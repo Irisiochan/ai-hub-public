@@ -14,11 +14,11 @@
     "turnTimeoutMs": 300000
   },
   "memory": {
-    "mcpUrl": null,
+    "mcpUrl": "http://memory-vault:8900/mcp",
     "repoPath": null,
-    "injectOnSpawn": false,
-    "searchPerTurn": false,
-    "capture": false,
+    "injectOnSpawn": true,
+    "searchPerTurn": true,
+    "capture": true,
     "maxTurnChars": 1200,
     "sessionMaxAgeHours": 12
   },

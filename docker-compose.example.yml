@@ -1,4 +1,29 @@
 services:
+  memory-vault:
+    build:
+      context: ./memory-vault
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      MEMORY_VAULT_PATH: /vault
+      VAULT_ALLOWED_HOSTS: "memory-vault:*"
+      VAULT_GIT_SYNC: auto
+    volumes:
+      - ./vault-data:/vault
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; s=socket.create_connection(('127.0.0.1',8900),2); s.close()"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
   ai-hub:
     build:
       context: .
@@ -9,6 +34,9 @@ services:
       - "127.0.0.1:3900:3900"
     env_file:
       - .env
+    depends_on:
+      memory-vault:
+        condition: service_healthy
     volumes:
       - ./server/config.docker.example.json:/app/server/config.json:ro
       - ai-hub-data:/app/server/data

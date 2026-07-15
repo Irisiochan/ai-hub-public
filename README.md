@@ -1,6 +1,6 @@
 # ai-hub
 
-自托管的 AI 聊天网关：像 IM 一样跟 Claude Code、Codex 和任意 API 模型聊天。
+自托管的 AI 聊天网关与长期记忆库：像 IM 一样跟 Claude Code、Codex 和任意 API 模型聊天。
 手机/电脑浏览器访问，历史全同步，CLI 后端走订阅额度，还能把编码任务派回自己的 PC 执行。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
@@ -13,7 +13,7 @@
   API 直连（Anthropic / OpenAI-compatible 双协议，UI 里自助添加任意供应商）
 - **群聊**：拉现有联系人建群，`@名字` / `@all` 调度，每成员独立会话
 - **图片**：选图/粘贴截图直接发，API 联系人可按需配独立视觉模型
-- **记忆库接入**：网关按联系人配置注入/检索外部 MCP 记忆服务，支持 full / compact / off 三档
+- **内置长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档
 - **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
   任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
 - **订阅额度可见**：Claude / Codex 标题栏实时显示 5h / 周窗口剩余
@@ -29,7 +29,8 @@
    │  每个联系人一个持久子进程或 API 客户端
    ├─ claude --input-format stream-json --output-format stream-json [--resume]
    ├─ codex app-server (JSON-RPC over stdio, thread/resume)
-   └─ 直连 API (anthropic / openai-compat)
+   ├─ 直连 API (anthropic / openai-compat)
+   └─ Memory Vault (MCP, :8900) → vault-data/ (Markdown)
 
 PC Worker (主动出站长轮询，无入站端口)
    └─ 网关 jobs 队列 → 本机 codex exec / claude -p → 流式事件与结果回传
@@ -40,6 +41,18 @@ PC Worker (主动出站长轮询，无入站端口)
 - API 直连按联系人 token 预算裁剪历史、持久化滚动摘要、成本分项估算
 
 ## 快速启动
+
+推荐用 Compose 一次启动前端、网关和记忆库：
+
+```bash
+cp .env.example .env
+docker compose -f docker-compose.example.yml up --build -d
+```
+
+打开 `http://127.0.0.1:3900`。首次启动会在仓库旁生成被 gitignore 的 `vault-data/`，
+里面是可直接用 Obsidian 打开的私人 Markdown 记忆库。
+
+源码开发：
 
 ```bash
 cd server && npm install && npm run dev     # 网关 :3900
@@ -54,11 +67,20 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 ## 配置
 
 - `server/config.example.json` → 复制为 `server/config.json`（端口、CLI 路径等）
-- 记忆库集成默认关闭；只有在你已经部署兼容 MCP 服务后，才配置 `memory.mcpUrl` 并按需开启注入、检索与捕捉
+- Compose 默认连接内置 Memory Vault；手动开发配置仍默认关闭，可在 `server/config.json` 设置 `memory.mcpUrl`
 - 联系人级配置存在 DB（UI 可改）：模型、人设、记忆三开关、委派权限等
 - Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是人设
   （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server
 - 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`
+
+## Memory Vault
+
+`memory-vault/` 只存公开的服务代码与空白模板，私人数据始终写入 `vault-data/`，两者不会混在一起。
+即使首次启动产生记忆，ai-hub 源码仓库也会保持干净。
+
+不配置 Git 时，记忆会稳定保存在本机目录。需要多设备同步时，把 `vault-data/` 初始化或克隆成一个
+**独立的私有 Git 仓库**；服务检测到 `vault-data/.git` 后，才会自动 pull、commit 和 push。
+它绝不会沿父目录误用公开 ai-hub 的远端。详细说明见 [`memory-vault/`](memory-vault/README.md)。
 
 ## PC Worker（离线优先）
 
@@ -99,12 +121,8 @@ overlay 网络内、绑定内网 IP；**绝对不要把 3900 直接暴露公网*
 
 作者自己的生产环境继续使用 systemd；Compose 模板只服务外部部署者，不替换现有生产链路。
 
-```bash
-cp .env.example .env
-docker compose -f docker-compose.example.yml up --build -d
-```
-
-默认只绑定宿主机 `127.0.0.1:3900`，数据、附件、备份和 agent 工作目录放在命名卷中。
+默认只绑定宿主机 `127.0.0.1:3900`；Memory Vault 的 8900 端口只在 Compose 内网开放。
+聊天数据、附件、备份和 agent 工作目录放在命名卷中，私人 Markdown 放在 `vault-data/`。
 容器镜像包含网关与 Web UI，但不内置 Claude/Codex CLI 或个人凭据；API 直连联系人可直接使用。
 如需 CLI 后端，请基于 Dockerfile 自建包含相应 CLI 的镜像并显式挂载凭据，或者使用上面的
 宿主机 systemd 部署方式。不要为了让容器重启宿主服务而挂载 `docker.sock`。

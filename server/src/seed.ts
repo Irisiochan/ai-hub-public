@@ -8,7 +8,7 @@ function writeIfMissing(file: string, lines: string[]): void {
   fs.writeFileSync(file, `${lines.join('\n')}\n`, 'utf8');
 }
 
-/** Public first boot: generic contacts only; memory integration stays opt-in. */
+/** Public first boot: generic contacts only; Compose provides memory automatically. */
 export function seedIfEmpty(db: Db, config: HubConfig): void {
   const count = db.prepare('SELECT COUNT(*) AS c FROM contacts').get() as { c: number };
   if (count.c > 0) return;
@@ -22,7 +22,7 @@ export function seedIfEmpty(db: Db, config: HubConfig): void {
     '',
     '- Reply naturally and concisely unless the user asks for detail.',
     '- Do not claim tools or permissions that are not available.',
-    '- Memory tools are optional; use them only when the owner explicitly configures a memory MCP server.',
+    '- Use memory context supplied by the gateway when it is available.',
   ]);
 
   db.prepare(
@@ -56,7 +56,7 @@ export function ensureCodexContact(db: Db, config: HubConfig): void {
     '',
     '- Reply naturally and concisely unless the user asks for detail.',
     '- Treat the filesystem as read-only unless project access is explicitly enabled.',
-    '- Memory tools are optional; use them only when the owner explicitly configures a memory MCP server.',
+    '- Use memory context supplied by the gateway when it is available.',
   ]);
 
   const existing = db.prepare('SELECT id FROM contacts WHERE id = ?').get('codex');

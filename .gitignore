@@ -1,5 +1,7 @@
 node_modules/
 dist/
+**/__pycache__/
+*.py[cod]
 server/data/
 server/config.json
 server/config.json.pre-*
@@ -19,3 +21,6 @@ server/agents/*/mcp.hub.json
 server/agents/*
 !server/agents/example/
 !server/agents/example/**
+
+# Private Memory Vault runtime data. It may be its own private git repository.
+vault-data/

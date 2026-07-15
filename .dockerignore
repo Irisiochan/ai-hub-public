@@ -12,3 +12,4 @@ server/agents/*/mcp.hub.json
 worker/config.json
 worker/*.log
 worker/*-state.json
+vault-data
