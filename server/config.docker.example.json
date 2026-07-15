@@ -1,0 +1,31 @@
+{
+  "port": 3900,
+  "host": "0.0.0.0",
+  "dbPath": "data/hub.db",
+  "agentsDir": "agents",
+  "webDist": "../web/dist",
+  "uploadsDir": "data/uploads",
+  "claude": {
+    "cliPath": "claude",
+    "turnTimeoutMs": 300000
+  },
+  "codex": {
+    "cliPath": "codex",
+    "turnTimeoutMs": 300000
+  },
+  "memory": {
+    "mcpUrl": null,
+    "repoPath": null,
+    "injectOnSpawn": false,
+    "searchPerTurn": false,
+    "capture": false,
+    "maxTurnChars": 1200,
+    "sessionMaxAgeHours": 12
+  },
+  "backup": {
+    "enabled": true,
+    "dir": "data/backups",
+    "intervalHours": 24,
+    "keep": 14
+  }
+}

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+server/data/
+server/config.json
+server/config.json.pre-*
+worker/config.json
+worker/worker-state.json
+worker/worker-state.json.tmp
+worker/launcher-state.json
+worker/launcher-state.json.tmp
+worker/launcher.stop
+server/agents/*/mcp.json
+*.log
+.env
+worker/worker.log
+server/agents/*/mcp.hub.json

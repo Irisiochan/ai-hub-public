@@ -1,0 +1,29 @@
+services:
+  ai-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:3900:3900"
+    env_file:
+      - .env
+    volumes:
+      - ./server/config.docker.example.json:/app/server/config.json:ro
+      - ai-hub-data:/app/server/data
+      - ai-hub-agents:/app/server/agents
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3900/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  ai-hub-data:
+  ai-hub-agents:

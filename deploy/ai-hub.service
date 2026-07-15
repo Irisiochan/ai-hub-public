@@ -1,0 +1,16 @@
+[Unit]
+Description=ai-hub gateway
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/ai-hub/server
+EnvironmentFile=-/opt/ai-hub/.env
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

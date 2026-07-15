@@ -1,0 +1,18 @@
+{
+  "serverUrl": "http://YOUR-GATEWAY-HOST:3900",
+  "token": "WORKER_ID.PASTE_PAIRING_TOKEN_HERE",
+  "name": "my-pc",
+  "workspaces": [
+    "C:\\path\\to\\allowed\\workspace"
+  ],
+  "runners": [
+    "codex",
+    "claude"
+  ],
+  "codexCommand": "codex.cmd",
+  "codexModel": "",
+  "codexWindowsSandbox": "unelevated",
+  "claudeCommand": "claude.cmd",
+  "allowShell": false,
+  "allowSsh": false
+}
