@@ -16,9 +16,12 @@ await client.connect(transport);
 
 const tools = await client.listTools();
 const names = new Set(tools.tools.map((tool) => tool.name));
-for (const required of ['get_context', 'search_vault', 'write_inbox']) {
+for (const required of ['get_context', 'get_core_context', 'search_vault', 'write_inbox']) {
   if (!names.has(required)) throw new Error(`missing MCP tool: ${required}`);
 }
+
+const core = await client.callTool({ name: 'get_core_context', arguments: {} });
+if (core.isError) throw new Error('get_core_context returned an MCP error');
 
 const context = await client.callTool({ name: 'get_context', arguments: {} });
 const contextText = context.content

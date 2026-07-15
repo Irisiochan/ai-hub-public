@@ -45,6 +45,8 @@ with tempfile.TemporaryDirectory(prefix="ai-hub-vault-smoke-") as temp:
 
     context = server.get_context()
     assert "核心记忆" in context
+    core_context = server.get_core_context()
+    assert "核心记忆" in core_context
 
     outside = vault.parent / "escape-proof.md"
     rejected = [
@@ -59,5 +61,36 @@ with tempfile.TemporaryDirectory(prefix="ai-hub-vault-smoke-") as temp:
 
     for invalid in [".hidden", "has.dot", "slash/name", r"back\slash", "a" * 82]:
         assert "不合法" in server.write_memory(invalid, "x", "x", [])
+
+    legacy = Path(temp) / "legacy-vault"
+    (legacy / "_meta").mkdir(parents=True)
+    (legacy / "memories").mkdir()
+    (legacy / "_meta" / "vault_config.yaml").write_text(
+        "owner: Legacy User\n"
+        "timezone: UTC\n"
+        "core_files:\n"
+        "  - memories/User-core.md\n"
+        "  - memories/User-ai-interaction-styles.md\n",
+        encoding="utf-8",
+    )
+    (legacy / "memories" / "User-core.md").write_text("# Legacy core\n", encoding="utf-8")
+    (legacy / "memories" / "User-ai-interaction-styles.md").write_text(
+        "# Legacy interaction styles\n", encoding="utf-8"
+    )
+
+    os.environ["MEMORY_VAULT_PATH"] = str(legacy)
+    legacy_spec = importlib.util.spec_from_file_location(
+        "memory_vault_legacy_smoke_server", ROOT / "_meta" / "mcp_server.py"
+    )
+    if legacy_spec is None or legacy_spec.loader is None:
+        raise RuntimeError("failed to load legacy memory-vault server")
+    legacy_server = importlib.util.module_from_spec(legacy_spec)
+    legacy_spec.loader.exec_module(legacy_server)
+
+    assert not (legacy / "memories" / "owner-core.md").exists()
+    assert not (legacy / "memories" / "owner-ai-interaction-styles.md").exists()
+    legacy_core = legacy_server.get_core_context()
+    assert "Legacy core" in legacy_core
+    assert "Legacy interaction styles" in legacy_core
 
 print("memory-vault smoke: ok")

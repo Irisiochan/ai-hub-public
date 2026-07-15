@@ -4,7 +4,7 @@ import type { VaultClient } from './vaultClient.js';
  * Read path of the memory layer: the gateway decides what the model sees,
  * instead of hoping the model decides to look.
  *
- *  - buildSessionPreamble → full get_context, appended to the system prompt
+ *  - buildSessionPreamble → get_context / get_core_context, appended to the system prompt
  *    every (re)spawn, so a session never starts cold.
  *  - buildTurnBlock → lightweight keyword search per user message, injected
  *    alongside the message; deduped per session via `seen`.
@@ -85,25 +85,12 @@ export async function buildSessionPreamble(
   if (mode === 'off') return '';
   let ctx: string;
   if (mode === 'compact') {
-    const fileCandidates = [
-      ['memories/owner-core.md', 'memories/User-core.md'],
-      ['memories/owner-ai-interaction-styles.md', 'memories/User-ai-interaction-styles.md'],
-    ];
-    const chunks: string[] = [];
-    for (const candidates of fileCandidates) {
-      for (const path of candidates) {
-        try {
-          const raw = await vault.call('read_file', { path }, 0);
-          const body = raw.replace(/^---[\s\S]*?---\s*/m, '').trim();
-          chunks.push(`## ${path}\n${body.slice(0, 1800)}`);
-          break;
-        } catch {
-          // 先用公开模板文件名，再兼容已有私人 vault 的旧文件名。
-        }
-      }
+    try {
+      ctx = await vault.call('get_core_context');
+    } catch {
+      // Compatible fallback for an older external Memory Vault server.
+      ctx = await vault.call('get_context');
     }
-    if (chunks.length === 0) throw new Error('compact core memory unavailable');
-    ctx = chunks.join('\n\n');
   } else {
     ctx = await vault.call('get_context');
   }

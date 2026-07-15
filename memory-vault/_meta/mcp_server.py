@@ -42,11 +42,19 @@ ACTIVE_DIRS = ["memories", "tasks", "inbox", "projects", "diary"]
 
 
 def _initialize_vault() -> None:
-    """Create a private data directory and fill only missing template files."""
+    """Initialize a new vault; never inject blank core memories into an old one."""
+    has_config = (VAULT / "_meta" / "vault_config.yaml").exists()
+    has_user_data = any(
+        directory.exists() and any(directory.iterdir())
+        for directory in (VAULT / name for name in ACTIVE_DIRS)
+    )
+    is_new = not has_config and not has_user_data
     VAULT.mkdir(parents=True, exist_ok=True)
     if TEMPLATE.exists():
         for source in TEMPLATE.rglob("*"):
             relative = source.relative_to(TEMPLATE)
+            if not is_new and relative.parts and relative.parts[0] == "memories":
+                continue
             destination = VAULT / relative
             if source.is_dir():
                 destination.mkdir(parents=True, exist_ok=True)
@@ -301,6 +309,20 @@ def _invalid_slug() -> str:
     return "slug 不合法：仅允许字母、数字、下划线和短横线，必须以字母或数字开头，最长 81 个字符。"
 
 
+def _read_core_context(max_chars_per_file: int | None = None) -> str:
+    """Read configured core files safely; vault_config.yaml is the authority."""
+    chunks = []
+    for rel in CORE_FILES:
+        filepath = _safe_md(str(rel))
+        if filepath is None or not filepath.exists():
+            continue
+        text = filepath.read_text(encoding="utf-8", errors="replace").strip()
+        if max_chars_per_file is not None:
+            text = text[:max_chars_per_file]
+        chunks.append(text)
+    return "\n\n---\n\n".join(chunk for chunk in chunks if chunk)
+
+
 def _is_core(path: str) -> bool:
     return Path(path).as_posix() in CORE_FILES
 
@@ -391,6 +413,21 @@ def _recent_diary_lines(days: int = 3, max_lines: int = 30) -> list[str]:
 
 
 @mcp.tool()
+def get_core_context(max_chars_per_file: int = 1800) -> str:
+    """按 vault_config.yaml 的 core_files 返回核心记忆，不包含任务、日常或记忆清单。
+
+    Args:
+        max_chars_per_file: 每个核心文件最多返回的字符数，默认 1800，范围 200-10000。
+    """
+    _pull_if_stale()
+    limit = max(200, min(int(max_chars_per_file), 10_000))
+    context = _read_core_context(limit)
+    if not context:
+        raise RuntimeError("vault_config.yaml 配置的核心记忆文件不存在或为空。")
+    return context
+
+
+@mcp.tool()
 def get_context() -> str:
     """获取主人的核心记忆上下文。每次新会话第一轮回复前先调用这个工具，
     返回：核心记忆全文 + 时间敏感事项（过期/到期任务，主动跟进）+ 最近日常 + 其余记忆清单。
@@ -406,14 +443,10 @@ def get_context() -> str:
         "",
     ]
 
-    core_set = set(CORE_FILES)
-    for rel in CORE_FILES:
-        fp = VAULT / rel
-        if fp.exists():
-            parts.append(fp.read_text(encoding="utf-8", errors="replace").strip())
-            parts.append("")
-            parts.append("---")
-            parts.append("")
+    core_set = {Path(str(rel)).as_posix() for rel in CORE_FILES}
+    core_context = _read_core_context()
+    if core_context:
+        parts.extend([core_context, "", "---", ""])
 
     parts.extend(_time_sensitive_lines())
     parts.extend(_recent_diary_lines())
