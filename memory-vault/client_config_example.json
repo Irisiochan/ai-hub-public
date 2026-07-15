@@ -19,7 +19,7 @@
   },
 
   "_ChatGPT连接器": {
-    "_前提": "需要公网 HTTPS，见 _meta/deploy/vps_setup.md 的公网入口一节",
+    "_前提": "需要自行提供受保护的公网 HTTPS 反向代理；本仓库不附带公网暴露模板",
     "_URL": "https://<节点>.<tailnet>.ts.net/mcp-<秘密串>/mcp",
     "_身份验证": "未授权（安全靠秘密路径）"
   }

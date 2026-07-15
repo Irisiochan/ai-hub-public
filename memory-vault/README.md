@@ -10,6 +10,11 @@ and private memory data are deliberately separated:
 The root Compose file initializes `vault-data/` on first boot and connects
 ai-hub to `http://memory-vault:8900/mcp` automatically.
 
+When the Python service is started directly without `MEMORY_VAULT_PATH`, it
+uses the ai-hub root directory `vault-data/` and initializes missing files from
+the bundled template. It never falls back to writing private Markdown under
+the tracked `memory-vault/` source directory.
+
 ## Optional private Git synchronization
 
 Local persistence works without Git. To sync memories between devices, make

@@ -20,6 +20,7 @@ import datetime
 import ipaddress
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -34,8 +35,29 @@ from mcp.server.fastmcp import FastMCP
 # ── 配置 ──────────────────────────────────────────────
 
 CODE_ROOT = Path(__file__).resolve().parent.parent
-VAULT = Path(os.environ.get("MEMORY_VAULT_PATH", CODE_ROOT)).expanduser().resolve()
+DEFAULT_VAULT = CODE_ROOT.parent / "vault-data"
+VAULT = Path(os.environ.get("MEMORY_VAULT_PATH", DEFAULT_VAULT)).expanduser().resolve()
+TEMPLATE = CODE_ROOT / "template"
 ACTIVE_DIRS = ["memories", "tasks", "inbox", "projects", "diary"]
+
+
+def _initialize_vault() -> None:
+    """Create a private data directory and fill only missing template files."""
+    VAULT.mkdir(parents=True, exist_ok=True)
+    if TEMPLATE.exists():
+        for source in TEMPLATE.rglob("*"):
+            relative = source.relative_to(TEMPLATE)
+            destination = VAULT / relative
+            if source.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+            elif not destination.exists():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+    for dirname in [*ACTIVE_DIRS, "_archive/retired", "_meta"]:
+        (VAULT / dirname).mkdir(parents=True, exist_ok=True)
+
+
+_initialize_vault()
 
 # ── 个性化配置：_meta/vault_config.yaml ──
 _cfg_path = VAULT / "_meta" / "vault_config.yaml"
@@ -242,6 +264,41 @@ def _safe_md(path: str) -> Path | None:
     except ValueError:
         return None
     return filepath
+
+
+SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,80}$")
+MD_FILENAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}\.md$")
+
+
+def _safe_generated_md(directory: str, slug: str, prefix: str = "") -> Path | None:
+    """Build a contained Markdown path from a validated external slug."""
+    if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
+        return None
+    return _safe_child_md(directory, f"{prefix}{slug}.md")
+
+
+def _safe_child_md(directory: str, filename: str) -> Path | None:
+    """Resolve a direct child and prove it remains inside both directory and vault."""
+    if not isinstance(filename, str) or not MD_FILENAME_RE.fullmatch(filename):
+        return None
+    if Path(filename).name != filename:
+        return None
+    vault_root = VAULT.resolve()
+    parent = (VAULT / directory).resolve()
+    candidate = (parent / filename).resolve()
+    try:
+        parent.relative_to(vault_root)
+        candidate.relative_to(vault_root)
+        candidate.relative_to(parent)
+    except ValueError:
+        return None
+    if candidate.suffix != ".md":
+        return None
+    return candidate
+
+
+def _invalid_slug() -> str:
+    return "slug 不合法：仅允许字母、数字、下划线和短横线，必须以字母或数字开头，最长 81 个字符。"
 
 
 def _is_core(path: str) -> bool:
@@ -480,27 +537,21 @@ def write_inbox(slug: str, title: str, content: str, tags: list[str], source: st
     """
     today = _today().isoformat()
     filename = f"{today}_{slug}.md"
-    filepath = VAULT / "inbox" / filename
+    filepath = _safe_generated_md("inbox", slug, f"{today}_")
+    if filepath is None:
+        return _invalid_slug()
     filepath.parent.mkdir(exist_ok=True)  # 空目录不进 git，克隆/reset 后可能消失
 
     if filepath.exists():
         return f"文件已存在：inbox/{filename}，请换一个 slug。"
 
-    tag_str = "\n".join(f"  - {t}" for t in tags) if tags else "  - untagged"
-
-    md_content = f"""---
-type: inbox
-created: {today}
-source: {source}
-tags:
-{tag_str}
----
-
-# {title}
-
-{content}
-"""
-    filepath.write_text(md_content.strip() + "\n", encoding="utf-8")
+    meta = {
+        "type": "inbox",
+        "created": today,
+        "source": source,
+        "tags": tags or ["untagged"],
+    }
+    filepath.write_text(_rebuild_file(meta, f"# {title}\n\n{content}"), encoding="utf-8")
     sync_status = _git_sync(f"auto: 写入记忆 {slug} (source: {source})")
     return f"已写入：inbox/{filename} {sync_status}"
 
@@ -530,11 +581,13 @@ def promote_to_memory(filename: str) -> str:
     Args:
         filename: inbox/ 中的文件名，例如 "2026-06-24_likes-spicy-food.md"
     """
-    src = VAULT / "inbox" / filename
+    src = _safe_child_md("inbox", filename)
+    dst = _safe_child_md("memories", filename)
+    if src is None or dst is None:
+        return "文件名不合法：只能使用 inbox 中由记忆工具生成的 .md 文件名。"
     if not src.exists():
         return f"文件不存在：inbox/{filename}"
 
-    dst = VAULT / "memories" / filename
     dst.parent.mkdir(exist_ok=True)
     if dst.exists():
         return f"memories/ 中已有同名文件：{filename}"
@@ -568,7 +621,9 @@ def write_memory(slug: str, title: str, content: str, tags: list[str], source: s
         tags: 标签列表
         source: 写入来源（AI 名/渠道名），例如 "claude" / "gpt"
     """
-    filepath = VAULT / "memories" / f"{slug}.md"
+    filepath = _safe_generated_md("memories", slug)
+    if filepath is None:
+        return _invalid_slug()
     filepath.parent.mkdir(exist_ok=True)
     if filepath.exists():
         return f"memories/{slug}.md 已存在。补充内容请用 update_memory，换主题请换 slug。"
@@ -716,7 +771,9 @@ def write_diary(slug: str, title: str, content: str, source: str = "unknown", ta
         tags: 标签（可选，默认 ["日记"]）
     """
     today = _today().isoformat()
-    filepath = VAULT / "diary" / f"{today}_{slug}.md"
+    filepath = _safe_generated_md("diary", slug, f"{today}_")
+    if filepath is None:
+        return _invalid_slug()
     filepath.parent.mkdir(exist_ok=True)
     if filepath.exists():
         return f"diary/{filepath.name} 已存在，换个 slug 或用 update_memory 追加。"
@@ -751,9 +808,11 @@ def add_task(slug: str, title: str, due: str, content: str = "", tags: list[str]
         except ValueError:
             return f"due 日期格式不对：{due}，需要 YYYY-MM-DD。"
 
-    dirpath = VAULT / "tasks"
+    filepath = _safe_generated_md("tasks", slug)
+    if filepath is None:
+        return _invalid_slug()
+    dirpath = filepath.parent
     dirpath.mkdir(exist_ok=True)
-    filepath = dirpath / f"{slug}.md"
     if filepath.exists():
         return f"tasks/{slug}.md 已存在，换个 slug 或用 update_task 更新它。"
 

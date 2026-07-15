@@ -85,15 +85,21 @@ export async function buildSessionPreamble(
   if (mode === 'off') return '';
   let ctx: string;
   if (mode === 'compact') {
-    const files = ['memories/User-core.md', 'memories/User-ai-interaction-styles.md'];
+    const fileCandidates = [
+      ['memories/owner-core.md', 'memories/User-core.md'],
+      ['memories/owner-ai-interaction-styles.md', 'memories/User-ai-interaction-styles.md'],
+    ];
     const chunks: string[] = [];
-    for (const path of files) {
-      try {
-        const raw = await vault.call('read_file', { path }, 0);
-        const body = raw.replace(/^---[\s\S]*?---\s*/m, '').trim();
-        chunks.push(`## ${path}\n${body.slice(0, 1800)}`);
-      } catch {
-        // compact 是 best-effort；两份核心文件都失败时再由下方抛错
+    for (const candidates of fileCandidates) {
+      for (const path of candidates) {
+        try {
+          const raw = await vault.call('read_file', { path }, 0);
+          const body = raw.replace(/^---[\s\S]*?---\s*/m, '').trim();
+          chunks.push(`## ${path}\n${body.slice(0, 1800)}`);
+          break;
+        } catch {
+          // 先用公开模板文件名，再兼容已有私人 vault 的旧文件名。
+        }
       }
     }
     if (chunks.length === 0) throw new Error('compact core memory unavailable');
