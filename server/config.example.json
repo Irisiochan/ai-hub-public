@@ -14,11 +14,11 @@
     "turnTimeoutMs": 300000
   },
   "memory": {
-    "mcpUrl": "http://127.0.0.1:8900/mcp",
+    "mcpUrl": null,
     "repoPath": null,
-    "injectOnSpawn": true,
-    "searchPerTurn": true,
-    "capture": true,
+    "injectOnSpawn": false,
+    "searchPerTurn": false,
+    "capture": false,
     "maxTurnChars": 1200,
     "sessionMaxAgeHours": 12
   }

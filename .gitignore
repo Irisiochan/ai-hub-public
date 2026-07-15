@@ -14,3 +14,8 @@ server/agents/*/mcp.json
 .env
 worker/worker.log
 server/agents/*/mcp.hub.json
+
+# First-boot contact workdirs are runtime state. Keep only the generic template tracked.
+server/agents/*
+!server/agents/example/
+!server/agents/example/**

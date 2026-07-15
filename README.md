@@ -53,7 +53,8 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 
 ## 配置
 
-- `server/config.example.json` → 复制为 `server/config.json`（端口、CLI 路径、记忆库 MCP 地址等）
+- `server/config.example.json` → 复制为 `server/config.json`（端口、CLI 路径等）
+- 记忆库集成默认关闭；只有在你已经部署兼容 MCP 服务后，才配置 `memory.mcpUrl` 并按需开启注入、检索与捕捉
 - 联系人级配置存在 DB（UI 可改）：模型、人设、记忆三开关、委派权限等
 - Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是人设
   （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server
@@ -73,6 +74,10 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 
 **信任边界 = 你的私有网络。** 网关目前没有账号体系，设计为跑在 Tailscale 等
 overlay 网络内、绑定内网 IP；**绝对不要把 3900 直接暴露公网**。在此边界内：
+
+- 没有账号、租户或会话级访问控制：任何能访问 Web UI 的人都可能读取聊天记录、管理联系人、
+  生成 Worker 配对令牌，并在已有权限边界内发起委派。Tailnet 里有其他成员时，必须用 ACL
+  只允许受信设备/用户访问 3900，不能把“加入同一 Tailnet”直接等同于可信。
 
 - API key 服务端存储、返回 UI 永远打码；`.env` 与数据库不进 git
 - CLI 联系人默认聊天模式：MCP 记忆工具白名单直通，Bash/Write/Edit 硬禁，漏网默认拒；
