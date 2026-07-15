@@ -67,7 +67,7 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 ## 配置
 
 - `server/config.example.json` → 复制为 `server/config.json`（端口、CLI 路径等）
-- Compose 默认连接内置 Memory Vault；手动开发配置仍默认关闭，可在 `server/config.json` 设置 `memory.mcpUrl`
+- Compose 会自动连接内置 Memory Vault；源码开发时先启动仓库内的记忆服务，再在 `server/config.json` 将 `memory.mcpUrl` 指向 `http://127.0.0.1:8900/mcp`
 - 联系人级配置存在 DB（UI 可改）：模型、人设、记忆三开关、委派权限等
 - Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是人设
   （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server
