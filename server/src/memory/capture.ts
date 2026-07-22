@@ -27,7 +27,7 @@ const REVIEW_CAPTURE_THRESHOLD = 0.8;
 const REVIEW_REJECT_THRESHOLD = 0.2;
 const lastCapture = new Map<string, number>();
 
-const WORKER_RECEIPT_RE = /^⚙\s*Worker 任务回执（网关自动通知，Iris 也看得到这条）/;
+const WORKER_RECEIPT_RE = /^⚙\s*Worker 任务回执（网关自动通知，.+也看得到这条）/;
 
 export interface CaptureReview {
   decision: 'capture' | 'reject' | 'pending';
@@ -171,7 +171,7 @@ export async function maybeCapture(
   log: (msg: string) => void,
   reviewer: CaptureReviewer = reviewCaptureWithDeepSeek
 ): Promise<void> {
-  // Only Iris's original message may trigger capture. Model replies often repeat
+  // Only the user's original message may trigger capture. Model replies often repeat
   // dates, preferences and TODO words from injected memory or room transcripts;
   // treating those words as new user facts creates self-echo and identity bleed.
   const reason = detectTrigger(userText);
@@ -196,7 +196,7 @@ export async function maybeCapture(
       ? `DeepSeek 精筛待处理：${review.detail ?? '置信度不足'}。`
       : `DeepSeek 精筛：${review.category ?? 'other'}，置信度 ${review.confidence?.toFixed(2) ?? '未知'}。`,
     '',
-    `**Iris**：${clipCaptureText(userText)}`,
+    `**User**：${clipCaptureText(userText)}`,
   ];
   if (replyText.trim()) {
     contentParts.push('', `**${contact.name}**：${clipCaptureText(replyText)}`);

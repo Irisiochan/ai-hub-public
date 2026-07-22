@@ -2,6 +2,7 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { cleanupOrphanUploads } from './attachments.js';
+import { desktopSessionAuth } from './auth.js';
 import { AgentManager } from './agents/manager.js';
 import { DbBackup } from './backup.js';
 import { loadConfig } from './config.js';
@@ -16,17 +17,15 @@ import { attachmentsRouter } from './routes/attachments.js';
 import { hubMcpRouter } from './routes/hubMcp.js';
 import { messagesRouter } from './routes/messages.js';
 import { systemRouter } from './routes/system.js';
-import { userRouter } from './routes/user.js';
+import { getUserProfile, userRouter } from './routes/user.js';
 import { workersRouter } from './routes/workers.js';
-import { ensureCoveContact, ensureGrokContact, seedIfEmpty } from './seed.js';
+import { seedIfEmpty } from './seed.js';
 import { SseHub } from './sse.js';
 import { JobStore } from './workers/jobStore.js';
 
 const config = loadConfig();
 const db = openDb(config.dbPath);
 seedIfEmpty(db, config);
-ensureCoveContact(db, config);
-ensureGrokContact(db, config);
 const orphanUploads = cleanupOrphanUploads(db, config.uploadsDir);
 if (orphanUploads > 0) console.log(`  [uploads] cleaned ${orphanUploads} orphan file(s)`);
 
@@ -109,14 +108,15 @@ jobStore.onFinished = (job) => {
     void ensureWorkerTail(job).catch((e) => {
       console.error(`  [jobs] worker-tail registration failed for ${job.id}:`, e);
     });
-    if (!job.requested_by || job.requested_by === 'iris') return;
+    if (!job.requested_by || job.requested_by === 'user') return;
     const contact = db
       .prepare("SELECT * FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'dm'")
       .get(job.requested_by) as import('./db.js').ContactRow | undefined;
     if (!contact) return;
     const body = job.result || job.error || '（无输出）';
+    const userName = getUserProfile(db).name;
     const text = [
-      `⚙ Worker 任务回执（网关自动通知，Iris 也看得到这条）`,
+      `⚙ Worker 任务回执（网关自动通知，${userName} 也看得到这条）`,
       `任务 ${job.id} → ${job.status}（runner: ${job.runner}, workspace: ${job.workspace}）`,
       job.delivery_state ? `交付状态：${job.delivery_state}` : '',
       body.slice(0, 6000),
@@ -173,35 +173,12 @@ app.use(express.json({ limit: '2mb' }));
 
 // Desktop-shell session auth: when HUB_TOKEN is set (Electron spawns us with a
 // random token), every request must carry it — first load passes ?token=…,
-// which we swap for an httpOnly cookie. Worker/hub-mcp endpoints keep their
-// own Bearer auth and are exempt. Without HUB_TOKEN (web/VPS) nothing changes.
+// which we swap for an httpOnly cookie. Exact worker device and hub-mcp paths
+// keep their own Bearer auth and are exempt. Without HUB_TOKEN (web/VPS)
+// nothing changes.
 const hubToken = process.env.HUB_TOKEN;
 if (hubToken) {
-  const COOKIE = 'hub_session';
-  const crypto = await import('node:crypto');
-  const tokenMatches = (value: unknown): boolean => {
-    if (typeof value !== 'string') return false;
-    const got = Buffer.from(value);
-    const want = Buffer.from(hubToken);
-    return got.length === want.length && crypto.timingSafeEqual(got, want);
-  };
-  app.use((req, res, next) => {
-    if (req.path.startsWith('/api/worker') || req.path.startsWith('/api/hub-mcp')) return next();
-    const cookies = Object.fromEntries(
-      (req.headers.cookie ?? '').split(';').map((p) => {
-        const i = p.indexOf('=');
-        return [p.slice(0, i).trim(), p.slice(i + 1).trim()];
-      })
-    );
-    if (tokenMatches(cookies[COOKIE])) return next();
-    if (tokenMatches(req.query.token)) {
-      res.cookie(COOKIE, hubToken, { httpOnly: true, sameSite: 'lax' });
-      const clean = req.path === '/' ? '/' : req.path;
-      if (req.method === 'GET' && !req.path.startsWith('/api/')) return res.redirect(clean);
-      return next();
-    }
-    return res.status(401).json({ error: 'missing or invalid session token' });
-  });
+  app.use(desktopSessionAuth(hubToken));
 }
 
 app.get('/api/health', (_req, res) => {

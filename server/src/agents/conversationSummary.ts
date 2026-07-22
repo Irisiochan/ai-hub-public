@@ -19,7 +19,7 @@ function summaryLine(row: MessageRow, nameOf?: (sender: string) => string): stri
     ? nameOf(row.sender)
     : row.role === 'assistant'
       ? '助手'
-      : 'Iris';
+      : 'User';
   const compact = row.content.replace(/\s+/g, ' ').trim().slice(0, 240);
   return `- ${who}：${compact}`;
 }

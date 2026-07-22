@@ -27,7 +27,7 @@ const upstream = http.createServer((req, res) => {
     const rec = { model: String(body.model), at: Date.now(), body };
     requests.push(rec);
     const firstDelay = rec.model === 'slow-model' ? 350 : 45;
-    const text = rec.model === 'slow-model' ? '慢成员不该被单点名触发' : '嘎啦蜜正常';
+    const text = rec.model === 'slow-model' ? '慢成员不该被单点名触发' : 'Member A 正常';
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     setTimeout(() => {
       rec.firstTokenAt = Date.now();
@@ -86,37 +86,37 @@ async function waitForMessage(contactId: string, sender: string, afterId: number
 }
 
 try {
-  addContact('gala', '嘎啦蜜', 'gala-model');
+  addContact('member-a', 'Member A', 'member-a-model');
   addContact('slow', '慢成员', 'slow-model');
   db.prepare(`INSERT INTO contacts (id, name, backend, kind, config) VALUES ('room', 'AI群聊', 'api', 'room', ?)`)
-    .run(JSON.stringify({ members: ['gala', 'slow'], reactionRounds: 1 }));
+    .run(JSON.stringify({ members: ['member-a', 'slow'], reactionRounds: 1 }));
   const manager = new AgentManager({ db, sse: sse as any, config: config as any, vault: null, jobStore: null });
 
-  const dmInsert = db.prepare(`INSERT INTO messages (contact_id, sender, role, kind, content, status) VALUES ('gala', 'user', 'user', 'text', '私聊测速', 'done')`).run();
+  const dmInsert = db.prepare(`INSERT INTO messages (contact_id, sender, role, kind, content, status) VALUES ('member-a', 'user', 'user', 'text', '私聊测速', 'done')`).run();
   const dmStart = Date.now();
-  assert.equal(manager.get(contact('gala')).enqueue({ userMessageId: Number(dmInsert.lastInsertRowid), text: '私聊测速' }), 'queued');
-  await waitForMessage('gala', 'gala', Number(dmInsert.lastInsertRowid));
-  const dmReq = requests.find((r) => r.model === 'gala-model');
+  assert.equal(manager.get(contact('member-a')).enqueue({ userMessageId: Number(dmInsert.lastInsertRowid), text: '私聊测速' }), 'queued');
+  await waitForMessage('member-a', 'member-a', Number(dmInsert.lastInsertRowid));
+  const dmReq = requests.find((r) => r.model === 'member-a-model');
   assert(dmReq?.firstTokenAt, 'DM should receive first token');
   const dmFirstTokenMs = dmReq.firstTokenAt - dmStart;
 
   requests.length = 0;
-  const roomInsert = db.prepare(`INSERT INTO messages (contact_id, sender, role, kind, content, status) VALUES ('room', 'user', 'user', 'text', '@嘎啦蜜 群聊测速', 'done')`).run();
+  const roomInsert = db.prepare(`INSERT INTO messages (contact_id, sender, role, kind, content, status) VALUES ('room', 'user', 'user', 'text', '@member-a 群聊测速', 'done')`).run();
   const roomStart = Date.now();
-  const targets = manager.dispatchRoomMessage(contact('room'), '@嘎啦蜜 群聊测速');
-  assert.deepEqual(targets, ['gala']);
-  await waitForMessage('room', 'gala', Number(roomInsert.lastInsertRowid));
+  const targets = manager.dispatchRoomMessage(contact('room'), '@member-a 群聊测速');
+  assert.deepEqual(targets, ['member-a']);
+  await waitForMessage('room', 'member-a', Number(roomInsert.lastInsertRowid));
   await sleep(500);
 
   assert.equal(requests.length, 1, 'single-target room message must not trigger slow member reaction turns');
-  assert.equal(requests[0].model, 'gala-model');
+  assert.equal(requests[0].model, 'member-a-model');
   assert(requests[0].firstTokenAt, 'room turn should receive first token');
   const roomFirstTokenMs = requests[0].firstTokenAt! - roomStart;
-  assert(roomFirstTokenMs < 250, `room first token should match gala upstream, got ${roomFirstTokenMs}ms`);
+  assert(roomFirstTokenMs < 250, `room first token should match member-a upstream, got ${roomFirstTokenMs}ms`);
 
   const roomStatuses = events.filter((e) => e.event === 'status' && (e.data as any).contactId === 'room').map((e) => (e.data as any));
-  assert(roomStatuses.some((s) => s.member === '嘎啦蜜' && s.state === 'thinking'));
-  assert(!roomStatuses.some((s) => s.member === '慢成员'), 'slow member should not enter room status for a single @嘎啦蜜 turn');
+  assert(roomStatuses.some((s) => s.member === 'Member A' && s.state === 'thinking'));
+  assert(!roomStatuses.some((s) => s.member === '慢成员'), 'slow member should not enter room status for a single @member-a turn');
   // Every non-idle room status must carry member — never leave UI to fall back to room title.
   for (const s of roomStatuses) {
     if (s.state === 'idle') continue;

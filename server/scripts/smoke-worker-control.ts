@@ -41,7 +41,7 @@ async function call(url: string, init: RequestInit = {}) {
 
 try {
   const paired = await call('/workers', {
-    method: 'POST', body: JSON.stringify({ id: 'iris-pc', name: 'Iris PC' }),
+    method: 'POST', body: JSON.stringify({ id: 'my-pc', name: 'My PC' }),
   });
   const auth = { Authorization: `Bearer ${paired.token}` };
   const capabilities = { runners: ['codex'], workspaces: [dir], shell: true, ssh: false };
@@ -52,7 +52,7 @@ try {
   });
   check('首次开机自动接单', connected.worker.acceptingJobs === true && connected.worker.status === 'online');
 
-  let controlled = await call('/workers/iris-pc/control', {
+  let controlled = await call('/workers/my-pc/control', {
     method: 'POST', body: JSON.stringify({ enabled: false }),
   });
   check('手动关闭进入暂停', controlled.acceptingJobs === false && controlled.status === 'paused');
@@ -64,7 +64,7 @@ try {
   check('同次开机重连仍暂停', connected.worker.acceptingJobs === false && connected.worker.status === 'paused');
 
   const created = jobs.create({
-    requestedBy: 'iris', runner: 'codex', workspace: dir, prompt: 'smoke',
+    requestedBy: 'user', runner: 'codex', workspace: dir, prompt: 'smoke',
     permissions: { write: true, shell: true },
   });
   if ('error' in created) throw new Error(created.error);

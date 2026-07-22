@@ -23,6 +23,8 @@ export interface GrokCliBackendOpts {
   disallowedTools?: string[];
   /** 人设 + 记忆前缀，经 `--rules` 追加进 system prompt（每轮进程都带，resume 也不丢人设）。 */
   preamble?: string;
+  /** Per-process environment overrides for managed project integrations. */
+  env?: Record<string, string>;
   turnTimeoutMs: number;
   log: (msg: string) => void;
 }
@@ -219,7 +221,7 @@ export class GrokCliBackend implements AgentBackend {
       command,
       args: finalArgs,
       cwd: this.opts.cwd,
-      env: { ...process.env },
+      env: { ...process.env, ...this.opts.env },
     });
     this.proc = proc;
 

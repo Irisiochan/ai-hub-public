@@ -23,6 +23,7 @@ function main() {
   fs.mkdirSync(logDir, { recursive: true });
   const logFile = path.join(logDir, 'gateway.log');
   const token = crypto.randomBytes(24).toString('hex');
+  const hubMcpToken = crypto.randomBytes(32).toString('hex');
 
   // Remote mode: %APPDATA%/ai-hub/desktop.json {"remoteUrl": "http://…"}
   // skips the local gateway entirely and wraps an existing hub (e.g. the VPS
@@ -74,6 +75,7 @@ function main() {
         HUB_PORT: String(port),
         HUB_HOST: '127.0.0.1',
         HUB_TOKEN: token,
+        HUB_MCP_TOKEN: hubMcpToken,
         HUB_DATA_DIR: dataDir,
         HUB_WEB_DIST: path.join(appRoot, 'web-dist'),
         HUB_CONFIG: path.join(userData, 'config.json'),

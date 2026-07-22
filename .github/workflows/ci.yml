@@ -22,20 +22,55 @@ jobs:
           cache-dependency-path: |
             server/package-lock.json
             web/package-lock.json
+            mobile/package-lock.json
 
       - name: Install dependencies
         run: |
           npm ci --prefix server
           npm ci --prefix web
+          npm ci --prefix mobile
 
       - name: Build and test
         run: |
           npm audit --prefix server --audit-level=moderate
           npm audit --prefix web --audit-level=moderate
+          npm audit --prefix mobile --audit-level=moderate
           npm run build --prefix server
+          npm run smoke --prefix server
           npm run test --prefix web
           npm run build --prefix web
           npm run test --prefix worker
+
+  desktop-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            web/package-lock.json
+            desktop/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm ci --prefix server
+          npm ci --prefix web
+          npm ci --prefix desktop
+
+      - name: Audit desktop dependencies
+        run: |
+          npm audit --prefix desktop --audit-level=moderate
+          npm audit --prefix desktop --omit=dev --audit-level=moderate
+
+      - name: Build desktop installers
+        run: |
+          npm run build --prefix server
+          npm run build --prefix web
+          npm run dist --prefix desktop
 
   memory-vault-contract:
     runs-on: ubuntu-latest

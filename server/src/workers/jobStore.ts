@@ -274,7 +274,7 @@ export class JobStore {
     return { status: 'done' };
   }
 
-  /** Worker complete 回传的收口，含终态通知；cancelled/paused 是 Iris 主导的。 */
+  /** Worker complete 回传的收口，含终态通知；cancelled/paused 由用户主导。 */
   complete(
     job: JobRow,
     requested: unknown,
