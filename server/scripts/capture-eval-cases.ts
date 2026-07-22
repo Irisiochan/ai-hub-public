@@ -52,7 +52,7 @@ export const dirtyHubAutoCases: CaptureEvalCase[] = [
     id: 'system-receipt',
     contactId: 'assistant-a',
     contactName: '助手甲',
-    text: '⚙ Worker 任务回执（网关自动通知，Iris 也看得到这条） 任务 demo → done 交付状态：delivered',
+    text: '⚙ Worker 任务回执（网关自动通知，User 也看得到这条） 任务 demo → done 交付状态：delivered',
     expected: 'reject',
     source: 'synthetic',
     note: 'System receipts are rejected before LLM review.',

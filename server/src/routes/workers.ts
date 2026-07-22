@@ -140,7 +140,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       req.body?.force === true ||
       req.query.force === '1' ||
       req.query.force === 'true';
-    const outcome = jobs.softDelete(req.params.id, 'iris', { force });
+    const outcome = jobs.softDelete(req.params.id, 'user', { force });
     if ('error' in outcome) {
       return res.status(outcome.code).json({ error: outcome.error });
     }
@@ -151,7 +151,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     const runner = ['claude', 'codex', 'grok'].includes(req.body?.runner) ? req.body.runner : '';
     if (!runner) return res.status(400).json({ error: 'runner/workspace/prompt required' });
     const created = jobs.create({
-      requestedBy: typeof req.body?.requestedBy === 'string' ? req.body.requestedBy : 'iris',
+      requestedBy: typeof req.body?.requestedBy === 'string' ? req.body.requestedBy : 'user',
       runner,
       workspace: typeof req.body?.workspace === 'string' ? req.body.workspace : '',
       prompt: typeof req.body?.prompt === 'string' ? req.body.prompt : '',
@@ -180,7 +180,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     if (!existing || existing.deleted === 1) {
       return res.status(404).json({ error: 'job not found' });
     }
-    const outcome = jobs.action(req.params.id, req.body?.action, 'iris');
+    const outcome = jobs.action(req.params.id, req.body?.action, 'user');
     if ('error' in outcome) {
       return res.status(outcome.error === 'job not found' ? 404 : 409).json({ error: outcome.error });
     }

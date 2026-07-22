@@ -23,6 +23,7 @@ export interface CodexAppServerBackendOpts {
 export interface CodexMcpServerConfig {
   name: string;
   url: string;
+  bearerTokenEnvVar?: string;
   enabledTools?: string[];
   required?: boolean;
   defaultToolsApprovalMode?: 'auto' | 'prompt' | 'writes' | 'approve';
@@ -39,6 +40,15 @@ export function codexAppServerArgs(servers: CodexMcpServerConfig[] = []): string
     args.push('--config', `${key}.url=${JSON.stringify(server.url)}`);
     args.push('--config', `${key}.enabled=true`);
     args.push('--config', `${key}.required=${server.required === true}`);
+    if (server.bearerTokenEnvVar) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(server.bearerTokenEnvVar)) {
+        throw new Error(`invalid Codex MCP bearer token env var: ${server.bearerTokenEnvVar}`);
+      }
+      args.push(
+        '--config',
+        `${key}.bearer_token_env_var=${JSON.stringify(server.bearerTokenEnvVar)}`
+      );
+    }
     if (server.enabledTools?.length) {
       args.push('--config', `${key}.enabled_tools=${JSON.stringify(server.enabledTools)}`);
     }

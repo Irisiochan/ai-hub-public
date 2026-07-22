@@ -104,7 +104,7 @@ check('codex 自动带 shell 可派', out.ok, out.text);
 // 5. 状态查询（自己的 / 别人的）
 out = await byName.worker_job_status.exec({ job_id: jobId });
 check('状态查询 ok', out.ok && out.text.includes('pending'));
-const foreign = buildDelegateTools(store, db, 'cove', { enabled: true, workspaces: [ws] });
+const foreign = buildDelegateTools(store, db, 'other-agent', { enabled: true, workspaces: [ws] });
 out = await foreign.find((t) => t.name === 'worker_job_status')!.exec({ job_id: jobId });
 check('别人的任务查不了', !out.ok);
 
@@ -144,7 +144,7 @@ store.complete(
 const finishedAfterBlock = finished.length;
 const reconciled = store.reconcileBlocked(
   store.get(blockedJob.id)!,
-  'pc-iris',
+  'worker-a',
   JSON.stringify({ state: 'delivered', reconciliation: { head: 'def5678', ahead: 0 } }),
   'def5678'
 );

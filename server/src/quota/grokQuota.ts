@@ -194,7 +194,7 @@ export function parseGrokCredits(body: Buffer): GrokCreditsParse {
  * gRPC-web call the TUI /usage screen makes (undocumented; parsed defensively
  * — when it breaks the UI shows the reason instead of fabricated numbers).
  *
- * Token 只读不刷新：grok CLI 自己会轮换 auth.json（阿野每聊一轮都在用），
+ * Token 只读不刷新：grok CLI 自己会轮换 auth.json，
  * poller 抢着刷新反而会跟 CLI 打架。401 就报 login-expired 等 CLI 下次轮换。
  */
 export class GrokQuotaPoller {

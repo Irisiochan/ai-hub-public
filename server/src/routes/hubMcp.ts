@@ -3,6 +3,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { Router } from 'express';
 import { z } from 'zod';
 import { buildDelegateTools, type DelegationCfg } from '../agents/gatewayTools.js';
+import { bearerMatches } from '../auth.js';
 import type { ContactRow, Db } from '../db.js';
 import type { JobStore } from '../workers/jobStore.js';
 
@@ -11,9 +12,9 @@ import type { JobStore } from '../workers/jobStore.js';
  * delegate tools to CLI backends. Claude CLI contacts get it merged into
  * their --mcp-config by the manager; Codex app-server gets per-process
  * mcp_servers.hub overrides, so no global config.toml edit is needed.
- * Stateless streamable-http: one server+transport per POST, identity comes
- * from the URL (gateway binds the tailnet, same trust level as the rest of
- * the HTTP API).
+ * Stateless streamable-http: one server+transport per POST. The contact id in
+ * the URL selects delegation policy; an independent HUB_MCP_TOKEN authenticates
+ * the internal CLI client before that identity is accepted.
  */
 
 const INPUT_SHAPES = {
@@ -36,8 +37,19 @@ const INPUT_SHAPES = {
   },
 } as Record<string, z.ZodRawShape>;
 
-export function hubMcpRouter(db: Db, jobs: JobStore): Router {
+export function hubMcpRouter(
+  db: Db,
+  jobs: JobStore,
+  internalToken: string | undefined = process.env.HUB_MCP_TOKEN
+): Router {
   const r = Router();
+
+  r.use('/hub-mcp/:contactId', (req, res, next) => {
+    const expected = internalToken?.trim() ?? '';
+    if (!expected) return res.status(503).json({ error: 'hub MCP authentication is not configured' });
+    if (!bearerMatches(req, expected)) return res.status(401).json({ error: 'invalid hub MCP token' });
+    next();
+  });
 
   r.post('/hub-mcp/:contactId', async (req, res) => {
     const contact = db

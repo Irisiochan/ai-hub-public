@@ -22,7 +22,7 @@ const fakeVault = {
   calls: [] as { name: string; args: any }[],
   async call(name: string, args: any) {
     this.calls.push({ name, args });
-    return `【假档案】${name} 查到的内容：ai-hub 是 Iris 的多 AI 群聊网关。`;
+    return `【假档案】${name} 查到的内容：ai-hub 是用户的多 AI 群聊网关。`;
   },
 } as any;
 
@@ -90,7 +90,7 @@ const openaiSrv = http.createServer((req, res) => {
         },
         {
           choices: [
-            { delta: { tool_calls: [{ index: 0, function: { arguments: 'ries/iris-core.md"}' } }] }, finish_reason: 'tool_calls' },
+            { delta: { tool_calls: [{ index: 0, function: { arguments: 'ries/user-profile.md"}' } }] }, finish_reason: 'tool_calls' },
           ],
         },
         { usage: { prompt_tokens: 100, completion_tokens: 20 } },
@@ -160,7 +160,7 @@ let geminiHits = 0;
 const signedFunctionPart = {
   functionCall: {
     name: 'read_file',
-    args: { path: 'memories/iris-core.md' },
+    args: { path: 'memories/user-profile.md' },
     id: 'gemini-fc-1',
   },
   thoughtSignature: 'opaque-signature-must-survive',

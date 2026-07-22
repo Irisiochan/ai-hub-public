@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import express from 'express';
 import { claudePermissionDecision, claudeTurnText } from '../src/agents/claudeCli.js';
 import { codexTurnInput } from '../src/agents/codexAppServer.js';
@@ -97,7 +97,7 @@ try {
   assert.equal(grokInput.type, 'acp');
   assert.deepEqual(grokInput.content[0], { type: 'text', text: '看图' });
   assert.equal(grokInput.content[1].type, 'resource_link');
-  assert.equal(grokInput.content[1].uri, new URL(`file:///${dmImagePaths[0].replaceAll('\\', '/')}`).href);
+  assert.equal(grokInput.content[1].uri, pathToFileURL(dmImagePaths[0]).href);
   assert.equal(grokInput.content[1].name, 'dm.png');
   assert.equal(grokInput.content[1].mimeType, 'image/png');
   assert.equal(grokInput.content[1].data, undefined, 'Grok 图片不得再把 base64 塞进命令行参数');
@@ -146,7 +146,7 @@ try {
   addImage(roomId, 'room.png');
   const anthropic = new DirectApiBackend({
     ...common, provider: 'anthropic', baseUrl: `http://127.0.0.1:${port}/v1/messages`, contactId: 'room', memberId: 'api-member',
-    roomMode: { selfId: 'api-member', nameOf: (sender: string) => sender === 'user' ? 'Iris' : sender },
+    roomMode: { selfId: 'api-member', nameOf: (sender: string) => sender === 'user' ? 'User' : sender },
   });
   await anthropic.start(null);
   await consume(anthropic, { text: '（群里有新消息，见对话历史。）' });
@@ -160,8 +160,8 @@ try {
   let imageRoomMembersCalls = 0;
   let dispatchedRoomTargets: any[] | undefined;
   const imageMembers = [
-    { id: 'codex-member', name: 'Cove', backend: 'codex' },
-    { id: 'claude-member', name: '橙', backend: 'claude-cli' },
+    { id: 'codex-member', name: 'Codex', backend: 'codex' },
+    { id: 'claude-member', name: 'Claude', backend: 'claude-cli' },
   ];
   const fakeManager = {
     get: () => ({ enqueue: () => 'queued' }),

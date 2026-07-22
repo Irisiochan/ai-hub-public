@@ -66,7 +66,8 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 
 或构建后单进程：`cd web && npm run build`，网关直接 serve `web/dist`。
 
-首次启动自动种一个 claude-cli 联系人。前提：`claude` CLI 已登录（`claude /login`）。
+首次启动会创建中性的 `Claude Code`、`Codex`、`Grok Build` 三个工具联系人，不写入用户姓名、
+私人关系人设或本机 Memory Vault 路径。使用前请分别完成所需 CLI 的登录。
 不想耗额度可以用 🧪 Mock 联系人（`server/scripts/mock-claude.mjs`）测管线和 UI。
 
 ## 配置
@@ -76,9 +77,13 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
   `memory-vault-mcp --vault <数据目录> --http --host 127.0.0.1 --port 8900`，再在
   `server/config.json` 将 `memory.mcpUrl` 指向 `http://127.0.0.1:8900/mcp`
 - 联系人级配置存在 DB（UI 可改）：模型、人设、记忆三开关、委派权限等
-- Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是人设
-  （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server
-- 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`DEEPSEEK_API_KEY`
+- Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是 Claude 配置模板；
+  `mcp.gateway.json` 与 `.grok/config.toml` 是网关按需生成的 MCP 配置
+- 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`HUB_MCP_TOKEN`、`DEEPSEEK_API_KEY`
+- CLI 联系人启用 PC Worker 委派前必须配置独立 `HUB_MCP_TOKEN`。该令牌只保护
+  内部 `/api/hub-mcp/*`，不要与桌面浏览器会话的 `HUB_TOKEN` 复用；未配置时接口默认关闭
+- Grok Build 启用委派时会在联系人工作目录生成项目级 `.grok/config.toml`；URL 和 Bearer
+  只引用 `HUB_PORT` / `HUB_MCP_TOKEN` 环境变量，不会把随机端口或令牌固化进公共仓库
 
 ### 自动记忆捕捉
 

@@ -18,7 +18,7 @@ assert.equal(detectTrigger('说好了明天去'), '时间与计划');
 assert.equal(detectTrigger('还说好舒服'), null);
 assert.equal(detectTrigger('说好了吗'), null);
 assert.equal(
-  detectTrigger('⚙ Worker 任务回执（网关自动通知，Iris 也看得到这条） 任务 abc → done 交付状态：delivered'),
+  detectTrigger('⚙ Worker 任务回执（网关自动通知，User 也看得到这条） 任务 abc → done 交付状态：delivered'),
   null
 );
 
@@ -107,7 +107,7 @@ for (const item of trueTaskCases) {
   const { writes, vault } = makeVault();
   await maybeCapture(
     vault as never,
-    { id: 'reply-echo-test', name: '嘎啦蜜' },
+    { id: 'reply-echo-test', name: 'Assistant' },
     '翻下我的档案',
     '你明天有个待办，长期偏好也在这里',
     () => {},
@@ -121,7 +121,7 @@ for (const item of trueTaskCases) {
   const { writes, vault } = makeVault();
   await maybeCapture(
     vault as never,
-    { id: 'llm-pending-test', name: '嘎啦蜜' },
+    { id: 'llm-pending-test', name: 'Assistant' },
     '提醒我有空处理一下',
     '',
     () => {},
@@ -159,7 +159,7 @@ for (const review of [
   }
 }
 
-// Room capture is attributed to the room, stores Iris's raw text once, and
+// Room capture is attributed to the room, stores the user's raw text once, and
 // omits an empty pseudo-reply section.
 {
   const { writes, vault } = makeVault();
@@ -181,7 +181,7 @@ for (const review of [
   );
   assert.equal(writes.length, 1, 'same room should be rate-limited to one capture');
   assert.deepEqual((writes[0].args.tags as string[]).slice(0, 2), ['hub-auto', 'room-capture-test']);
-  assert.match(String(writes[0].args.content), /\*\*Iris\*\*：明天下午三点开会/);
+  assert.match(String(writes[0].args.content), /\*\*User\*\*：明天下午三点开会/);
   assert.doesNotMatch(String(writes[0].args.content), /\*\*重大会议\*\*：/);
 }
 

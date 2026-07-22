@@ -29,6 +29,7 @@ import { CodexAppServerBackend } from './codexAppServer.js';
 import { touchConversationSummary } from './conversationSummary.js';
 import { DirectApiBackend } from './directApi.js';
 import { GrokCliBackend } from './grokCli.js';
+import { GROK_HUB_ALLOW_RULE, syncManagedGrokHubMcpConfig } from './grokMcpConfig.js';
 import {
   PROJECT_WRITE_GIT_GUARD,
   buildDelegateTools,
@@ -36,6 +37,14 @@ import {
   type DelegationCfg,
 } from './gatewayTools.js';
 import type { AgentBackend, TurnHandle } from './types.js';
+
+export function managedHubMcpConfig(url: string): Record<string, unknown> {
+  return {
+    type: 'http',
+    url,
+    headers: { Authorization: 'Bearer ${HUB_MCP_TOKEN}' },
+  };
+}
 
 export type RoomTurnOutcome = 'spoke' | 'silent' | 'error';
 
@@ -170,7 +179,7 @@ export class AgentRuntime {
     });
   }
 
-  /** 发言人显示名：user → Iris 的资料名，其余查联系人表。 */
+  /** 发言人显示名：user → 当前用户资料名，其余查联系人表。 */
   private nameOf(sender: string): string {
     if (sender === 'user') return getUserProfile(this.deps.db).name;
     if (sender === this.agent.id) return this.agent.name;
@@ -305,6 +314,10 @@ export class AgentRuntime {
 
     const delegation: DelegationCfg = cfg.delegation ?? {};
     const delegationOn = delegation.enabled === true && !!this.deps.jobStore;
+    const cliDelegationOn = delegationOn && ['claude-cli', 'codex', 'grok-cli'].includes(this.agent.backend);
+    if (cliDelegationOn && !process.env.HUB_MCP_TOKEN?.trim()) {
+      throw new Error('Worker 委派需要配置独立的 HUB_MCP_TOKEN');
+    }
 
     if (!resumeToken) {
       const bridge = this.buildBridge();
@@ -377,6 +390,7 @@ export class AgentRuntime {
         mcpServers = [{
           name: 'hub',
           url,
+          bearerTokenEnvVar: 'HUB_MCP_TOKEN',
           enabledTools: ['delegate_to_worker', 'worker_job_status', 'worker_job_cancel'],
           required: true,
           defaultToolsApprovalMode: 'approve' as const,
@@ -406,13 +420,19 @@ export class AgentRuntime {
       const memoryMcpOn = !!this.deps.vault && mem.injectOnSpawn;
       const allowRules: string[] = [];
       if (memoryMcpOn) allowRules.push('MCPTool(memory-vault__*)');
+      const { config } = this.deps;
+      const host = ['0.0.0.0', '::'].includes(config.host) ? '127.0.0.1' : config.host;
+      const hubMcpUrl = delegationOn
+        ? `http://${host}:\${HUB_PORT:-${config.port}}/api/hub-mcp/${encodeURIComponent(this.agent.id)}`
+        : undefined;
+      syncManagedGrokHubMcpConfig(cwd, hubMcpUrl);
       if (delegationOn) {
-        allowRules.push('MCPTool(hub__*)');
+        allowRules.push(GROK_HUB_ALLOW_RULE);
         preamble = [preamble, delegationGuidance(delegation, 'hub__')].join('\n');
-        this.log('worker delegation enabled (grok hub MCP)');
+        this.log('worker delegation enabled (grok project hub MCP)');
       }
       // chat-only 模式：禁掉内置写/终端工具，防 headless 确认墙炸整轮
-      // （对齐橙的 disallowedTools 白名单策略：看不见就不会调）
+      // 与其他 CLI 后端的工具白名单策略保持一致：看不见就不会调
       const disallowedTools = ['search_replace', 'run_terminal_command'];
       this.backend = new GrokCliBackend({
         cliPath: cfg.cliPath ?? this.deps.config.grok.cliPath,
@@ -422,6 +442,10 @@ export class AgentRuntime {
         disallowedTools,
         // grok headless 没有 system-prompt flag：人设 + 记忆前缀作为首轮网关注入
         preamble: [cfg.appendSystemPrompt, preamble].filter(Boolean).join('\n') || undefined,
+        // The cwd is AI Hub's managed chat directory (project writes are rejected
+        // above). Disable Grok's interactive folder-trust gate only for this child
+        // so its generated project MCP config can load in headless mode.
+        env: delegationOn ? { GROK_FOLDER_TRUST: '0' } : undefined,
         turnTimeoutMs: this.deps.config.grok.turnTimeoutMs,
         log: (m) => this.log(m),
       });
@@ -528,10 +552,9 @@ export class AgentRuntime {
     }
     if (opts.includeHub) {
       const host = ['0.0.0.0', '::'].includes(config.host) ? '127.0.0.1' : config.host;
-      servers.hub = {
-        type: 'http',
-        url: `http://${host}:${config.port}/api/hub-mcp/${this.agent.id}`,
-      };
+      servers.hub = managedHubMcpConfig(
+        `http://${host}:${config.port}/api/hub-mcp/${this.agent.id}`
+      );
     }
     if (Object.keys(servers).length === 0) return opts.base;
     const dir = path.resolve(config.agentsDir, opts.cwdName ?? this.agent.id);
@@ -937,7 +960,7 @@ export class AgentRuntime {
                 this.log(`session token threshold reached (${this.sessionInputTokens}/${threshold}) — rolling over`);
               }
             }
-            // 自动捕捉只在 DM 里跑：群消息由派发层按"Iris 原话、群级一次"捕捉，
+            // 自动捕捉只在 DM 里跑：群消息由派发层按“用户原话、群级一次”捕捉，
             // 成员发言（带名字前缀的 transcript）永不参与——防记忆污染
             if (!this.isRoom && this.deps.vault && mem.capture) {
               void maybeCapture(
@@ -1066,7 +1089,7 @@ export class AgentManager {
   >();
 
   /** 用户在群里发言 → 顺序点名轮 + 接话轮（输出不互相触发，轮数硬上限）。
-   *  记忆捕捉在这里做且只做一次：只看 Iris 的原话，成员发言永不参与。 */
+   *  记忆捕捉在这里做且只做一次：只看用户原话，成员发言永不参与。 */
   imageRoomMembers(room: ContactRow): ContactRow[] {
     return this.roomMembers(room);
   }

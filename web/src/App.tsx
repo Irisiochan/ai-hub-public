@@ -15,7 +15,7 @@ export default function App() {
   const [statuses, setStatuses] = useState<Record<string, ContactStatus>>({});
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [configFor, setConfigFor] = useState<{ contact: Contact | null } | null>(null);
-  const [user, setUser] = useState<UserProfile>({ name: 'Iris', avatar: '🦋', color: '#e94560' });
+  const [user, setUser] = useState<UserProfile>({ name: 'User', avatar: '🦋', color: '#e94560' });
   const [userConfigOpen, setUserConfigOpen] = useState(false);
   const [workerPanelOpen, setWorkerPanelOpen] = useState(false);
   const [publishStatusOpen, setPublishStatusOpen] = useState(false);
@@ -173,7 +173,7 @@ export default function App() {
           onSettings={() => setConfigFor({ contact: selected })}
         />
       ) : (
-        <div className="chat-empty">选个人开聊 🍊</div>
+        <div className="chat-empty">选个联系人开聊</div>
       )}
       {configFor && (
         <ContactConfig
