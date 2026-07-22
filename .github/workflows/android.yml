@@ -2,9 +2,9 @@ name: android-apk
 
 # 云端出 APK：本机网络走 Tailscale 出口节点下不动 Android 工具链，
 # 所以原生工程每次由 CI 现场生成（cap add）+ 打补丁 + 构建。
-# 首次运行若没配 ANDROID_KEYSTORE_B64/ANDROID_KEYSTORE_PASSWORD 两个 secret，
-# 会自动生成签名 keystore 并作为 artifact 导出（3 天过期）——下载后存成
-# repo secrets 再重跑，之后所有 APK 用同一签名，手机上可覆盖升级。
+# 没配 ANDROID_KEYSTORE_B64/ANDROID_KEYSTORE_PASSWORD 时会使用一次性临时签名，
+# 只适合试装，密钥不会上传。要让后续 APK 可覆盖升级，请自行生成 keystore，
+# 再把 base64 与密码存进仓库 Actions secrets。
 
 on:
   workflow_dispatch:
@@ -62,7 +62,6 @@ jobs:
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
 
       - name: Signing keystore
-        id: keystore
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           KEYSTORE_PASSWORD_SECRET: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -77,10 +76,8 @@ jobs:
             keytool -genkeypair -keystore mobile/keys/release.keystore -storetype PKCS12 \
               -alias aihub -keyalg RSA -keysize 2048 -validity 10950 \
               -storepass "$PW" -keypass "$PW" -dname "CN=ai-hub"
-            printf '%s' "$PW" > mobile/keys/keystore-password.txt
             echo "KEYSTORE_PASSWORD=$PW" >> "$GITHUB_ENV"
-            echo "bootstrap=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::no signing secrets — generated a fresh keystore; save the bootstrap artifact as secrets ANDROID_KEYSTORE_B64 + ANDROID_KEYSTORE_PASSWORD"
+            echo "::warning::no signing secrets — using an ephemeral key; this APK cannot upgrade builds signed by another run"
           fi
 
       - name: Build APK
@@ -105,11 +102,3 @@ jobs:
         with:
           name: ai-hub-apk
           path: ai-hub.apk
-
-      - name: Upload bootstrap keystore
-        if: steps.keystore.outputs.bootstrap == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: signing-keystore-bootstrap
-          path: mobile/keys/
-          retention-days: 3
