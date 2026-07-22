@@ -15,6 +15,7 @@
 - **群聊**：拉现有联系人建群，`@名字` / `@all` 调度，每成员独立会话
 - **图片**：选图/粘贴截图直接发，API 联系人可按需配独立视觉模型
 - **版本化长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档；两仓只通过 MCP 契约连接
+- **语义化记忆捕捉**：廉价规则先筛选候选，再由 DeepSeek 以固定 JSON schema 精筛；高置信度内容进入 inbox、明确误报丢弃，低置信度或 API 故障标记为待审，不阻断聊天
 - **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
   任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
 - **订阅额度可见**：Claude / Codex 标题栏实时显示 5h / 周窗口剩余
@@ -78,6 +79,28 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 - Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是人设
   （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server
 - 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`DEEPSEEK_API_KEY`
+
+### 自动记忆捕捉
+
+`hub-auto` 只检查用户原话。时间、待办、偏好或长期约定等规则命中后，才把该条原话发送给
+DeepSeek 做语义精筛，不会发送完整聊天历史或记忆库：
+
+- `confidence >= 0.8` 且模型判定值得保留：写入 Memory Vault `inbox/`
+- `confidence <= 0.2` 且模型判定不值得保留：直接丢弃
+- 中间置信度、未配置密钥、超时、非 2xx、空响应或 schema 无效：以
+  `llm-review-pending` 标签写入 `inbox/`，等待人工复核；聊天与 MCP 链路继续运行
+
+在 `.env` 中配置：
+
+```dotenv
+DEEPSEEK_API_KEY=your_key_here
+DEEPSEEK_CAPTURE_MODEL=deepseek-v4-flash
+# 可选；默认 https://api.deepseek.com
+DEEPSEEK_API_BASE_URL=
+```
+
+模型调用显式关闭 thinking。公开回归集使用合成样本，不包含私人聊天导出；可运行
+`npx tsx server/scripts/smoke-capture.ts` 验证规则边界、系统回执过滤、置信度分流和失败降级。
 
 ## Memory Vault
 
