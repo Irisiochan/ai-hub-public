@@ -1,6 +1,7 @@
 # ai-hub
 
-自托管的 AI 聊天网关与长期记忆库：像 IM 一样跟 Claude Code、Codex 和任意 API 模型聊天。
+自托管的 AI 聊天网关，也是 [Memory Vault](https://github.com/Irisiochan/memory-vault)
+的可选旗舰客户端：像 IM 一样跟 Claude Code、Codex、Grok CLI 和任意 API 模型聊天。
 手机/电脑浏览器访问，历史全同步，CLI 后端走订阅额度，还能把编码任务派回自己的 PC 执行。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
@@ -9,14 +10,15 @@
 ## 能干什么
 
 - **IM 式永续会话**：每个 AI 是一个联系人，一条永远聊下去的对话；改名、换头像、换颜色
-- **三种后端**：`claude` CLI（stream-json 持久子进程 + resume）、`codex app-server`（JSON-RPC）、
-  API 直连（Anthropic / OpenAI-compatible 双协议，UI 里自助添加任意供应商）
+- **四类后端**：`claude` CLI、`codex app-server`、Grok CLI，以及 Anthropic /
+  OpenAI-compatible / Gemini 原生 API；模型与推理档位可以按联系人和委派任务选择
 - **群聊**：拉现有联系人建群，`@名字` / `@all` 调度，每成员独立会话
 - **图片**：选图/粘贴截图直接发，API 联系人可按需配独立视觉模型
-- **内置长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档
+- **版本化长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档；两仓只通过 MCP 契约连接
 - **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
   任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
 - **订阅额度可见**：Claude / Codex 标题栏实时显示 5h / 周窗口剩余
+- **桌面与 Android 壳**：Electron 支持本地/远程 Hub，Capacitor 伴侣 App 可由 Actions 生成 APK
 - **运维内建**：token 门控的一键部署端点（拉取/构建/重启/健康检查/失败自动回滚）、
   SQLite 在线定时备份（integrity 校验 + 保留窗口）、发布状态面板
 
@@ -29,7 +31,7 @@
    │  每个联系人一个持久子进程或 API 客户端
    ├─ claude --input-format stream-json --output-format stream-json [--resume]
    ├─ codex app-server (JSON-RPC over stdio, thread/resume)
-   ├─ 直连 API (anthropic / openai-compat)
+   ├─ 直连 API (anthropic / openai-compat / gemini)
    └─ Memory Vault (MCP, :8900) → vault-data/ (Markdown)
 
 PC Worker (主动出站长轮询，无入站端口)
@@ -42,7 +44,8 @@ PC Worker (主动出站长轮询，无入站端口)
 
 ## 快速启动
 
-推荐用 Compose 一次启动前端、网关和记忆库：
+推荐用 Compose 一次启动前端、网关和记忆库。Compose 默认锁定
+`memory-vault` 的 `v0.4.1` 发布标签，不复制维护它的源码：
 
 ```bash
 cp .env.example .env
@@ -50,7 +53,8 @@ docker compose -f docker-compose.example.yml up --build -d
 ```
 
 打开 `http://127.0.0.1:3900`。首次启动会在仓库旁生成被 gitignore 的 `vault-data/`，
-里面是可直接用 Obsidian 打开的私人 Markdown 记忆库。
+里面是可直接用 Obsidian 打开的私人 Markdown 记忆库。升级记忆系统时，显式修改
+`.env` 中的 `MEMORY_VAULT_VERSION`，再运行契约测试。
 
 源码开发：
 
@@ -67,20 +71,30 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 ## 配置
 
 - `server/config.example.json` → 复制为 `server/config.json`（端口、CLI 路径等）
-- Compose 会自动连接内置 Memory Vault；源码开发时先启动仓库内的记忆服务，再在 `server/config.json` 将 `memory.mcpUrl` 指向 `http://127.0.0.1:8900/mcp`
+- Compose 会从独立仓库的固定标签构建 Memory Vault；源码开发时另行启动
+  `memory-vault-mcp --vault <数据目录> --http --host 127.0.0.1 --port 8900`，再在
+  `server/config.json` 将 `memory.mcpUrl` 指向 `http://127.0.0.1:8900/mcp`
 - 联系人级配置存在 DB（UI 可改）：模型、人设、记忆三开关、委派权限等
 - Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是人设
   （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server
-- 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`
+- 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`DEEPSEEK_API_KEY`
 
 ## Memory Vault
 
-`memory-vault/` 只存公开的服务代码与空白模板，私人数据始终写入 `vault-data/`，两者不会混在一起。
-即使首次启动产生记忆，ai-hub 源码仓库也会保持干净。
+Memory Vault 是独立主产品；AI Hub 不再内嵌或复制它的服务实现。
+`docker-compose.example.yml` 通过固定 release tag 消费它，私人数据始终写入被 gitignore 的
+`vault-data/`，所以首次启动产生记忆后 ai-hub 源码仓库仍保持干净。
 
 不配置 Git 时，记忆会稳定保存在本机目录。需要多设备同步时，把 `vault-data/` 初始化或克隆成一个
 **独立的私有 Git 仓库**；服务检测到 `vault-data/.git` 后，才会自动 pull、commit 和 push。
-它绝不会沿父目录误用公开 ai-hub 的远端。详细说明见 [`memory-vault/`](memory-vault/README.md)。
+它绝不会沿父目录误用公开 ai-hub 的远端。完整安装、同步和隐私说明见
+[Memory Vault 仓库](https://github.com/Irisiochan/memory-vault)。
+
+已启动 Memory Vault 后可验证当前 MCP 契约：
+
+```bash
+npm run smoke:memory-contract --prefix server
+```
 
 ## PC Worker（离线优先）
 
@@ -91,6 +105,12 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 2. `worker/config.example.json` → `worker/config.json`，填令牌和允许的 workspace
 3. `node worker/worker.mjs worker/config.json` 验证；Windows 登录自启用
    `worker-launcher.ps1 -Action install`（单实例、崩溃退避重拉、本地状态文件）
+
+## 桌面与 Android
+
+- `desktop/`：Electron 壳；默认运行本地网关，也可在 `desktop.json` 中指向已有远程 Hub。
+- `mobile/`：Capacitor Android 伴侣壳；`.github/workflows/android.yml` 可生成签名 APK artifact。
+- 两者都是同一套 Web UI 的消费端，不复制 Memory Vault 实现；远程模式仍应只连接受保护的私网 Hub。
 
 ## 安全模型与威胁边界
 

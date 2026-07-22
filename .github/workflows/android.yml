@@ -1,0 +1,115 @@
+name: android-apk
+
+# 云端出 APK：本机网络走 Tailscale 出口节点下不动 Android 工具链，
+# 所以原生工程每次由 CI 现场生成（cap add）+ 打补丁 + 构建。
+# 首次运行若没配 ANDROID_KEYSTORE_B64/ANDROID_KEYSTORE_PASSWORD 两个 secret，
+# 会自动生成签名 keystore 并作为 artifact 导出（3 天过期）——下载后存成
+# repo secrets 再重跑，之后所有 APK 用同一签名，手机上可覆盖升级。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/android.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Build web frontend
+        run: |
+          npm ci --prefix web
+          npm run build --prefix web
+
+      - name: Generate Android project
+        run: |
+          cp -r web/dist mobile/www
+          cd mobile
+          npm install
+          npx cap add android
+
+      - name: App icon
+        working-directory: mobile
+        run: |
+          if [ -f assets/logo.png ]; then
+            npx --yes @capacitor/assets generate --android \
+              --iconBackgroundColor '#e8620a' --iconBackgroundColorDark '#e8620a' \
+              --splashBackgroundColor '#16161e' --splashBackgroundColorDark '#16161e' \
+              || echo "::warning::icon generation failed, keeping default icon"
+          fi
+
+      - name: Patch native project
+        working-directory: mobile
+        run: |
+          node scripts/patch-android.mjs
+          npx cap sync android
+
+      - name: Accept SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Signing keystore
+        id: keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD_SECRET: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          mkdir -p mobile/keys
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > mobile/keys/release.keystore
+            echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD_SECRET" >> "$GITHUB_ENV"
+            echo "bootstrap=false" >> "$GITHUB_OUTPUT"
+          else
+            PW=$(openssl rand -hex 24)
+            keytool -genkeypair -keystore mobile/keys/release.keystore -storetype PKCS12 \
+              -alias aihub -keyalg RSA -keysize 2048 -validity 10950 \
+              -storepass "$PW" -keypass "$PW" -dname "CN=ai-hub"
+            printf '%s' "$PW" > mobile/keys/keystore-password.txt
+            echo "KEYSTORE_PASSWORD=$PW" >> "$GITHUB_ENV"
+            echo "bootstrap=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::no signing secrets — generated a fresh keystore; save the bootstrap artifact as secrets ANDROID_KEYSTORE_B64 + ANDROID_KEYSTORE_PASSWORD"
+          fi
+
+      - name: Build APK
+        working-directory: mobile/android
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ github.workspace }}/mobile/keys/release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: aihub
+          ANDROID_KEY_PASSWORD: ${{ env.KEYSTORE_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/ai-hub.apk"
+          {
+            echo '### APK'
+            ls -la "$GITHUB_WORKSPACE/ai-hub.apk"
+            sha256sum "$GITHUB_WORKSPACE/ai-hub.apk"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-hub-apk
+          path: ai-hub.apk
+
+      - name: Upload bootstrap keystore
+        if: steps.keystore.outputs.bootstrap == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: signing-keystore-bootstrap
+          path: mobile/keys/
+          retention-days: 3

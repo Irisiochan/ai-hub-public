@@ -27,7 +27,7 @@ fs.mkdirSync(ws);
 
 db.prepare(
   `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
-   VALUES ('claude', 'Claude', '🍊', '#f80', 'claude-cli', 'dm', ?, 0)`
+   VALUES ('cheng', '橙', '🍊', '#f80', 'claude-cli', 'dm', ?, 0)`
 ).run(JSON.stringify({ delegation: { enabled: true, workspaces: [ws], allowShell: true } }));
 db.prepare(
   `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
@@ -44,7 +44,7 @@ const port = (server.address() as any).port;
 // 1. delegation 开着的联系人：list + call
 const client = new Client({ name: 'smoke', version: '0.0.1' });
 await client.connect(
-  new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/api/hub-mcp/claude`))
+  new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/api/hub-mcp/cheng`))
 );
 const tools = await client.listTools();
 check('工具清单 3 件套', tools.tools.map((t) => t.name).sort().join(',') === 'delegate_to_worker,worker_job_cancel,worker_job_status');
@@ -62,23 +62,27 @@ const good: any = await client.callTool({
 const text = String(good.content?.[0]?.text ?? '');
 check('派单成功', !good.isError && text.includes('pending'), text);
 const jobId = text.match(/任务 ([0-9a-f-]{36})/)?.[1];
-check('job 落库且 requested_by=claude', !!jobId && (db.prepare('SELECT requested_by FROM jobs WHERE id = ?').get(jobId) as any)?.requested_by === 'claude');
+check('job 落库且 requested_by=cheng', !!jobId && (db.prepare('SELECT requested_by FROM jobs WHERE id = ?').get(jobId) as any)?.requested_by === 'cheng');
 await client.close();
 
 // 2. 没开 delegation 的联系人被 403
 let refused = false;
+const c2 = new Client({ name: 'smoke2', version: '0.0.1' });
 try {
-  const c2 = new Client({ name: 'smoke2', version: '0.0.1' });
   await c2.connect(
     new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/api/hub-mcp/nodelegate`))
   );
 } catch {
   refused = true;
+} finally {
+  await c2.close().catch(() => {});
 }
 check('未开启委派的联系人被拒', refused);
 
-server.close();
+await new Promise<void>((resolve, reject) => {
+  server.close((error) => error ? reject(error) : resolve());
+});
 db.close();
 fs.rmSync(dir, { recursive: true, force: true });
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
-process.exit(failures === 0 ? 0 : 1);
+process.exitCode = failures === 0 ? 0 : 1;

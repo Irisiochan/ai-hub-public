@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { BackupConfig } from './backup.js';
+import type { PurgeConfig } from './purge.js';
 
 export interface HubConfig {
   port: number;
@@ -18,8 +19,13 @@ export interface HubConfig {
     cliPath: string;
     turnTimeoutMs: number;
   };
+  grok: {
+    cliPath: string;
+    turnTimeoutMs: number;
+  };
   memory: MemoryConfig;
   backup: BackupConfig;
+  purge: PurgeConfig;
 }
 
 export interface MemoryConfig {
@@ -51,6 +57,10 @@ const defaults: HubConfig = {
     cliPath: 'codex',
     turnTimeoutMs: 300_000,
   },
+  grok: {
+    cliPath: 'grok',
+    turnTimeoutMs: 300_000,
+  },
   memory: {
     mcpUrl: null,
     repoPath: process.env.MEMORY_VAULT_REPO ?? null,
@@ -67,10 +77,19 @@ const defaults: HubConfig = {
     intervalHours: 24,
     keep: 14,
   },
+  purge: {
+    enabled: true,
+    messagesRetentionDays: 14,
+    jobsRetentionDays: 30,
+    intervalHours: 24,
+    batchSize: 500,
+  },
 };
 
 export function loadConfig(): HubConfig {
-  const file = path.join(serverRoot, 'config.json');
+  // HUB_CONFIG lets the desktop shell point at a config.json outside the
+  // install dir (e.g. %APPDATA%); default stays the checkout-local file.
+  const file = process.env.HUB_CONFIG ?? path.join(serverRoot, 'config.json');
   let user: Partial<HubConfig> = {};
   if (fs.existsSync(file)) {
     user = JSON.parse(fs.readFileSync(file, 'utf-8'));
@@ -80,9 +99,22 @@ export function loadConfig(): HubConfig {
     ...user,
     claude: { ...defaults.claude, ...(user.claude ?? {}) },
     codex: { ...defaults.codex, ...(user.codex ?? {}) },
+    grok: { ...defaults.grok, ...(user.grok ?? {}) },
     memory: { ...defaults.memory, ...(user.memory ?? {}) },
     backup: { ...defaults.backup, ...(user.backup ?? {}) },
+    purge: { ...defaults.purge, ...(user.purge ?? {}) },
   };
+  // env overrides (desktop shell); absent vars leave web/VPS behavior untouched
+  if (process.env.HUB_PORT) cfg.port = Number(process.env.HUB_PORT);
+  if (process.env.HUB_HOST) cfg.host = process.env.HUB_HOST;
+  if (process.env.HUB_WEB_DIST) cfg.webDist = process.env.HUB_WEB_DIST;
+  const dataDir = process.env.HUB_DATA_DIR;
+  if (dataDir) {
+    cfg.dbPath = path.join(dataDir, 'hub.db');
+    cfg.uploadsDir = path.join(dataDir, 'uploads');
+    cfg.agentsDir = path.join(dataDir, 'agents');
+    cfg.backup.dir = path.join(dataDir, 'backups');
+  }
   // resolve relative paths against server root so cwd doesn't matter
   cfg.dbPath = path.resolve(serverRoot, cfg.dbPath);
   cfg.agentsDir = path.resolve(serverRoot, cfg.agentsDir);
@@ -90,6 +122,9 @@ export function loadConfig(): HubConfig {
   cfg.uploadsDir = path.resolve(serverRoot, cfg.uploadsDir);
   cfg.backup.dir = path.resolve(serverRoot, cfg.backup.dir);
   if (cfg.memory.repoPath) cfg.memory.repoPath = path.resolve(serverRoot, cfg.memory.repoPath);
+  for (const dir of [path.dirname(cfg.dbPath), cfg.uploadsDir, cfg.agentsDir]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
   return cfg;
 }
 

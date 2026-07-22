@@ -41,7 +41,7 @@ async function call(url: string, init: RequestInit = {}) {
 
 try {
   const paired = await call('/workers', {
-    method: 'POST', body: JSON.stringify({ id: 'my-pc', name: 'User PC' }),
+    method: 'POST', body: JSON.stringify({ id: 'iris-pc', name: 'Iris PC' }),
   });
   const auth = { Authorization: `Bearer ${paired.token}` };
   const capabilities = { runners: ['codex'], workspaces: [dir], shell: true, ssh: false };
@@ -52,7 +52,7 @@ try {
   });
   check('首次开机自动接单', connected.worker.acceptingJobs === true && connected.worker.status === 'online');
 
-  let controlled = await call('/workers/my-pc/control', {
+  let controlled = await call('/workers/iris-pc/control', {
     method: 'POST', body: JSON.stringify({ enabled: false }),
   });
   check('手动关闭进入暂停', controlled.acceptingJobs === false && controlled.status === 'paused');
@@ -64,7 +64,7 @@ try {
   check('同次开机重连仍暂停', connected.worker.acceptingJobs === false && connected.worker.status === 'paused');
 
   const created = jobs.create({
-    requestedBy: 'User', runner: 'codex', workspace: dir, prompt: 'smoke',
+    requestedBy: 'iris', runner: 'codex', workspace: dir, prompt: 'smoke',
     permissions: { write: true, shell: true },
   });
   if ('error' in created) throw new Error(created.error);
@@ -80,6 +80,74 @@ try {
 
   const resumedClaim = await call('/worker/claim?wait=0', { headers: auth });
   check('恢复后可以认领原任务', resumedClaim.job?.id === created.job.id && resumedClaim.acceptingJobs === true);
+
+  await call(`/worker/jobs/${created.job.id}/start`, {
+    method: 'POST', headers: auth, body: '{}',
+  });
+  await call(`/worker/jobs/${created.job.id}/complete`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({
+      status: 'blocked',
+      result: 'commit 尚未推送',
+      delivery: { state: 'blocked_unpushed', head: 'abc1234', ahead: 1, dirtyFiles: [] },
+    }),
+  });
+  const candidates = await call('/worker/reconcile', { headers: auth });
+  check(
+    '交付阻塞任务进入自动回写候选',
+    candidates.jobs.length === 1 && candidates.jobs[0].id === created.job.id
+  );
+
+  let weakEvidenceRejected = false;
+  try {
+    await call(`/worker/jobs/${created.job.id}/reconcile`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({
+        head: 'def5678',
+        evidence: { dirty: false, ahead: 1, ancestorIncluded: true },
+      }),
+    });
+  } catch {
+    weakEvidenceRejected = true;
+  }
+  check('未推送证据不能回写完成', weakEvidenceRejected && jobs.get(created.job.id)?.status === 'blocked');
+
+  let mismatchedEvidenceRejected = false;
+  try {
+    await call(`/worker/jobs/${created.job.id}/reconcile`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({
+        head: 'def5678',
+        evidence: {
+          dirty: false,
+          ahead: 0,
+          ancestorIncluded: true,
+          blockedHead: 'wrong123',
+        },
+      }),
+    });
+  } catch {
+    mismatchedEvidenceRejected = true;
+  }
+  check('不匹配原交付的证据不能回写完成', mismatchedEvidenceRejected);
+
+  const reconciled = await call(`/worker/jobs/${created.job.id}/reconcile`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({
+      head: 'def5678',
+      evidence: {
+        dirty: false,
+        ahead: 0,
+        ancestorIncluded: true,
+        blockedHead: 'abc1234',
+      },
+    }),
+  });
+  check('可信 Git 证据自动回写 done', reconciled.status === 'done' && jobs.get(created.job.id)?.status === 'done');
+  check(
+    '自动回写留下审计消息',
+    jobs.messages(created.job.id).some((message) => message.content.includes('外部续接已自动确认完成'))
+  );
 } finally {
   await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
   db.close();

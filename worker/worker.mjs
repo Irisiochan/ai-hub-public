@@ -3,6 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import {
+  classifyDelivery,
+  isGitAncestor,
+  reconciliationDecision,
+  snapshotRepo,
+} from './delivery.mjs';
 
 // The stateful Windows launcher runs hidden, so persist worker stdout/stderr here.
 // Timestamps are deliberately rendered in Asia/Shanghai, independent of device timezone.
@@ -38,6 +44,7 @@ const bootId = process.env.AI_HUB_WORKER_BOOT_ID
   || `${os.hostname()}:${Math.round(estimatedBootMs / 60_000)}`;
 let stopping = false;
 let activeChild = null;
+let lastReconcileAt = 0;
 let spool = { active: null, events: [] };
 try { spool = JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch {}
 
@@ -99,6 +106,43 @@ async function recoverSpool() {
   saveSpool();
 }
 
+async function reconcileBlockedJobs() {
+  if (Date.now() - lastReconcileAt < 60_000) return;
+  lastReconcileAt = Date.now();
+  const response = await request('/api/worker/reconcile');
+  for (const job of response.jobs ?? []) {
+    try {
+      if (!allowedWorkspace(job.workspace) || !fs.existsSync(job.workspace)) continue;
+      const delivery = {
+        ...(job.delivery_meta && typeof job.delivery_meta === 'object' ? job.delivery_meta : {}),
+        state: job.delivery_state,
+      };
+      const current = await snapshotRepo(job.workspace);
+      const ancestorIncluded = current && delivery.head
+        ? await isGitAncestor(job.workspace, delivery.head, current.head)
+        : false;
+      const decision = reconciliationDecision(delivery, current, ancestorIncluded);
+      if (!decision.ready || !current) continue;
+      await request(`/api/worker/jobs/${job.id}/reconcile`, {
+        method: 'POST',
+        body: JSON.stringify({
+          head: current.head,
+          evidence: {
+            dirty: current.dirty,
+            ahead: current.ahead,
+            ancestorIncluded,
+            blockedHead: delivery.head,
+            reason: decision.reason,
+          },
+        }),
+      });
+      console.log(`[${job.id.slice(0, 8)}] blocked delivery reconciled at ${current.head.slice(0, 12)}`);
+    } catch (error) {
+      console.error(`[${job.id.slice(0, 8)}] blocked delivery reconciliation failed: ${error.message}`);
+    }
+  }
+}
+
 function parseLine(job, line, state) {
   if (!line.trim()) return;
   let data;
@@ -107,6 +151,22 @@ function parseLine(job, line, state) {
   if (typeof sessionId === 'string' && sessionId !== state.sessionId) {
     state.sessionId = sessionId;
     void event(job, 'session', `session ${sessionId}`, { sessionId });
+  }
+  // grok streaming-json：逐词 thought/text delta，缓冲成块再上传，end 时清账
+  if (data.type === 'thought' || data.type === 'text') {
+    if (typeof data.data !== 'string') return;
+    const key = data.type === 'thought' ? 'grokThought' : 'grokText';
+    state[key] = (state[key] ?? '') + data.data;
+    if (data.type === 'thought' && state.grokThought.length > 2000) {
+      void event(job, 'thinking', state.grokThought, { type: 'thought' });
+      state.grokThought = '';
+    }
+    return;
+  }
+  if (data.type === 'end' && (state.grokThought || state.grokText)) {
+    if (state.grokThought) { void event(job, 'thinking', state.grokThought, { type: 'thought' }); state.grokThought = ''; }
+    if (state.grokText) { state.result = state.grokText; void event(job, 'log', state.grokText, { type: 'text' }); state.grokText = ''; }
+    return;
   }
   if (data.type === 'result' && typeof data.result === 'string') state.result = data.result;
   if (data.type === 'item.completed' && data.item?.type === 'agent_message') {
@@ -120,35 +180,61 @@ function parseLine(job, line, state) {
 
 function runner(job) {
   const perms = job.permissions ?? {};
+  const opts = job.options ?? {};
   const prompt = [
     `ai-hub worker job ${job.id}.`,
     'Work only inside the assigned workspace. Do not delegate to other agents.',
     perms.ssh ? 'SSH/VPS operations are explicitly allowed for this job.' : 'Do not use SSH or operate remote machines.',
+    'Delivery is not complete merely because the agent process exits successfully. For write tasks, run the requested validation and commit/push only when it passes. If validation, commit, or push is blocked, leave a precise handoff: changed files, checks passed/failed, blocker, and next step.',
     job.prompt,
   ].join('\n\n');
   const sessionId = typeof job.session_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(job.session_id)
     ? job.session_id : null;
+  const validModel = (v) => typeof v === 'string' && /^[a-zA-Z0-9._-]{1,100}$/.test(v);
   if (job.runner === 'claude') {
     const tools = ['Read', 'Grep', 'Glob'];
     if (perms.write) tools.push('Write', 'Edit');
     if (perms.shell) tools.push('Bash');
     const args = ['-p', '--verbose', '--output-format', 'stream-json', '--allowedTools', tools.join(',')];
     if (!perms.shell) args.push('--disallowedTools', 'Bash');
+    const modelVal = validModel(opts.model) ? opts.model : cfg.claudeModel;
+    if (validModel(modelVal)) args.push('--model', modelVal);
+    if (opts.reasoning && ['low', 'medium', 'high', 'xhigh', 'max'].includes(opts.reasoning))
+      args.push('--effort', opts.reasoning);
     if (sessionId) args.push('--resume', sessionId);
     return { command: cfg.claudeCommand ?? (process.platform === 'win32' ? 'claude.cmd' : 'claude'), args, stdin: prompt };
   }
+  if (job.runner === 'grok') {
+    // prompt 走 --prompt-file，避开 Windows 命令行长度/引号问题；文件落 tmp，不脏工作区
+    const promptFile = path.join(os.tmpdir(), `ai-hub-grok-prompt-${job.id}.txt`);
+    fs.writeFileSync(promptFile, prompt, 'utf8');
+    const args = ['--prompt-file', promptFile, '--output-format', 'streaming-json'];
+    // 权限映射（实测 grok 0.2.102：默认只自动批读类工具；写/shell 要 --always-approve）
+    // read-only：不给 approve，再硬禁写与 shell；写不带 shell：approve + 禁 shell；写+shell：全放
+    const denied = [];
+    if (!perms.write) denied.push('search_replace', 'run_terminal_command');
+    else if (!perms.shell) denied.push('run_terminal_command');
+    if (denied.length) args.push('--disallowed-tools', denied.join(','));
+    if (perms.write) args.push('--always-approve');
+    if (sessionId) args.push('-r', sessionId);
+    const model = typeof cfg.grokModel === 'string' && /^[a-zA-Z0-9._-]{1,100}$/.test(cfg.grokModel)
+      ? ['-m', cfg.grokModel] : [];
+    return { command: cfg.grokCommand ?? 'grok', args: [...args, ...model], stdin: '' };
+  }
   const sandbox = perms.write ? 'workspace-write' : 'read-only';
   const command = cfg.codexCommand ?? (process.platform === 'win32' ? 'codex.cmd' : 'codex');
-  const model = typeof cfg.codexModel === 'string' && /^[a-zA-Z0-9._-]{1,100}$/.test(cfg.codexModel)
-    ? ['--model', cfg.codexModel] : [];
+  const modelVal = validModel(opts.model) ? opts.model : cfg.codexModel;
+  const model = validModel(modelVal) ? ['--model', modelVal] : [];
+  const reasoning = opts.reasoning && ['low', 'medium', 'high'].includes(opts.reasoning)
+    ? ['--reasoning-effort', opts.reasoning] : [];
   const windowsSandbox = process.platform === 'win32'
     && ['elevated', 'unelevated'].includes(cfg.codexWindowsSandbox ?? 'unelevated')
     ? ['--config', `windows.sandbox="${cfg.codexWindowsSandbox ?? 'unelevated'}"`]
     : [];
   if (sessionId) {
-    return { command, args: ['exec', 'resume', '--json', ...windowsSandbox, ...model, sessionId, '-'], stdin: prompt };
+    return { command, args: ['exec', 'resume', '--json', ...windowsSandbox, ...model, ...reasoning, sessionId, '-'], stdin: prompt };
   }
-  return { command, args: ['exec', '--json', ...windowsSandbox, '--sandbox', sandbox, '--skip-git-repo-check', ...model, '-'], stdin: prompt };
+  return { command, args: ['exec', '--json', ...windowsSandbox, '--sandbox', sandbox, '--skip-git-repo-check', ...model, ...reasoning, '-'], stdin: prompt };
 }
 
 async function execute(job) {
@@ -158,18 +244,31 @@ async function execute(job) {
   if (!fs.existsSync(job.workspace)) throw new Error(`workspace does not exist: ${job.workspace}`);
 
   await request(`/api/worker/jobs/${job.id}/start`, { method: 'POST', body: '{}' });
+  const repoBefore = await snapshotRepo(job.workspace);
   spool.active = { job, outcome: null };
   saveSpool();
   const spec = runner(job);
   await event(job, 'state', `启动 ${job.runner}: ${spec.command}`);
   const state = { result: '', sessionId: job.session_id ?? null, action: 'continue' };
 
+  // Same defense as server claudeCli.ts: settings.json "env" blocks re-inject
+  // ANTHROPIC_* when absent, so claude must get explicit overrides
+  // (empty key → apiKeySource: none → subscription OAuth).
+  const env = { ...process.env, NO_COLOR: '1' };
+  if (job.runner === 'claude') {
+    delete env.CLAUDECODE;
+    delete env.CLAUDE_CODE_ENTRYPOINT;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.ANTHROPIC_MODEL;
+    env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
+    env.ANTHROPIC_API_KEY = '';
+  }
   const child = spawn(spec.command, spec.args, {
     cwd: job.workspace,
     windowsHide: true,
     shell: process.platform === 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, NO_COLOR: '1' },
+    env,
   });
   activeChild = child;
   child.stdin.end(spec.stdin);
@@ -203,10 +302,20 @@ async function execute(job) {
   }).finally(() => clearInterval(heartbeat));
   activeChild = null;
   if (stdout.trim()) parseLine(job, stdout, state);
-  if (state.action === 'pause') return { status: 'paused', result: state.result };
-  if (state.action === 'cancel') return { status: 'interrupted', result: state.result };
-  if (exit.code === 0) return { status: 'done', result: state.result || `runner exited successfully` };
-  return { status: 'failed', result: state.result, error: `${spec.command} exited code=${exit.code} signal=${exit.signal}` };
+  const repoAfter = await snapshotRepo(job.workspace);
+  const delivery = classifyDelivery(repoBefore, repoAfter, exit.code);
+  if (state.action === 'pause') return { status: 'paused', result: state.result, delivery };
+  if (state.action === 'cancel') return { status: 'interrupted', result: state.result, delivery };
+  if (delivery.state === 'blocked_local_changes' || delivery.state === 'blocked_unpushed') {
+    return { status: 'blocked', result: state.result || 'runner left unfinished local work', delivery };
+  }
+  if (exit.code === 0) return { status: 'done', result: state.result || `runner exited successfully`, delivery };
+  return {
+    status: 'failed',
+    result: state.result,
+    error: `${spec.command} exited code=${exit.code} signal=${exit.signal}`,
+    delivery,
+  };
 }
 
 async function main() {
@@ -222,6 +331,7 @@ async function main() {
         }, bootId }),
       });
       await recoverSpool();
+      await reconcileBlockedJobs();
       if (connected.worker?.acceptingJobs === false) {
         if (!paused) console.log('worker paused from ai-hub; control heartbeat remains active');
         paused = true;

@@ -116,7 +116,7 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     db.prepare('UPDATE messages SET deleted = 1 WHERE id = ?').run(mid);
     deleteMessageFiles(db, uploadsDir, mid);
     sse.broadcast('prune', { contactId: contact.id, ids: [mid] });
-    await manager.invalidateConversation(contact);
+    await manager.invalidateConversation(contact, mid);
     res.json({ ok: true });
   });
 

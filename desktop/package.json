@@ -1,0 +1,25 @@
+{
+  "name": "ai-hub-desktop",
+  "productName": "ai-hub",
+  "private": true,
+  "version": "0.1.0",
+  "description": "ai-hub desktop shell (Electron)",
+  "main": "main.cjs",
+  "scripts": {
+    "prepare:app": "node scripts/prepare.mjs",
+    "dev": "node scripts/prepare.mjs && electron .",
+    "dist": "node scripts/prepare.mjs && electron-builder --win",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^12.11.1",
+    "express": "^4.21.2",
+    "multer": "^2.2.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^25.1.8"
+  }
+}

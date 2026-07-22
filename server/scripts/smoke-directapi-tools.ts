@@ -1,7 +1,7 @@
 /**
  * Smoke test: DirectApiBackend tool loop against mock SSE servers.
  * Round 1 returns a tool call, round 2 (after tool_result is fed back)
- * returns text. Verifies both openai-compat and anthropic protocols.
+ * returns text. Verifies openai-compat, anthropic, and native Gemini protocols.
  * Not shipped to production — run with: npx tsx scripts/smoke-directapi-tools.ts
  */
 import http from 'node:http';
@@ -22,11 +22,16 @@ const fakeVault = {
   calls: [] as { name: string; args: any }[],
   async call(name: string, args: any) {
     this.calls.push({ name, args });
-    return `【假档案】${name} 查到的内容：ai-hub 是 User 的多 AI 群聊网关。`;
+    return `【假档案】${name} 查到的内容：ai-hub 是 Iris 的多 AI 群聊网关。`;
   },
 } as any;
 
-async function runTurn(backend: DirectApiBackend, label: string, expectTool: string) {
+async function runTurn(
+  backend: DirectApiBackend,
+  label: string,
+  expectTool: string,
+  assertUsage?: (usage: any) => void
+) {
   const events: any[] = [];
   for await (const ev of backend.sendTurn({ text: '给我讲讲 ai-hub 架构' }).events) {
     events.push(ev);
@@ -35,12 +40,20 @@ async function runTurn(backend: DirectApiBackend, label: string, expectTool: str
   const done = events.find((e) => e.type === 'done');
   const toolUse = events.find((e) => e.type === 'tool_use');
   const toolResult = events.find((e) => e.type === 'tool_result');
-  const ok =
+  let ok =
     toolUse?.name === expectTool &&
     toolResult?.ok === true &&
     typeof done?.finalText === 'string' &&
     done.finalText.includes('翻完档案了') &&
     !kinds.includes('error');
+  if (ok && assertUsage) {
+    try {
+      assertUsage(done.usage);
+    } catch (e: any) {
+      console.log(`[${label}] usage assert failed: ${e.message}`);
+      ok = false;
+    }
+  }
   console.log(`[${label}] ${ok ? 'PASS' : 'FAIL'}  events=${kinds.join(',')}`);
   if (!ok) {
     console.log(JSON.stringify(events, null, 2));
@@ -51,6 +64,10 @@ async function runTurn(backend: DirectApiBackend, label: string, expectTool: str
 // ---------- openai-compat mock ----------
 let openaiHits = 0;
 const openaiSrv = http.createServer((req, res) => {
+  if (req.url !== '/v1beta/openai/chat/completions') {
+    res.writeHead(404).end(`unexpected path: ${req.url}`);
+    return;
+  }
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
@@ -73,7 +90,7 @@ const openaiSrv = http.createServer((req, res) => {
         },
         {
           choices: [
-            { delta: { tool_calls: [{ index: 0, function: { arguments: 'ries/User-core.md"}' } }] }, finish_reason: 'tool_calls' },
+            { delta: { tool_calls: [{ index: 0, function: { arguments: 'ries/iris-core.md"}' } }] }, finish_reason: 'tool_calls' },
           ],
         },
         { usage: { prompt_tokens: 100, completion_tokens: 20 } },
@@ -83,7 +100,7 @@ const openaiSrv = http.createServer((req, res) => {
       if (!toolMsg?.content?.includes('假档案')) throw new Error('tool result not fed back');
       sse(res, [
         { choices: [{ delta: { content: '翻完档案了：ai-hub 是网关架构。' } }] },
-        { usage: { prompt_tokens: 200, completion_tokens: 30 } },
+        { usage: { prompt_tokens: 200, completion_tokens: 30, prompt_cache_hit_tokens: 15 } },
       ]);
     }
   });
@@ -92,6 +109,10 @@ const openaiSrv = http.createServer((req, res) => {
 // ---------- anthropic mock ----------
 let anthropicHits = 0;
 const anthropicSrv = http.createServer((req, res) => {
+  if (req.url !== '/custom/anthropic/messages') {
+    res.writeHead(404).end(`unexpected path: ${req.url}`);
+    return;
+  }
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
@@ -134,8 +155,83 @@ const anthropicSrv = http.createServer((req, res) => {
   });
 });
 
-const [oPort, aPort] = await Promise.all(
-  [openaiSrv, anthropicSrv].map(
+// ---------- native Gemini mock ----------
+let geminiHits = 0;
+const signedFunctionPart = {
+  functionCall: {
+    name: 'read_file',
+    args: { path: 'memories/iris-core.md' },
+    id: 'gemini-fc-1',
+  },
+  thoughtSignature: 'opaque-signature-must-survive',
+};
+const geminiSrv = http.createServer((req, res) => {
+  if (req.url !== '/v1beta/models/mock-model:streamGenerateContent?alt=sse') {
+    res.writeHead(404).end(`unexpected path: ${req.url}`);
+    return;
+  }
+  let body = '';
+  req.on('data', (c) => (body += c));
+  req.on('end', () => {
+    const parsed = JSON.parse(body);
+    geminiHits++;
+    if (req.headers['x-goog-api-key'] !== 'test-key') throw new Error('Gemini API key header missing');
+    if (geminiHits === 1) {
+      if (!parsed.tools?.[0]?.functionDeclarations?.length) {
+        throw new Error('Gemini function declarations missing');
+      }
+      if (parsed.contents?.[0]?.role !== 'user') throw new Error('Gemini contents role mapping is wrong');
+      sse(res, [
+        {
+          candidates: [{
+            content: { role: 'model', parts: [signedFunctionPart] },
+            finishReason: 'STOP',
+          }],
+          usageMetadata: { promptTokenCount: 90, candidatesTokenCount: 12 },
+        },
+      ]);
+    } else {
+      const modelTurn = parsed.contents?.[parsed.contents.length - 2];
+      const toolTurn = parsed.contents?.[parsed.contents.length - 1];
+      if (JSON.stringify(modelTurn?.parts?.[0]) !== JSON.stringify(signedFunctionPart)) {
+        throw new Error('Gemini signed functionCall Part was not preserved exactly');
+      }
+      const response = toolTurn?.parts?.[0]?.functionResponse;
+      if (response?.id !== 'gemini-fc-1' || !response?.response?.output?.includes('假档案')) {
+        throw new Error('Gemini functionResponse did not preserve id/result');
+      }
+      sse(res, [
+        {
+          candidates: [{
+            content: { role: 'model', parts: [{ text: '翻完档案了：Gemini 原生回环完成。' }] },
+            finishReason: 'STOP',
+          }],
+          usageMetadata: {
+            promptTokenCount: 180,
+            candidatesTokenCount: 20,
+            thoughtsTokenCount: 5,
+            cachedContentTokenCount: 7,
+          },
+        },
+        {
+          candidates: [{
+            content: { role: 'model', parts: [{ text: '', thoughtSignature: 'final-signature' }] },
+            finishReason: 'STOP',
+          }],
+          usageMetadata: {
+            promptTokenCount: 180,
+            candidatesTokenCount: 20,
+            thoughtsTokenCount: 5,
+            cachedContentTokenCount: 7,
+          },
+        },
+      ]);
+    }
+  });
+});
+
+const [oPort, aPort, gPort] = await Promise.all(
+  [openaiSrv, anthropicSrv, geminiSrv].map(
     (srv) =>
       new Promise<number>((resolve) => srv.listen(0, '127.0.0.1', () => resolve((srv.address() as any).port)))
   )
@@ -145,6 +241,10 @@ const common = {
   apiKey: 'test-key',
   model: 'mock-model',
   maxHistoryMessages: 10,
+  historyTokenBudget: 8_000,
+  minRecentTurns: 2,
+  summaryMaxTokens: 1_000,
+  historySummaryStrategy: 'off' as const,
   maxTokens: 1000,
   turnTimeoutMs: 10_000,
   db: fakeDb,
@@ -154,14 +254,40 @@ const common = {
   vault: fakeVault,
 };
 
-const openaiBackend = new DirectApiBackend({ ...common, provider: 'openai-compat', baseUrl: `http://127.0.0.1:${oPort}` });
+const openaiBackend = new DirectApiBackend({
+  ...common,
+  provider: 'openai-compat',
+  baseUrl: `http://127.0.0.1:${oPort}/v1beta/openai/chat/completions`,
+});
 await openaiBackend.start(null);
-await runTurn(openaiBackend, 'openai-compat', 'read_file');
+await runTurn(openaiBackend, 'openai-compat', 'read_file', (usage) => {
+  if (usage?.cacheRead !== 15) throw new Error(`expected cacheRead=15 from prompt_cache_hit_tokens, got ${usage?.cacheRead}`);
+});
 
-const anthropicBackend = new DirectApiBackend({ ...common, provider: 'anthropic', baseUrl: `http://127.0.0.1:${aPort}` });
+const anthropicBackend = new DirectApiBackend({
+  ...common,
+  provider: 'anthropic',
+  baseUrl: `http://127.0.0.1:${aPort}/custom/anthropic/messages`,
+});
 await anthropicBackend.start(null);
 await runTurn(anthropicBackend, 'anthropic', 'search_vault');
+
+const geminiBackend = new DirectApiBackend({
+  ...common,
+  provider: 'gemini',
+  baseUrl: `http://127.0.0.1:${gPort}/v1beta/models/{model}:streamGenerateContent?alt=sse`,
+});
+await geminiBackend.start(null);
+// Gemini：本轮 input 取最终轮 180，而非 90+180=270；output/cache 口径见 smoke-token-efficiency
+await runTurn(geminiBackend, 'gemini', 'read_file', (usage) => {
+  if (usage?.input !== 180) throw new Error(`expected display input=180, got ${usage?.input}`);
+  if (usage?.inputRoundsSum !== 270) throw new Error(`expected roundsSum=270, got ${usage?.inputRoundsSum}`);
+  if (usage?.output !== 37) throw new Error(`expected output=37 (12+25), got ${usage?.output}`);
+  if (usage?.cacheRead !== 7) throw new Error(`expected final-round cacheRead=7, got ${usage?.cacheRead}`);
+  if (usage?.providerRounds !== 2) throw new Error(`expected providerRounds=2, got ${usage?.providerRounds}`);
+});
 
 console.log(`vault calls: ${JSON.stringify(fakeVault.calls)}`);
 openaiSrv.close();
 anthropicSrv.close();
+geminiSrv.close();

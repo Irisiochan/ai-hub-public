@@ -6,6 +6,7 @@ import ContactList from './components/ContactList';
 import PublishStatusPanel from './components/PublishStatusPanel';
 import UserConfig from './components/UserConfig';
 import WorkerPanel from './components/WorkerPanel';
+import { appendMessageDelta, mergeIncomingMessage, mergeMessageRows } from './messageMerge';
 
 export default function App() {
   const [contacts, setContacts] = useState<Contact[]>([]);
@@ -14,7 +15,7 @@ export default function App() {
   const [statuses, setStatuses] = useState<Record<string, ContactStatus>>({});
   const [unread, setUnread] = useState<Record<string, number>>({});
   const [configFor, setConfigFor] = useState<{ contact: Contact | null } | null>(null);
-  const [user, setUser] = useState<UserProfile>({ name: 'User', avatar: '🦋', color: '#e94560' });
+  const [user, setUser] = useState<UserProfile>({ name: 'Iris', avatar: '🦋', color: '#e94560' });
   const [userConfigOpen, setUserConfigOpen] = useState(false);
   const [workerPanelOpen, setWorkerPanelOpen] = useState(false);
   const [publishStatusOpen, setPublishStatusOpen] = useState(false);
@@ -30,7 +31,7 @@ export default function App() {
       const idx = list.findIndex((m) => m.id === msg.id);
       const next =
         idx >= 0
-          ? [...list.slice(0, idx), msg, ...list.slice(idx + 1)]
+          ? [...list.slice(0, idx), mergeIncomingMessage(list[idx], msg), ...list.slice(idx + 1)]
           : [...list, msg].sort((a, b) => a.id - b.id);
       return { ...prev, [msg.contact_id]: next };
     });
@@ -50,9 +51,7 @@ export default function App() {
     const { messages: rows } = await api.messages(contactId, { limit: 50 });
     setMessages((prev) => {
       const existing = prev[contactId] ?? [];
-      const byId = new Map(existing.map((m) => [m.id, m]));
-      for (const r of rows) byId.set(r.id, r);
-      return { ...prev, [contactId]: [...byId.values()].sort((a, b) => a.id - b.id) };
+      return { ...prev, [contactId]: mergeMessageRows(existing, rows) };
     });
   }, []);
 
@@ -63,8 +62,7 @@ export default function App() {
     if (rows.length === 0) return;
     setMessages((prev) => {
       const existing = prev[contactId] ?? [];
-      const byId = new Map([...rows, ...existing].map((m) => [m.id, m]));
-      return { ...prev, [contactId]: [...byId.values()].sort((a, b) => a.id - b.id) };
+      return { ...prev, [contactId]: mergeMessageRows(rows, existing) };
     });
   }, []);
 
@@ -74,7 +72,19 @@ export default function App() {
     void api.getUser().then(setUser).catch(() => {});
     setStatuses((prev) => {
       const next = { ...prev };
-      for (const c of list) next[c.id] = { state: c.state };
+      for (const c of list) {
+        const prevStatus = prev[c.id];
+        const busy =
+          c.state === 'thinking' ||
+          c.state === 'streaming' ||
+          c.state.startsWith('tool:');
+        // Prefer server member; if contacts snapshot omitted it mid-turn, keep
+        // the previous member while state is still busy (never invent room title).
+        const member =
+          c.member ??
+          (busy && prevStatus?.state === c.state ? prevStatus.member : undefined);
+        next[c.id] = { state: c.state, member };
+      }
       return next;
     });
     if (selectedRef.current) await loadMessages(selectedRef.current);
@@ -90,9 +100,7 @@ export default function App() {
           if (!list) return prev;
           return {
             ...prev,
-            [contactId]: list.map((m) =>
-              m.id === messageId ? { ...m, content: m.content + text } : m
-            ),
+            [contactId]: appendMessageDelta(list, messageId, text),
           };
         });
       },

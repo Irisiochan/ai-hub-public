@@ -31,14 +31,19 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
   const [apiKey, setApiKey] = useState<string>(cfg.apiKey ?? '');
   const [model, setModel] = useState<string>(cfg.model ?? '');
   const [visionModel, setVisionModel] = useState<string>(cfg.visionModel ?? '');
+  // 图片支持：auto=按模型推断（deepseek 等纯文字模型自动剥图），on/off=显式覆盖
+  const [imageSupport, setImageSupport] = useState<'auto' | 'on' | 'off'>(
+    typeof cfg.supportsImages === 'boolean' ? (cfg.supportsImages ? 'on' : 'off') : 'auto'
+  );
   const [systemPrompt, setSystemPrompt] = useState<string>(cfg.systemPrompt ?? '');
   const [maxHistory, setMaxHistory] = useState<number>(cfg.maxHistoryMessages ?? 60);
-  const [historyTokenBudget, setHistoryTokenBudget] = useState<number>(cfg.historyTokenBudget ?? 24000);
+  // 与 server manager.ts API 默认一致：未配置时 compact + 8k 历史预算
+  const [historyTokenBudget, setHistoryTokenBudget] = useState<number>(cfg.historyTokenBudget ?? 8000);
   const [minRecentTurns, setMinRecentTurns] = useState<number>(cfg.minRecentTurns ?? 6);
   const [summaryMaxTokens, setSummaryMaxTokens] = useState<number>(cfg.summaryMaxTokens ?? 3000);
   const [historySummary, setHistorySummary] = useState<boolean>(cfg.historySummaryStrategy !== 'off');
   const [memoryPreambleMode, setMemoryPreambleMode] = useState<'full' | 'compact' | 'off'>(
-    cfg.memoryPreambleMode ?? (creating ? 'compact' : 'full')
+    cfg.memoryPreambleMode ?? 'compact'
   );
 
   const [memInject, setMemInject] = useState<boolean>(mem.injectOnSpawn ?? true);
@@ -48,6 +53,11 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
   const [delegEnabled, setDelegEnabled] = useState<boolean>(delegation.enabled ?? false);
   const [delegWorkspaces, setDelegWorkspaces] = useState<string[]>(
     Array.isArray(delegation.workspaces) ? delegation.workspaces : []
+  );
+  const [delegRunners, setDelegRunners] = useState<string[]>(
+    Array.isArray(delegation.runners) && delegation.runners.length
+      ? delegation.runners.filter((runner: unknown) => ['claude', 'codex', 'grok'].includes(String(runner)))
+      : ['claude', 'codex', 'grok']
   );
   const [delegWorkspaceDraft, setDelegWorkspaceDraft] = useState('');
   const [delegShell, setDelegShell] = useState<boolean>(delegation.allowShell ?? false);
@@ -71,11 +81,12 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
   const buildConfig = (): Record<string, unknown> => {
     if (advanced) return JSON.parse(rawJson);
     if (isRoom) return { ...cfg, members, reactionRounds, respondAllByDefault };
-    // 保留 runners/workerId/allowSsh 等只能走高级 JSON 改的深层字段
+    // 保留 workerId/allowSsh 等只能走高级 JSON 改的深层字段
     const delegationCfg = {
       ...delegation,
       enabled: delegEnabled,
       workspaces: delegWorkspaces,
+      runners: delegRunners,
       allowShell: delegShell,
       maxOpenJobs: delegMaxJobs,
     };
@@ -97,6 +108,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
       apiKey: apiKey, // 打码值/空 = 服务端保留旧 key
       model: model.trim(),
       visionModel: visionModel.trim() || undefined,
+      supportsImages: imageSupport === 'auto' ? undefined : imageSupport === 'on',
       systemPrompt: systemPrompt.trim() || undefined,
       maxHistoryMessages: maxHistory,
       historyTokenBudget,
@@ -241,6 +253,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                   <select value={provider} onChange={(e) => setProvider(e.target.value)}>
                     <option value="openai-compat">OpenAI 兼容（GLM/DeepSeek/…）</option>
                     <option value="anthropic">Anthropic</option>
+                    <option value="gemini">Gemini 原生</option>
                   </select>
                 </label>
                 <label className="field" style={{ flex: 1 }}>
@@ -258,12 +271,36 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                 <span className="field-hint">只在消息含图片时使用，不改变日常文字聊天模型。</span>
               </label>
               <label className="field">
-                Base URL
+                图片支持
+                <select
+                  value={imageSupport}
+                  onChange={(e) => setImageSupport(e.target.value as 'auto' | 'on' | 'off')}
+                >
+                  <option value="auto">自动（按模型判断，deepseek 等纯文字模型自动去图）</option>
+                  <option value="on">支持（多模态模型）</option>
+                  <option value="off">不支持（纯文字，含图历史降级为文字占位）</option>
+                </select>
+                <span className="field-hint">
+                  未配图片模型时，纯文字模型收到含图历史会剥掉图片、换成占位，避免上游拒收 image_url。
+                </span>
+              </label>
+              <label className="field">
+                完整 API URL
                 <input
                   value={baseUrl}
                   onChange={(e) => setBaseUrl(e.target.value)}
-                  placeholder="https://open.bigmodel.cn/api/paas（会自动拼 /v1/…）"
+                  placeholder={
+                    provider === 'anthropic'
+                      ? 'https://api.anthropic.com/v1/messages'
+                      : provider === 'gemini'
+                        ? 'https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse'
+                        : 'https://api.openai.com/v1/chat/completions'
+                  }
                 />
+                <span className="field-hint">
+                  请求会原样发到这个地址，不再自动追加 /v1/… 路径。
+                  {provider === 'gemini' ? ' Gemini 原生地址可用 {model} 占位，以便图片模型自动切换。' : ''}
+                </span>
               </label>
               <label className="field">
                 API Key
@@ -301,7 +338,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                     min={2048}
                     step={1000}
                     value={historyTokenBudget}
-                    onChange={(e) => setHistoryTokenBudget(Math.max(2048, Number(e.target.value) || 24000))}
+                    onChange={(e) => setHistoryTokenBudget(Math.max(2048, Number(e.target.value) || 8000))}
                   />
                 </label>
                 <label className="field" style={{ flex: 1 }}>
@@ -347,7 +384,8 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                 超预算时持久化滚动摘要（关闭后只裁剪旧原文）
               </label>
               <p className="field-hint">
-                历史条数是硬上限；token 预算先保近期原文，再把更早消息压成联系人独立摘要。编辑或删除会自动重建，避免残留旧内容。
+                历史条数是硬上限；token 预算先保近期原文，再把更早消息压成联系人独立摘要。
+                编辑/删除若落在摘要覆盖区会局部重建该窗，只改近期原文则保留摘要；供应商窗口会再预留输出/工具/附件空间。
               </p>
               <fieldset className="mem-toggles">
                 <legend>记忆库</legend>
@@ -370,6 +408,9 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
           {!isRoom && !isApi && !advanced && (
             <fieldset className="mem-toggles">
               <legend>项目权限</legend>
+              {contact?.backend === 'grok-cli' ? (
+                <p className="field-hint">grok-cli 后端暂不支持项目写权限。</p>
+              ) : (
               <label>
                 <input
                   type="checkbox"
@@ -378,7 +419,8 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                 />
                 允许这个联系人修改指定项目
               </label>
-              {projectEnabled && (
+              )}
+              {projectEnabled && contact?.backend !== 'grok-cli' && (
                 <>
                   <label className="field">
                     项目工作区（必须已存在，不能填磁盘根目录）
@@ -450,7 +492,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                     <div className="deleg-workspace-add">
                       <input
                         value={delegWorkspaceDraft}
-                        placeholder="C:\path\to\project"
+                        placeholder="C:\projects\my-repo"
                         onChange={(e) => setDelegWorkspaceDraft(e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') {
@@ -462,6 +504,33 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                       <button type="button" onClick={addDelegWorkspace} disabled={!delegWorkspaceDraft.trim()}>
                         添加
                       </button>
+                    </div>
+                  </div>
+                  <div className="deleg-workspaces">
+                    <span className="field-hint">允许使用的本机 runner（至少保留一个）</span>
+                    <div className="field-row">
+                      {[
+                        ['claude', 'Claude'],
+                        ['codex', 'Codex'],
+                        ['grok', 'Grok'],
+                      ].map(([runner, label]) => (
+                        <label key={runner}>
+                          <input
+                            type="checkbox"
+                            checked={delegRunners.includes(runner)}
+                            onChange={() =>
+                              setDelegRunners((prev) =>
+                                prev.includes(runner)
+                                  ? prev.length > 1
+                                    ? prev.filter((item) => item !== runner)
+                                    : prev
+                                  : [...prev, runner]
+                              )
+                            }
+                          />
+                          {label}
+                        </label>
+                      ))}
                     </div>
                   </div>
                   <label>
@@ -486,6 +555,8 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                     SSH 等高影响能力永远不给模型，只能在 🖥 面板手动派。委派任务会以子会话形式挂在原聊天消息下。
                     {contact?.backend === 'codex' &&
                       ' Codex 会按联系人自动接入 hub MCP，无需修改全局 config.toml。'}
+                    {contact?.backend === 'grok-cli' &&
+                      ' Grok 使用部署机受信任的用户级 hub MCP；这里只控制是否授权委派，并仅自动批准这个接口。'}
                   </p>
                 </>
               )}

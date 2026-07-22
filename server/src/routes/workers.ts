@@ -4,6 +4,8 @@ import type { Db, JobRow, WorkerRow } from '../db.js';
 import type { SseHub } from '../sse.js';
 import { ACTIVE_STATUSES, JobStore, LEASE_SECONDS, workspaceAllowed } from '../workers/jobStore.js';
 
+// jobs.deleted = 1 is presentation soft-delete; claim/list hide those rows.
+
 type Capabilities = {
   runners?: string[];
   workspaces?: string[];
@@ -37,7 +39,12 @@ function publicWorker(row: WorkerRow) {
 }
 
 function publicJob(row: JobRow) {
-  return { ...row, permissions: json(row.permissions, {}) };
+  return {
+    ...row,
+    permissions: json(row.permissions, {}),
+    options: json(row.options ?? '{}', {}),
+    delivery_meta: row.delivery_meta ? json(row.delivery_meta, {}) : null,
+  };
 }
 
 function workerFrom(req: Request, db: Db): WorkerRow | null {
@@ -111,22 +118,40 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
   r.get('/jobs', (req, res) => {
     jobs.reap();
     const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 300);
-    const rows = db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit) as JobRow[];
+    const rows = db
+      .prepare('SELECT * FROM jobs WHERE deleted = 0 ORDER BY created_at DESC LIMIT ?')
+      .all(limit) as JobRow[];
     res.json({ jobs: rows.map(publicJob) });
   });
 
   r.get('/jobs/:id', (req, res) => {
     jobs.reap();
     const job = jobs.get(req.params.id);
-    if (!job) return res.status(404).json({ error: 'job not found' });
+    if (!job || job.deleted === 1) return res.status(404).json({ error: 'job not found' });
     res.json({ job: publicJob(job), messages: jobs.messages(job.id) });
   });
 
+  /**
+   * Soft-delete / hide a job window (presentation layer). Not a hard delete.
+   * Active jobs need force=true after UI confirmation that the worker may continue.
+   */
+  r.delete('/jobs/:id', (req, res) => {
+    const force =
+      req.body?.force === true ||
+      req.query.force === '1' ||
+      req.query.force === 'true';
+    const outcome = jobs.softDelete(req.params.id, 'iris', { force });
+    if ('error' in outcome) {
+      return res.status(outcome.code).json({ error: outcome.error });
+    }
+    res.json({ ok: true, job: publicJob(outcome.job) });
+  });
+
   r.post('/jobs', (req, res) => {
-    const runner = req.body?.runner === 'claude' ? 'claude' : req.body?.runner === 'codex' ? 'codex' : '';
+    const runner = ['claude', 'codex', 'grok'].includes(req.body?.runner) ? req.body.runner : '';
     if (!runner) return res.status(400).json({ error: 'runner/workspace/prompt required' });
     const created = jobs.create({
-      requestedBy: typeof req.body?.requestedBy === 'string' ? req.body.requestedBy : 'User',
+      requestedBy: typeof req.body?.requestedBy === 'string' ? req.body.requestedBy : 'iris',
       runner,
       workspace: typeof req.body?.workspace === 'string' ? req.body.workspace : '',
       prompt: typeof req.body?.prompt === 'string' ? req.body.prompt : '',
@@ -151,7 +176,11 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
   });
 
   r.post('/jobs/:id/action', (req, res) => {
-    const outcome = jobs.action(req.params.id, req.body?.action, 'User');
+    const existing = jobs.get(req.params.id);
+    if (!existing || existing.deleted === 1) {
+      return res.status(404).json({ error: 'job not found' });
+    }
+    const outcome = jobs.action(req.params.id, req.body?.action, 'iris');
     if ('error' in outcome) {
       return res.status(outcome.error === 'job not found' ? 404 : 409).json({ error: outcome.error });
     }
@@ -184,7 +213,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     const runners = Array.isArray(caps.runners) ? caps.runners : [];
     const roots = Array.isArray(caps.workspaces) ? caps.workspaces : [];
     const candidates = db.prepare(
-      `SELECT * FROM jobs WHERE status = 'pending' AND (worker_id IS NULL OR worker_id = ?)
+      `SELECT * FROM jobs WHERE deleted = 0 AND status = 'pending' AND (worker_id IS NULL OR worker_id = ?)
        ORDER BY priority DESC, created_at ASC LIMIT 50`
     ).all(worker.id) as JobRow[];
     for (const job of candidates) {
@@ -222,6 +251,56 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       if (Date.now() >= deadline) return res.json({ job: null, acceptingJobs: true });
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
+  });
+
+  r.get('/worker/reconcile', (req, res) => {
+    const worker = workerFrom(req, db);
+    if (!worker) return res.status(401).json({ error: 'invalid worker token' });
+    const rows = db.prepare(
+      `SELECT * FROM jobs
+       WHERE worker_id = ? AND status = 'blocked'
+       AND delivery_state IN ('blocked_local_changes', 'blocked_unpushed')
+       ORDER BY updated_at ASC LIMIT 50`
+    ).all(worker.id) as JobRow[];
+    res.json({ jobs: rows.map(publicJob) });
+  });
+
+  r.post('/worker/jobs/:id/reconcile', (req, res) => {
+    const worker = workerFrom(req, db);
+    if (!worker) return res.status(401).json({ error: 'invalid worker token' });
+    const job = db.prepare('SELECT * FROM jobs WHERE id = ? AND worker_id = ?')
+      .get(req.params.id, worker.id) as JobRow | undefined;
+    if (!job) return res.status(404).json({ error: 'job not found' });
+    const head = typeof req.body?.head === 'string' ? req.body.head.trim() : '';
+    const evidence = req.body?.evidence && typeof req.body.evidence === 'object'
+      ? req.body.evidence as Record<string, unknown>
+      : null;
+    if (
+      !/^[0-9a-f]{7,64}$/i.test(head)
+      || evidence?.dirty !== false
+      || evidence?.ahead !== 0
+      || evidence?.ancestorIncluded !== true
+    ) {
+      return res.status(400).json({ error: 'clean synchronized git evidence required' });
+    }
+    const previous = json<Record<string, unknown>>(job.delivery_meta ?? '', {});
+    const blockedHead = typeof previous.head === 'string' ? previous.head : '';
+    if (
+      !/^[0-9a-f]{7,64}$/i.test(blockedHead)
+      || evidence.blockedHead !== blockedHead
+    ) {
+      return res.status(400).json({ error: 'evidence does not match blocked delivery' });
+    }
+    const deliveryMeta = JSON.stringify({
+      ...previous,
+      state: 'delivered',
+      reconciledAt: new Date().toISOString(),
+      reconciliation: { ...evidence, head },
+    }).slice(0, 100_000);
+    const outcome = jobs.reconcileBlocked(job, worker.id, deliveryMeta, head);
+    if ('error' in outcome) return res.status(409).json({ error: outcome.error });
+    db.prepare("UPDATE workers SET last_seen_at = datetime('now') WHERE id = ?").run(worker.id);
+    res.json({ ok: true, status: outcome.status });
   });
 
   r.post('/worker/jobs/:id/start', (req, res) => {
@@ -273,7 +352,21 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     if (!job) return res.status(404).json({ error: 'job not found' });
     const result = typeof req.body?.result === 'string' ? req.body.result.slice(0, 500_000) : null;
     const error = typeof req.body?.error === 'string' ? req.body.error.slice(0, 20_000) : null;
-    const status = jobs.complete(job, req.body?.status, result, error);
+    const delivery = req.body?.delivery && typeof req.body.delivery === 'object'
+      ? req.body.delivery as Record<string, unknown>
+      : null;
+    const allowedDeliveryStates = new Set([
+      'delivered',
+      'blocked_local_changes',
+      'blocked_unpushed',
+      'failed_clean',
+      'unknown',
+    ]);
+    const deliveryState = delivery && allowedDeliveryStates.has(String(delivery.state))
+      ? String(delivery.state)
+      : null;
+    const deliveryMeta = delivery ? JSON.stringify(delivery).slice(0, 100_000) : null;
+    const status = jobs.complete(job, req.body?.status, result, error, deliveryState, deliveryMeta);
     const fresh = db.prepare('SELECT accepting_jobs FROM workers WHERE id = ?').get(worker.id) as { accepting_jobs: number };
     db.prepare("UPDATE workers SET status = ?, last_seen_at = datetime('now') WHERE id = ?")
       .run(fresh.accepting_jobs === 1 ? 'online' : 'paused', worker.id);

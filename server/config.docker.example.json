@@ -27,5 +27,9 @@
     "dir": "data/backups",
     "intervalHours": 24,
     "keep": 14
+  },
+  "grok": {
+    "cliPath": "grok",
+    "turnTimeoutMs": 300000
   }
 }

@@ -140,6 +140,25 @@ export function deleteMessageFiles(db: Db, uploadsDir: string, messageId: number
   db.prepare('DELETE FROM message_attachments WHERE message_id = ?').run(messageId);
 }
 
+/**
+ * 物理删除消息行（附件先清）。用于内部气泡收回、软删过期 purge 等。
+ * 用户主动删除仍走 soft-delete（messages.deleted=1）。
+ */
+export function hardDeleteMessages(db: Db, uploadsDir: string, messageIds: number[]): number {
+  const ids = [...new Set(messageIds.filter((id) => Number.isFinite(id) && id > 0))];
+  if (ids.length === 0) return 0;
+  const del = db.transaction((batch: number[]) => {
+    let n = 0;
+    for (const id of batch) {
+      deleteMessageFiles(db, uploadsDir, id);
+      const r = db.prepare('DELETE FROM messages WHERE id = ?').run(id);
+      n += r.changes;
+    }
+    return n;
+  });
+  return del(ids);
+}
+
 export function attachmentDataUrl(uploadsDir: string, row: AttachmentRow): string {
   const bytes = fs.readFileSync(path.join(uploadsDir, row.stored_name));
   return `data:${row.mime_type};base64,${bytes.toString('base64')}`;

@@ -6,9 +6,11 @@ import { AgentManager } from './agents/manager.js';
 import { DbBackup } from './backup.js';
 import { loadConfig } from './config.js';
 import { openDb } from './db.js';
+import { SoftDeletePurge } from './purge.js';
 import { VaultClient } from './memory/vaultClient.js';
 import { ClaudeQuotaPoller } from './quota/claudeQuota.js';
 import { CodexQuotaPoller } from './quota/codexQuota.js';
+import { GrokQuotaPoller } from './quota/grokQuota.js';
 import { contactsRouter } from './routes/contacts.js';
 import { attachmentsRouter } from './routes/attachments.js';
 import { hubMcpRouter } from './routes/hubMcp.js';
@@ -16,14 +18,15 @@ import { messagesRouter } from './routes/messages.js';
 import { systemRouter } from './routes/system.js';
 import { userRouter } from './routes/user.js';
 import { workersRouter } from './routes/workers.js';
-import { ensureCodexContact, seedIfEmpty } from './seed.js';
+import { ensureCoveContact, ensureGrokContact, seedIfEmpty } from './seed.js';
 import { SseHub } from './sse.js';
 import { JobStore } from './workers/jobStore.js';
 
 const config = loadConfig();
 const db = openDb(config.dbPath);
 seedIfEmpty(db, config);
-ensureCodexContact(db, config);
+ensureCoveContact(db, config);
+ensureGrokContact(db, config);
 const orphanUploads = cleanupOrphanUploads(db, config.uploadsDir);
 if (orphanUploads > 0) console.log(`  [uploads] cleaned ${orphanUploads} orphan file(s)`);
 
@@ -39,23 +42,87 @@ const vault = config.memory.mcpUrl
 const jobStore = new JobStore(db, sse);
 const manager = new AgentManager({ db, sse, config, vault, jobStore });
 
+function parseDeliveryMeta(raw: string | null): {
+  dirtyFiles?: string[];
+  head?: string | null;
+  ahead?: number | null;
+} {
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+async function ensureWorkerTail(job: import('./db.js').JobRow): Promise<void> {
+  if (!vault || !['blocked_local_changes', 'blocked_unpushed'].includes(job.delivery_state ?? '')) return;
+  const taskPath = `tasks/worker-tail-${job.id}.md`;
+  const meta = parseDeliveryMeta(job.delivery_meta);
+  const files = Array.isArray(meta.dirtyFiles) && meta.dirtyFiles.length
+    ? meta.dirtyFiles.map((file) => `- \`${file}\``).join('\n')
+    : '- （工作区干净；存在尚未推送的 commit）';
+  const note = [
+    `Worker job：\`${job.id}\``,
+    `交付状态：\`${job.delivery_state}\``,
+    `workspace：\`${job.workspace}\``,
+    meta.head ? `HEAD：\`${meta.head}\`${typeof meta.ahead === 'number' ? `（领先 upstream ${meta.ahead}）` : ''}` : '',
+    '',
+    '### 本地状态',
+    files,
+    '',
+    '### 原始需求',
+    job.prompt.slice(0, 6000),
+    '',
+    '### Worker 回执',
+    (job.result || job.error || '（无输出）').slice(0, 8000),
+    '',
+    '### 下一步',
+    '从现有工作区续接，核对改动后完成剩余验证；验证通过再只提交本任务文件并 push。禁止从头派单覆盖本地改动。',
+  ].filter((line) => line !== '').join('\n');
+  const source = job.requested_by || 'codex';
+  try {
+    await vault.call('read_file', { path: taskPath }, 0);
+    await vault.write('update_task', {
+      path: taskPath,
+      status: 'open',
+      note,
+      source,
+    });
+    console.log(`  [jobs] refreshed ${taskPath}`);
+  } catch {
+    const outcome = await vault.write('add_task', {
+      slug: `worker-tail-${job.id}`,
+      title: `Worker 未完成交付 ${job.id.slice(0, 8)}`,
+      due: '',
+      content: note,
+      tags: ['backlog', 'worker-tail', path.basename(job.workspace).toLowerCase()],
+      source,
+    });
+    console.log(`  [jobs] registered ${taskPath} (${outcome})`);
+  }
+}
+
 // Worker 任务终态 → 给派单的联系人投一条回执消息并触发至多一次 continuation，
 // 让它在新回合里验收（不占派单那一回合的 5 分钟 turn timeout）。
 jobStore.onFinished = (job) => {
   try {
-    if (!job.requested_by || job.requested_by === 'User') return;
+    void ensureWorkerTail(job).catch((e) => {
+      console.error(`  [jobs] worker-tail registration failed for ${job.id}:`, e);
+    });
+    if (!job.requested_by || job.requested_by === 'iris') return;
     const contact = db
       .prepare("SELECT * FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'dm'")
       .get(job.requested_by) as import('./db.js').ContactRow | undefined;
     if (!contact) return;
     const body = job.result || job.error || '（无输出）';
     const text = [
-      `⚙ Worker 任务回执（网关自动通知，User 也看得到这条）`,
+      `⚙ Worker 任务回执（网关自动通知，Iris 也看得到这条）`,
       `任务 ${job.id} → ${job.status}（runner: ${job.runner}, workspace: ${job.workspace}）`,
+      job.delivery_state ? `交付状态：${job.delivery_state}` : '',
       body.slice(0, 6000),
       '',
-      '请验收：结果符合预期就简短向 User 汇报；有问题说清楚差在哪。不要条件反射地再派新任务。',
-    ].join('\n');
+      '请直接给出验收结论并同步需求账本：以本回执和 worker_job_status 为依据，禁止调用终端/git fetch/VPS 复核。任务范围内验证、commit、push 均完成则 update_task 关闭原 backlog（其他 backlog 的本地改动不算本任务阻塞）；未完成则保持 backlog open 并确认自动登记的 worker-tail 写清 workspace、文件、检查、阻塞与下一步。不要条件反射地从头派新任务。',
+    ].filter(Boolean).join('\n');
     const result = db
       .prepare(
         `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta)
@@ -74,7 +141,68 @@ jobStore.onFinished = (job) => {
 };
 
 const app = express();
+
+// Android 壳（Capacitor WebView）从 http://localhost 等本地 origin 跨源调 API。
+// 只放行 WebView 本地 origin，普通网站的 origin 永远不在名单里；
+// 需要扩展时用 HUB_CORS_ORIGINS（逗号分隔）覆盖。
+const corsOrigins = new Set(
+  (process.env.HUB_CORS_ORIGINS ?? 'http://localhost,https://localhost,capacitor://localhost')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (typeof origin === 'string' && corsOrigins.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    if (req.method === 'OPTIONS') {
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        (req.headers['access-control-request-headers'] as string | undefined) ?? 'Content-Type'
+      );
+      res.setHeader('Access-Control-Max-Age', '86400');
+      return res.status(204).end();
+    }
+  }
+  next();
+});
+
 app.use(express.json({ limit: '2mb' }));
+
+// Desktop-shell session auth: when HUB_TOKEN is set (Electron spawns us with a
+// random token), every request must carry it — first load passes ?token=…,
+// which we swap for an httpOnly cookie. Worker/hub-mcp endpoints keep their
+// own Bearer auth and are exempt. Without HUB_TOKEN (web/VPS) nothing changes.
+const hubToken = process.env.HUB_TOKEN;
+if (hubToken) {
+  const COOKIE = 'hub_session';
+  const crypto = await import('node:crypto');
+  const tokenMatches = (value: unknown): boolean => {
+    if (typeof value !== 'string') return false;
+    const got = Buffer.from(value);
+    const want = Buffer.from(hubToken);
+    return got.length === want.length && crypto.timingSafeEqual(got, want);
+  };
+  app.use((req, res, next) => {
+    if (req.path.startsWith('/api/worker') || req.path.startsWith('/api/hub-mcp')) return next();
+    const cookies = Object.fromEntries(
+      (req.headers.cookie ?? '').split(';').map((p) => {
+        const i = p.indexOf('=');
+        return [p.slice(0, i).trim(), p.slice(i + 1).trim()];
+      })
+    );
+    if (tokenMatches(cookies[COOKIE])) return next();
+    if (tokenMatches(req.query.token)) {
+      res.cookie(COOKIE, hubToken, { httpOnly: true, sameSite: 'lax' });
+      const clean = req.path === '/' ? '/' : req.path;
+      if (req.method === 'GET' && !req.path.startsWith('/api/')) return res.redirect(clean);
+      return next();
+    }
+    return res.status(401).json({ error: 'missing or invalid session token' });
+  });
+}
 
 app.get('/api/health', (_req, res) => {
   const count = db.prepare('SELECT COUNT(*) AS c FROM messages').get() as { c: number };
@@ -83,11 +211,24 @@ app.get('/api/health', (_req, res) => {
 
 app.get('/api/events', (req, res) => {
   sse.addClient(res);
+  // Reconnect mid-turn: push current busy statuses (with room member names)
+  // so the UI never falls back to the room title while waiting for the next setState.
+  for (const status of manager.activeStatuses()) {
+    sse.send(res, 'status', status);
+  }
   req.on('close', () => {});
 });
 
 const dbBackup = new DbBackup(db, config.backup, (m) => console.log(`  [backup] ${m}`));
 dbBackup.start();
+
+const softPurge = new SoftDeletePurge(
+  db,
+  config.uploadsDir,
+  config.purge,
+  (m) => console.log(`  [purge] ${m}`)
+);
+softPurge.start();
 
 const quotaPoller = new ClaudeQuotaPoller((m) => console.log(`  [quota] ${m}`));
 quotaPoller.start();
@@ -96,6 +237,8 @@ const codexQuotaPoller = new CodexQuotaPoller(
   (m) => console.log(`  [quota] ${m}`)
 );
 codexQuotaPoller.start();
+const grokQuotaPoller = new GrokQuotaPoller((m) => console.log(`  [quota] ${m}`));
+grokQuotaPoller.start();
 
 app.use('/api/contacts', contactsRouter(db, sse, manager, config));
 app.use('/api/contacts', messagesRouter(db, sse, manager, config.uploadsDir));
@@ -115,6 +258,18 @@ app.post('/api/system/backup', async (_req, res) => {
     res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 });
+app.get('/api/system/purge', (_req, res) => {
+  res.json(softPurge.status());
+});
+app.post('/api/system/purge', async (req, res) => {
+  try {
+    const dryRun = req.query.dryRun === '1' || req.body?.dryRun === true;
+    const result = await softPurge.runOnce({ dryRun });
+    res.json({ ok: true, result, ...softPurge.status() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
 
 app.get('/api/quota/claude', (_req, res) => {
   res.json(quotaPoller.get());
@@ -122,6 +277,9 @@ app.get('/api/quota/claude', (_req, res) => {
 app.get('/api/quota/codex', (_req, res) => {
   const q = codexQuotaPoller.get();
   res.json({ available: q !== null, ...(q ?? {}) });
+});
+app.get('/api/quota/grok', (_req, res) => {
+  res.json(grokQuotaPoller.get());
 });
 
 // serve built frontend if present (prod single-process mode)
@@ -149,7 +307,9 @@ async function shutdown(signal: string): Promise<void> {
   server.close();
   sse.close();
   dbBackup.stop();
+  softPurge.stop();
   codexQuotaPoller.stop();
+  grokQuotaPoller.stop();
   await manager.stopAll();
   await vault?.close();
   db.close();

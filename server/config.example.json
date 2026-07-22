@@ -21,5 +21,9 @@
     "capture": false,
     "maxTurnChars": 1200,
     "sessionMaxAgeHours": 12
+  },
+  "grok": {
+    "cliPath": "grok",
+    "turnTimeoutMs": 300000
   }
 }

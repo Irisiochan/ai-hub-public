@@ -20,3 +20,4 @@
 - 服务端同时校验 MIME 白名单和文件签名，但不把上传文件当作可信内容执行。
 - OpenAI-compatible 使用 `image_url` data URL；Anthropic 使用 base64 image source。供应商或具体模型不支持视觉时，错误会原样回到聊天界面。
 - API 联系人可以设置独立的 `visionModel`。含图回合使用图片模型，纯文字回合继续使用原模型，避免为日常聊天强行更换人设模型。
+- 纯文字模型（如 openai-compat 下的 deepseek）只接受 `text` content part，收到 `image_url` 会 HTTP 400。联系人配置的 `supportsImages` 控制是否发图：`true`/`false` 为显式覆盖，留空时按 `provider + model` 名自动推断（`defaultSupportsImages`，deepseek 等已知纯文字家族返回 `false`）。判定为不支持且未配 `visionModel` 时，含图历史/新图会被降级成 `[图片已省略，该模型不支持图片]` 文字占位——只影响该成员这一趟请求，不外发 base64/url，也不拖累群里支持图片的其他成员。

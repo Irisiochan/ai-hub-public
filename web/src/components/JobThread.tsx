@@ -5,15 +5,37 @@ import { formatLocalTime, parseUtcTimestamp } from '../time';
 /**
  * 委派任务子会话：挂在原聊天消息下的可折叠 thread。
  * 折叠时一行状态摘要；展开后是任务详情 + 结构化日志/tool/diff/结果 + 操作按钮。
+ * 删除只软隐藏任务窗口，不碰原聊天消息。
  */
 
 export const JOB_ACTIVE = new Set(['pending', 'claimed', 'running', 'pause_requested', 'cancel_requested']);
+
+/** Confirm + soft-hide a job window. Shared by chat thread and Worker panel. */
+export async function hideJobWindow(job: WorkerJob): Promise<boolean> {
+  const active = JOB_ACTIVE.has(job.status);
+  if (active) {
+    const ok = window.confirm(
+      '任务仍在队列或执行中。\n\n' +
+        '删除窗口不会硬删数据，但后台 Worker 仍可能继续执行。\n' +
+        '若要停止执行，请先点「取消」。\n\n' +
+        '确定仅删除（隐藏）此任务窗口？'
+    );
+    if (!ok) return false;
+  } else {
+    const ok = window.confirm(
+      '删除此任务窗口？\n\n仅从界面隐藏（软删除），刷新后不会再出现；任务记录与日志仍保留。'
+    );
+    if (!ok) return false;
+  }
+  await api.deleteJob(job.id, { force: active });
+  return true;
+}
 
 export function jobStatusLabel(status: string): string {
   const labels: Record<string, string> = {
     pending: '等待本机上线', claimed: '已认领', running: '执行中', pause_requested: '正在暂停',
     cancel_requested: '正在取消', paused: '已暂停', interrupted: '连接中断', done: '已完成',
-    failed: '失败', cancelled: '已取消', expired: '已过期',
+    blocked: '待续接', failed: '失败', cancelled: '已取消', expired: '已过期',
   };
   return labels[status] ?? status;
 }
@@ -72,6 +94,7 @@ export default function JobThread({ job, onChanged }: Props) {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<JobMessage[]>([]);
   const [error, setError] = useState('');
+  const [hiding, setHiding] = useState(false);
   const active = JOB_ACTIVE.has(job.status);
 
   useEffect(() => {
@@ -94,15 +117,44 @@ export default function JobThread({ job, onChanged }: Props) {
     }
   };
 
+  const hideWindow = async () => {
+    if (hiding) return;
+    setError('');
+    setHiding(true);
+    try {
+      const done = await hideJobWindow(job);
+      if (done) onChanged();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setHiding(false);
+    }
+  };
+
   return (
     <div className={`job-thread ${active ? 'active' : ''} ${job.status}`}>
-      <button className="job-thread-head" onClick={() => setOpen(!open)}>
-        <span className={`job-dot ${job.status}`} />
-        <b>🖥 {jobStatusLabel(job.status)}</b>
-        <span className="job-thread-brief">{job.runner} · {job.prompt.slice(0, 60)}</span>
-        <small>{elapsedText(job)}</small>
-        <span className="job-thread-arrow">{open ? '▾' : '▸'}</span>
-      </button>
+      <div className="job-thread-head-row">
+        <button type="button" className="job-thread-head" onClick={() => setOpen(!open)}>
+          <span className={`job-dot ${job.status}`} />
+          <b>🖥 {jobStatusLabel(job.status)}</b>
+          <span className="job-thread-brief">{job.runner} · {job.prompt.slice(0, 60)}</span>
+          <small>{elapsedText(job)}</small>
+          <span className="job-thread-arrow">{open ? '▾' : '▸'}</span>
+        </button>
+        <button
+          type="button"
+          className="job-thread-hide"
+          title="删除任务窗口（软隐藏，不删聊天消息）"
+          aria-label="删除任务窗口"
+          disabled={hiding}
+          onClick={(e) => {
+            e.stopPropagation();
+            void hideWindow();
+          }}
+        >
+          ×
+        </button>
+      </div>
       {open && (
         <div className="job-thread-body">
           <div className="job-thread-meta">
@@ -144,14 +196,17 @@ export default function JobThread({ job, onChanged }: Props) {
           {error && <div className="modal-error">⚠ {error}</div>}
           <div className="job-thread-actions">
             {active && job.status !== 'pending' && (
-              <button onClick={() => void action('pause')}>暂停</button>
+              <button type="button" onClick={() => void action('pause')}>暂停</button>
             )}
-            {active && <button onClick={() => void action('cancel')}>取消</button>}
-            {['paused', 'interrupted', 'failed'].includes(job.status) && (
-              <button onClick={() => void action('resume')}>
-                {job.status === 'failed' ? '重试' : '继续'}
+            {active && <button type="button" onClick={() => void action('cancel')}>取消</button>}
+            {['paused', 'interrupted', 'blocked', 'failed'].includes(job.status) && (
+              <button type="button" onClick={() => void action('resume')}>
+                {['failed', 'blocked'].includes(job.status) ? '重试' : '继续'}
               </button>
             )}
+            <button type="button" className="del" disabled={hiding} onClick={() => void hideWindow()}>
+              {hiding ? '删除中…' : '删除窗口'}
+            </button>
           </div>
         </div>
       )}

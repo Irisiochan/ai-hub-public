@@ -1,3 +1,4 @@
+import { notifyIncoming, withBase } from './mobileShell';
 import { SHANGHAI_TZ_OFFSET } from './time';
 
 export interface Contact {
@@ -9,6 +10,8 @@ export interface Contact {
   kind: string;
   config: Record<string, unknown>;
   state: string;
+  /** Busy room member display name from server statusOf (undefined for DM/idle). */
+  member?: string;
   last_content: string | null;
   last_at: string | null;
 }
@@ -37,7 +40,7 @@ export interface Attachment {
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const isForm = init?.body instanceof FormData;
-  const res = await fetch(url, {
+  const res = await fetch(withBase(url), {
     ...(!isForm ? { headers: { 'Content-Type': 'application/json' } } : {}),
     ...init,
   });
@@ -89,6 +92,16 @@ export interface CodexQuota {
   fetchedAt?: string;
 }
 
+export interface GrokQuota {
+  available: boolean;
+  /** 不可用原因：no-token | login-expired | error */
+  reason?: string;
+  detail?: string;
+  /** 订阅是全产品共享周池，只有一个窗口 */
+  weekly?: QuotaWindow | null;
+  fetchedAt?: string;
+}
+
 export interface ContactPayload {
   id?: string;
   name?: string;
@@ -116,6 +129,8 @@ export interface ModelCatalog {
   current: string;
   dynamic: boolean;
   warning?: string;
+  efforts?: ModelOption[];
+  currentEffort?: string;
 }
 
 export interface Worker {
@@ -131,7 +146,7 @@ export interface WorkerJob {
   id: string;
   requested_by: string | null;
   worker_id: string | null;
-  runner: 'codex' | 'claude';
+  runner: 'codex' | 'claude' | 'grok';
   workspace: string;
   prompt: string;
   status: string;
@@ -141,8 +156,18 @@ export interface WorkerJob {
   permissions: { write?: boolean; shell?: boolean; ssh?: boolean };
   result: string | null;
   error: string | null;
+  delivery_state: string | null;
+  delivery_meta: {
+    state?: string;
+    changed?: boolean;
+    dirtyFiles?: string[];
+    head?: string | null;
+    ahead?: number | null;
+  } | null;
   origin_contact_id: string | null;
   origin_anchor_id: number | null;
+  /** 1 when task window is soft-hidden; list APIs omit these */
+  deleted?: number;
   created_at: string;
   updated_at: string;
 }
@@ -190,6 +215,12 @@ export const api = {
     req<Contact>(`/api/contacts/${id}/model`, {
       method: 'PATCH',
       body: JSON.stringify({ model }),
+    }),
+
+  switchEffort: (id: string, effort: string) =>
+    req<Contact>(`/api/contacts/${id}/effort`, {
+      method: 'PATCH',
+      body: JSON.stringify({ effort }),
     }),
 
   deleteContact: (id: string) =>
@@ -240,6 +271,8 @@ export const api = {
 
   codexQuota: () => req<CodexQuota>('/api/quota/codex'),
 
+  grokQuota: () => req<GrokQuota>('/api/quota/grok'),
+
   getUser: () => req<UserProfile>('/api/user'),
 
   putUser: (p: Partial<UserProfile>) =>
@@ -268,13 +301,20 @@ export const api = {
   job: (id: string) => req<{ job: WorkerJob; messages: JobMessage[] }>(`/api/jobs/${id}`),
 
   createJob: (data: {
-    runner: 'codex' | 'claude'; workspace: string; prompt: string; workerId?: string;
+    runner: 'codex' | 'claude' | 'grok'; workspace: string; prompt: string; workerId?: string;
     permissions?: { write?: boolean; shell?: boolean; ssh?: boolean };
   }) => req<WorkerJob>('/api/jobs', { method: 'POST', body: JSON.stringify(data) }),
 
   jobAction: (id: string, action: 'cancel' | 'pause' | 'resume') =>
     req<{ ok: boolean; status: string }>(`/api/jobs/${id}/action`, {
       method: 'POST', body: JSON.stringify({ action }),
+    }),
+
+  /** Soft-hide a worker task window (not a hard delete; does not touch chat messages). */
+  deleteJob: (id: string, opts: { force?: boolean } = {}) =>
+    req<{ ok: boolean; job: WorkerJob }>(`/api/jobs/${id}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ force: opts.force === true }),
     }),
 };
 
@@ -299,7 +339,7 @@ export function connectEvents(handlers: SseHandlers): () => void {
   const open = () => {
     if (closed) return;
     es?.close();
-    es = new EventSource('/api/events');
+    es = new EventSource(withBase('/api/events'));
     es.onopen = () => {
       if (hadError) {
         hadError = false;
@@ -309,7 +349,11 @@ export function connectEvents(handlers: SseHandlers): () => void {
     es.onerror = () => {
       hadError = true; // EventSource auto-retries; onopen will trigger resync
     };
-    es.addEventListener('message', (e) => handlers.onMessage(JSON.parse(e.data)));
+    es.addEventListener('message', (e) => {
+      const msg = JSON.parse(e.data) as Message;
+      notifyIncoming(msg);
+      handlers.onMessage(msg);
+    });
     es.addEventListener('delta', (e) => handlers.onDelta(JSON.parse(e.data)));
     es.addEventListener('status', (e) => handlers.onStatus(JSON.parse(e.data)));
     es.addEventListener('contact', (e) => handlers.onContact(JSON.parse(e.data)));

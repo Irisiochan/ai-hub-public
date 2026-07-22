@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node test/externalLinks.test.mjs && node test/messageMerge.test.mjs && node test/statusText.test.mjs",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "preview": "vite preview"
   },

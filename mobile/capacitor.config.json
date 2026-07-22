@@ -1,0 +1,12 @@
+{
+  "appId": "com.irisiochan.aihub",
+  "appName": "ai-hub",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
+  }
+}

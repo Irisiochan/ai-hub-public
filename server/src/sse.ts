@@ -35,6 +35,12 @@ export class SseHub {
     res.on('close', () => this.clients.delete(res));
   }
 
+  /** Write one event to a single client (e.g. status snapshot on connect). */
+  send(res: Response, event: SseEvent, data: unknown): void {
+    if (!this.clients.has(res)) return;
+    res.write(`id: ${++this.eventId}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
   broadcast(event: SseEvent, data: unknown): void {
     const payload = `id: ${++this.eventId}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of this.clients) res.write(payload);

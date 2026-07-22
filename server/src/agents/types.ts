@@ -8,10 +8,22 @@ export type TurnEvent =
   | { type: 'error'; message: string; fatal: boolean };
 
 export interface TokenUsage {
+  /**
+   * 本轮展示用 input（UI「本轮 input」）。
+   * Gemini 多工具轮：取最终请求的 promptTokenCount，避免把各趟 prompt 简单相加造成虚高。
+   * 其它 provider：保持各自既有累加/上报口径。
+   */
   input: number;
   output: number;
   cacheCreation?: number;
   cacheRead?: number;
+  /**
+   * 多工具轮时各请求 prompt token 之和（更接近供应商按次计费的累加值）。
+   * 有值时可与 input 对照：input=展示口径，inputRoundsSum=round 累加。
+   */
+  inputRoundsSum?: number;
+  /** 本用户 turn 内实际向上游发了几趟请求（含 tool 回环）。 */
+  providerRounds?: number;
   /** 本地启发式估算，只用于分项定位成本；供应商 usage 仍是计费口径。 */
   estimate?: TokenCostEstimate;
 }
@@ -40,7 +52,7 @@ export interface TurnInput {
 }
 
 export interface AgentBackend {
-  readonly kind: 'claude-cli' | 'codex' | 'api';
+  readonly kind: 'claude-cli' | 'codex' | 'grok-cli' | 'api';
   /** Spawn/connect. resumeToken = claude session_id / codex threadId / null.
    *  Must not throw on a stale token — fall back to fresh and emit a new 'session'. */
   start(resumeToken: string | null): Promise<void>;

@@ -7,6 +7,7 @@ import express from 'express';
 import { claudePermissionDecision, claudeTurnText } from '../src/agents/claudeCli.js';
 import { codexTurnInput } from '../src/agents/codexAppServer.js';
 import { DirectApiBackend } from '../src/agents/directApi.js';
+import { grokPromptJson } from '../src/agents/grokCli.js';
 import { attachmentPathsForMessages } from '../src/attachments.js';
 import { openDb } from '../src/db.js';
 import { attachmentsRouter } from '../src/routes/attachments.js';
@@ -27,7 +28,11 @@ const server = http.createServer((req, res) => {
   req.on('end', () => {
     requests.push({ url: req.url ?? '', body: JSON.parse(raw) });
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    if (req.url?.includes('/chat/completions')) {
+    if (req.url?.includes(':streamGenerateContent')) {
+      res.write(`data: ${JSON.stringify({
+        candidates: [{ content: { role: 'model', parts: [{ text: '看到了图片' }] }, finishReason: 'STOP' }],
+      })}\n\n`);
+    } else if (req.url?.includes('/chat/completions')) {
       res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '看到了图片' } }] })}\n\n`);
       res.write('data: [DONE]\n\n');
     } else {
@@ -88,6 +93,14 @@ try {
     ).behavior,
     'deny'
   );
+  const grokInput = JSON.parse(grokPromptJson('看图', dmImagePaths));
+  assert.equal(grokInput.type, 'acp');
+  assert.deepEqual(grokInput.content[0], { type: 'text', text: '看图' });
+  assert.equal(grokInput.content[1].type, 'resource_link');
+  assert.equal(grokInput.content[1].uri, new URL(`file:///${dmImagePaths[0].replaceAll('\\', '/')}`).href);
+  assert.equal(grokInput.content[1].name, 'dm.png');
+  assert.equal(grokInput.content[1].mimeType, 'image/png');
+  assert.equal(grokInput.content[1].data, undefined, 'Grok 图片不得再把 base64 塞进命令行参数');
   assert.equal(
     claudePermissionDecision(
       { tool_name: 'Bash', input: { command: 'cat image.png' } },
@@ -102,7 +115,7 @@ try {
     maxTokens: 64, turnTimeoutMs: 5000, db, uploadsDir, log: () => {},
   };
   const openai = new DirectApiBackend({
-    ...common, provider: 'openai-compat', baseUrl: `http://127.0.0.1:${port}`, contactId: 'dm',
+    ...common, provider: 'openai-compat', baseUrl: `http://127.0.0.1:${port}/v1/chat/completions`, contactId: 'dm',
   });
   await openai.start(null);
   await consume(openai, { text: '这张图里是什么？', userMessageId: dmId });
@@ -111,15 +124,33 @@ try {
   assert.equal(requests[0].body.model, 'vision-test', '含图回合应切到独立图片模型');
   assert(openaiContent.some((part: any) => part.type === 'image_url' && part.image_url.url.startsWith('data:image/png;base64,')));
 
+  const gemini = new DirectApiBackend({
+    ...common,
+    provider: 'gemini',
+    baseUrl: `http://127.0.0.1:${port}/v1beta/models/{model}:streamGenerateContent?alt=sse`,
+    contactId: 'dm',
+  });
+  await gemini.start(null);
+  await consume(gemini, { text: '这张图里是什么？', userMessageId: dmId });
+  assert.equal(
+    requests[1].url,
+    '/v1beta/models/vision-test:streamGenerateContent?alt=sse',
+    'Gemini URL 只应替换显式 {model} 占位符'
+  );
+  const geminiParts = requests[1].body.contents.at(-1).parts;
+  const geminiImage = geminiParts.find((part: any) => part.inlineData);
+  assert.equal(geminiImage?.inlineData?.mimeType, 'image/png');
+  assert(geminiImage?.inlineData?.data, 'Gemini 图片应以内联 base64 inlineData 发送');
+
   const roomId = Number(addMessage.run('room', '订单截图').lastInsertRowid);
   addImage(roomId, 'room.png');
   const anthropic = new DirectApiBackend({
-    ...common, provider: 'anthropic', baseUrl: `http://127.0.0.1:${port}`, contactId: 'room', memberId: 'api-member',
-    roomMode: { selfId: 'api-member', nameOf: (sender: string) => sender === 'user' ? 'User' : sender },
+    ...common, provider: 'anthropic', baseUrl: `http://127.0.0.1:${port}/v1/messages`, contactId: 'room', memberId: 'api-member',
+    roomMode: { selfId: 'api-member', nameOf: (sender: string) => sender === 'user' ? 'Iris' : sender },
   });
   await anthropic.start(null);
   await consume(anthropic, { text: '（群里有新消息，见对话历史。）' });
-  const anthropicImage = requests[1].body.messages
+  const anthropicImage = requests[2].body.messages
     .flatMap((message: any) => Array.isArray(message.content) ? message.content : [])
     .find((part: any) => part.type === 'image');
   assert.equal(anthropicImage?.source?.media_type, 'image/png');
@@ -129,8 +160,8 @@ try {
   let imageRoomMembersCalls = 0;
   let dispatchedRoomTargets: any[] | undefined;
   const imageMembers = [
-    { id: 'codex-member', name: 'Codex', backend: 'codex' },
-    { id: 'claude-member', name: 'Claude', backend: 'claude-cli' },
+    { id: 'codex-member', name: 'Cove', backend: 'codex' },
+    { id: 'claude-member', name: '橙', backend: 'claude-cli' },
   ];
   const fakeManager = {
     get: () => ({ enqueue: () => 'queued' }),
@@ -172,7 +203,11 @@ try {
     const afterDelete = await fetch(`http://127.0.0.1:${uploadPort}${message.attachments[0].url}`);
     assert.equal(afterDelete.status, 404, '消息删除后附件应立即失效并清理');
 
-    for (const [id, backend] of [['codex-dm', 'codex'], ['claude-dm', 'claude-cli']] as const) {
+    for (const [id, backend] of [
+      ['codex-dm', 'codex'],
+      ['claude-dm', 'claude-cli'],
+      ['grok-dm', 'grok-cli'],
+    ] as const) {
       db.prepare(`INSERT INTO contacts (id, name, backend, kind, config) VALUES (?, ?, ?, 'dm', '{}')`)
         .run(id, id, backend);
       const cliForm = new FormData();

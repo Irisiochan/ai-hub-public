@@ -26,11 +26,40 @@ interface ModelOption {
 
 const CLAUDE_MODELS: ModelOption[] = [
   { id: '', label: '默认（Claude CLI 自动选择）', isDefault: true },
-  { id: 'sonnet', label: 'Sonnet' },
-  { id: 'opus', label: 'Opus' },
-  { id: 'haiku', label: 'Haiku' },
+  { id: 'sonnet', label: 'Sonnet（最新）' },
+  { id: 'opus', label: 'Opus（最新）' },
+  { id: 'haiku', label: 'Haiku（最新）' },
   { id: 'fable', label: 'Fable' },
+  { id: 'claude-opus-4-7', label: 'Opus 4.7' },
+  { id: 'claude-opus-4-6', label: 'Opus 4.6' },
+  { id: 'claude-opus-4-5', label: 'Opus 4.5' },
+  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
+  { id: 'claude-sonnet-4-5', label: 'Sonnet 4.5' },
 ];
+
+// claude CLI 的 --effort 档位；'' 表示不传 flag，交给 CLI 默认（当前是 xhigh）
+const CLAUDE_EFFORTS: ModelOption[] = [
+  { id: '', label: '默认强度', isDefault: true },
+  { id: 'low', label: 'low' },
+  { id: 'medium', label: 'medium' },
+  { id: 'high', label: 'high' },
+  { id: 'xhigh', label: 'xhigh' },
+  { id: 'max', label: 'max' },
+];
+
+const CODEX_EFFORT_IDS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+
+function codexEfforts(models: CodexModelOption[], currentModel: string): ModelOption[] {
+  const selected = (currentModel && models.find((model) => model.id === currentModel))
+    || models.find((model) => model.isDefault)
+    || models[0];
+  if (!selected) return [];
+  const suffix = selected.defaultReasoningEffort ? `（${selected.defaultReasoningEffort}）` : '';
+  return [
+    { id: '', label: `默认强度${suffix}`, isDefault: true },
+    ...(selected.supportedReasoningEfforts ?? []),
+  ];
+}
 
 function customModels(cfg: Record<string, any>): ModelOption[] {
   if (!Array.isArray(cfg.modelOptions)) return [];
@@ -63,11 +92,31 @@ export function contactsRouter(
   const r = Router();
   let codexCache: { expires: number; models: CodexModelOption[] } | null = null;
 
-  const publicRow = (c: ContactRow) => ({
-    ...c,
-    config: maskConfig(JSON.parse(c.config || '{}')),
-    state: manager.stateOf(c.id),
-  });
+  const loadCodexModels = async (cfg: Record<string, any>): Promise<CodexModelOption[]> => {
+    if (!codexCache || codexCache.expires < Date.now()) {
+      codexCache = {
+        expires: Date.now() + 10 * 60_000,
+        models: await CodexAppServerBackend.listModels({
+          cliPath: cfg.cliPath ?? hubConfig.codex.cliPath,
+          cwd: hubConfig.agentsDir,
+          log: (m) => console.log(`  [models] ${m}`),
+        }),
+      };
+    }
+    return codexCache.models;
+  };
+
+  const publicRow = (c: ContactRow) => {
+    const status = manager.statusOf(c.id);
+    return {
+      ...c,
+      config: maskConfig(JSON.parse(c.config || '{}')),
+      state: status.state,
+      // Room busy member display name (undefined for DM / idle). Used by resync
+      // so thinking labels stay on the contact, not the room title.
+      member: status.member,
+    };
+  };
 
   r.get('/', (_req, res) => {
     const rows = db
@@ -96,33 +145,32 @@ export function contactsRouter(
     let models: ModelOption[] = [];
     let dynamic = false;
     let warning: string | undefined;
+    let efforts: ModelOption[] | undefined;
+    let currentEffort: string | undefined;
 
     if (contact.backend === 'codex') {
       try {
-        if (!codexCache || codexCache.expires < Date.now()) {
-          codexCache = {
-            expires: Date.now() + 10 * 60_000,
-            models: await CodexAppServerBackend.listModels({
-              cliPath: cfg.cliPath ?? hubConfig.codex.cliPath,
-              cwd: hubConfig.agentsDir,
-              log: (m) => console.log(`  [models] ${m}`),
-            }),
-          };
-        }
-        models = codexCache.models;
+        models = await loadCodexModels(cfg);
         dynamic = true;
+        efforts = codexEfforts(models as CodexModelOption[], current);
+        currentEffort = typeof cfg.effort === 'string' ? cfg.effort : '';
       } catch (e: any) {
         warning = `Codex 模型列表暂时不可用：${e.message}`;
       }
       models = [{ id: '', label: '默认（Codex 自动选择）' }, ...models, ...customModels(cfg)];
     } else if (contact.backend === 'claude-cli') {
       models = [...CLAUDE_MODELS, ...customModels(cfg)];
+      efforts = CLAUDE_EFFORTS;
+      currentEffort = typeof cfg.effort === 'string' ? cfg.effort : '';
+    } else if (contact.backend === 'grok-cli') {
+      // grok build 还在 beta，模型 id 没有稳定目录——默认自动选择，特定 id 走 modelOptions
+      models = [{ id: '', label: '默认（Grok CLI 自动选择）', isDefault: true }, ...customModels(cfg)];
     } else {
       models = [...customModels(cfg)];
       if (current) models.unshift({ id: current, label: current });
     }
 
-    res.json({ models: dedupeModels(models, current), current, dynamic, warning });
+    res.json({ models: dedupeModels(models, current), current, dynamic, warning, efforts, currentEffort });
   });
 
   r.patch('/:id/model', async (req, res) => {
@@ -135,7 +183,7 @@ export function contactsRouter(
       return res.status(409).json({ error: '正在回复，等这轮结束再切模型' });
     }
 
-    const model = typeof req.body?.model === 'string' ? req.body.model.trim() : null;
+    const model: string | null = typeof req.body?.model === 'string' ? req.body.model.trim() : null;
     if (model === null || model.length > 160) return res.status(400).json({ error: 'model 无效' });
     const cfg = JSON.parse(contact.config || '{}');
     const previous = typeof cfg.model === 'string' ? cfg.model : '';
@@ -143,6 +191,17 @@ export function contactsRouter(
 
     if (model) cfg.model = model;
     else delete cfg.model;
+    if (contact.backend === 'codex' && typeof cfg.effort === 'string') {
+      try {
+        const models = await loadCodexModels(cfg);
+        const selected = (model && models.find((item) => item.id === model))
+          || models.find((item) => item.isDefault);
+        const supported = selected?.supportedReasoningEfforts?.some((item) => item.id === cfg.effort);
+        if (selected && !supported) delete cfg.effort;
+      } catch {
+        // Switching the model should still work if the optional catalog lookup is unavailable.
+      }
+    }
     db.prepare('UPDATE contacts SET config = ? WHERE id = ?').run(JSON.stringify(cfg), contact.id);
     const updated = db.prepare('SELECT * FROM contacts WHERE id = ?').get(contact.id) as ContactRow;
     await manager.switchContactModel(updated);
@@ -157,6 +216,66 @@ export function contactsRouter(
         contact.id,
         `已从 ${label(previous)} 切换到 ${label(model)}`,
         JSON.stringify({ event: 'model-switch', from: previous, to: model })
+      );
+    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(result.lastInsertRowid));
+    sse.broadcast('message', message);
+    const payload = publicRow(updated);
+    sse.broadcast('contact', payload);
+    res.json(payload);
+  });
+
+  r.patch('/:id/effort', async (req, res) => {
+    const contact = db
+      .prepare('SELECT * FROM contacts WHERE id = ? AND enabled = 1')
+      .get(req.params.id) as ContactRow | undefined;
+    if (!contact) return res.status(404).json({ error: 'contact not found' });
+    if (contact.backend !== 'claude-cli' && contact.backend !== 'codex')
+      return res.status(400).json({ error: '当前联系人不支持推理强度' });
+    if (manager.isAgentBusy(contact.id)) {
+      return res.status(409).json({ error: '正在回复，等这轮结束再切强度' });
+    }
+
+    const effort: string | null = typeof req.body?.effort === 'string' ? req.body.effort.trim() : null;
+    const validEffort = contact.backend === 'claude-cli'
+      ? CLAUDE_EFFORTS.some((item) => item.id === effort)
+      : effort === '' || CODEX_EFFORT_IDS.some((id) => id === effort);
+    if (effort === null || !validEffort) {
+      return res.status(400).json({ error: 'effort 无效' });
+    }
+    const cfg = JSON.parse(contact.config || '{}');
+    if (contact.backend === 'codex' && effort) {
+      try {
+        const models = await loadCodexModels(cfg);
+        const currentModel: string = typeof cfg.model === 'string' ? cfg.model : '';
+        const selected = (currentModel && models.find((item) => item.id === currentModel))
+          || models.find((item) => item.isDefault);
+        if (selected && !selected.supportedReasoningEfforts?.some((item) => item.id === effort)) {
+          return res.status(400).json({ error: `${selected.label} 不支持 ${effort} 推理强度` });
+        }
+      } catch {
+        // The finite allowlist above remains a safe fallback when model/list is unavailable.
+      }
+    }
+    const previous = typeof cfg.effort === 'string' ? cfg.effort : '';
+    if (previous === effort) return res.json(publicRow(contact));
+
+    if (effort) cfg.effort = effort;
+    else delete cfg.effort;
+    db.prepare('UPDATE contacts SET config = ? WHERE id = ?').run(JSON.stringify(cfg), contact.id);
+    const updated = db.prepare('SELECT * FROM contacts WHERE id = ?').get(contact.id) as ContactRow;
+    // 两种 CLI 都在新底层会话应用 effort，并自动衔接近期聊天。
+    await manager.switchContactModel(updated);
+
+    const label = (value: string) => value || '默认强度';
+    const result = db
+      .prepare(
+        `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta)
+         VALUES (?, 'system', 'system', 'text', ?, 'done', ?)`
+      )
+      .run(
+        contact.id,
+        `推理强度已从 ${label(previous)} 切换到 ${label(effort)}`,
+        JSON.stringify({ event: 'effort-switch', from: previous, to: effort })
       );
     const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(result.lastInsertRowid));
     sse.broadcast('message', message);
@@ -198,7 +317,7 @@ export function contactsRouter(
     }
     const backendKind = isRoom
       ? 'room'
-      : ['claude-cli', 'codex', 'api'].includes(backend)
+      : ['claude-cli', 'codex', 'grok-cli', 'api'].includes(backend)
         ? backend
         : 'api';
 

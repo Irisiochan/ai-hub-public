@@ -18,11 +18,15 @@ import type { JobStore } from '../workers/jobStore.js';
 
 const INPUT_SHAPES = {
   delegate_to_worker: {
-    runner: z.enum(['claude', 'codex']).describe('本机执行方'),
+    runner: z.enum(['claude', 'codex', 'grok']).describe('本机执行方'),
     workspace: z.string().describe('PC 上的项目路径，必须在白名单内'),
     prompt: z.string().describe('自包含的任务描述（目标/约束/验收标准）'),
     shell: z.boolean().optional().describe('是否允许执行 shell 命令（codex 必须 true）'),
     priority: z.number().optional().describe('-10~10，默认 0'),
+    model: z.string().optional().describe(
+      '覆盖 Worker 默认模型。Claude 固定版本写 Opus 4.6 或 claude-opus-4-6；指定版本时禁止用 opus/sonnet 泛化。Codex 如 gpt-5.6-sol'
+    ),
+    effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional().describe('推理强度'),
   },
   worker_job_status: {
     job_id: z.string().describe('delegate_to_worker 返回的任务 id'),

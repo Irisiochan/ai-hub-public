@@ -2,6 +2,8 @@ import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Contact, Message, UserProfile } from '../api';
+import { shouldOpenInExternalView } from '../externalLinks';
+import { withBase } from '../mobileShell';
 
 interface Props {
   message: Message;
@@ -10,10 +12,14 @@ interface Props {
   allowRegen?: boolean; // 群聊 v1 不支持编辑/重新生成
   user: UserProfile;
   selected: boolean;
+  bulkMessageMode?: boolean;
+  bulkSelected?: boolean;
   onSelect(id: number | null): void;
+  onBulkMessageToggle?(id: number): void;
   onEdit(m: Message): void;
   onResend(m: Message): void;
   onDelete(m: Message): void;
+  onOpenExternalLink(url: string): void;
 }
 
 export default function MessageBubble({
@@ -23,14 +29,28 @@ export default function MessageBubble({
   allowRegen = true,
   user,
   selected,
+  bulkMessageMode = false,
+  bulkSelected = false,
   onSelect,
+  onBulkMessageToggle,
   onEdit,
   onResend,
   onDelete,
+  onOpenExternalLink,
 }: Props) {
   const [thinkingOpen, setThinkingOpen] = useState(false);
   const mine = message.sender === 'user';
   const edited = message.meta?.includes('"edited"');
+  const selectMessage = () => {
+    if (bulkMessageMode) onBulkMessageToggle?.(message.id);
+    else onSelect(selected ? null : message.id);
+  };
+  const bulkClass = bulkMessageMode
+    ? ` bulk-selectable${bulkSelected ? ' bulk-selected' : ''}`
+    : '';
+  const bulkMark = bulkMessageMode && (
+    <span className="tool-select-mark" aria-hidden="true">{bulkSelected ? '✓' : ''}</span>
+  );
 
   const actions = selected && (
     <div className={`msg-actions ${mine ? 'mine' : ''}`}>
@@ -49,9 +69,16 @@ export default function MessageBubble({
   if (message.kind === 'tool_use') {
     return (
       <div className="msg-group">
-        <div className="tool-chip" title={safeMeta(message.meta)} onClick={() => onSelect(selected ? null : message.id)}>
-          🔧 {message.content}
-        </div>
+        <button
+          type="button"
+          className={`tool-chip${bulkClass}`}
+          title={safeMeta(message.meta)}
+          aria-pressed={bulkMessageMode ? bulkSelected : undefined}
+          onClick={selectMessage}
+        >
+          {bulkMark}
+          <span>🔧 {message.content}</span>
+        </button>
         {actions}
       </div>
     );
@@ -60,9 +87,14 @@ export default function MessageBubble({
   if (message.kind === 'error') {
     return (
       <div className="msg-group center">
-        <div className="error-note" onClick={() => onSelect(selected ? null : message.id)}>
-          ⚠ {message.content}
-        </div>
+        <button
+          type="button"
+          className={`error-note bulk-message-control${bulkClass}`}
+          aria-pressed={bulkMessageMode ? bulkSelected : undefined}
+          onClick={selectMessage}
+        >
+          {bulkMark}<span>⚠ {message.content}</span>
+        </button>
         {actions}
       </div>
     );
@@ -74,13 +106,18 @@ export default function MessageBubble({
       <div className="msg-group">
         <div className="thinking-block">
           <button
-            className="thinking-toggle"
+            className={`thinking-toggle${bulkClass}`}
+            aria-pressed={bulkMessageMode ? bulkSelected : undefined}
             onClick={() => {
+              if (bulkMessageMode) {
+                onBulkMessageToggle?.(message.id);
+                return;
+              }
               setThinkingOpen(!thinkingOpen);
               onSelect(selected ? null : message.id);
             }}
           >
-            💭 {thinkingOpen ? '收起想法' : '想法'}
+            {bulkMark}<span>💭 {thinkingOpen ? '收起想法' : '想法'}</span>
             {message.status === 'streaming' && <span className="cursor">▍</span>}
           </button>
           {thinkingOpen && <div className="thinking-content">{message.content}</div>}
@@ -102,27 +139,51 @@ export default function MessageBubble({
         <div
           className={`bubble ${mine ? 'bubble-mine' : 'bubble-theirs'} ${
             message.status === 'interrupted' ? 'interrupted' : ''
-          }`}
+          }${bulkClass}`}
           style={mine ? { background: user.color } : undefined}
-          onClick={() => onSelect(selected ? null : message.id)}
+          role={bulkMessageMode ? 'button' : undefined}
+          aria-pressed={bulkMessageMode ? bulkSelected : undefined}
+          onClick={selectMessage}
         >
+          {bulkMark}
           {(message.attachments ?? []).length > 0 && (
             <div className="message-images">
               {message.attachments!.map((attachment) => (
                 <a
                   key={attachment.id}
-                  href={attachment.url}
+                  href={withBase(attachment.url)}
                   target="_blank"
                   rel="noreferrer"
                   onClick={(event) => event.stopPropagation()}
                 >
-                  <img src={attachment.url} alt={attachment.name} loading="lazy" />
+                  <img src={withBase(attachment.url)} alt={attachment.name} loading="lazy" />
                 </a>
               ))}
             </div>
           )}
           <div className="markdown">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                a: ({ href, children, ...anchorProps }) => (
+                  <a
+                    {...anchorProps}
+                    href={href}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      if (shouldOpenInExternalView(href, window.location.href)) {
+                        event.preventDefault();
+                        onOpenExternalLink(new URL(href!, window.location.href).href);
+                      }
+                    }}
+                  >
+                    {children}
+                  </a>
+                ),
+              }}
+            >
+              {message.content}
+            </ReactMarkdown>
           </div>
           {message.status === 'streaming' && <span className="cursor">▍</span>}
           {message.status === 'interrupted' && <span className="interrupted-tag">（被打断）</span>}

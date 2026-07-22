@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, type JobMessage, type Worker, type WorkerJob } from '../api';
-import { JOB_ACTIVE as active, jobStatusLabel as statusLabel } from './JobThread';
+import { hideJobWindow, JOB_ACTIVE as active, jobStatusLabel as statusLabel } from './JobThread';
 import { formatLocalTime } from '../time';
 
 interface Props { onClose(): void }
@@ -12,8 +12,8 @@ export default function WorkerPanel({ onClose }: Props) {
   const [messages, setMessages] = useState<JobMessage[]>([]);
   const [error, setError] = useState('');
   const [pairToken, setPairToken] = useState('');
-  const [pairName, setPairName] = useState('my-pc');
-  const [form, setForm] = useState({ runner: 'codex' as 'codex' | 'claude', workspace: '', prompt: '', workerId: '', write: false, shell: false, ssh: false });
+  const [pairName, setPairName] = useState('Iris-PC');
+  const [form, setForm] = useState({ runner: 'codex' as 'codex' | 'claude' | 'grok', workspace: '', prompt: '', workerId: '', write: false, shell: false, ssh: false });
 
   const refresh = async () => {
     const [w, j] = await Promise.all([api.workers(), api.jobs()]);
@@ -66,6 +66,20 @@ export default function WorkerPanel({ onClose }: Props) {
     catch (e) { setError((e as Error).message); }
   };
 
+  const hideSelected = async () => {
+    if (!selected) return;
+    setError('');
+    try {
+      const done = await hideJobWindow(selected);
+      if (!done) return;
+      setSelectedId(null);
+      setMessages([]);
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
   const setWorkerEnabled = async (worker: Worker, enabled: boolean) => {
     setError('');
     try {
@@ -112,7 +126,7 @@ export default function WorkerPanel({ onClose }: Props) {
         </section>
         {pairToken && <div className="pair-token"><b>仅显示一次：</b><code>{pairToken}</code><button onClick={() => void navigator.clipboard.writeText(pairToken)}>复制</button></div>}
         <section className="job-compose">
-          <select value={form.runner} onChange={(e) => setForm({ ...form, runner: e.target.value as 'codex' | 'claude' })}><option value="codex">Codex</option><option value="claude">Claude Code</option></select>
+          <select value={form.runner} onChange={(e) => setForm({ ...form, runner: e.target.value as 'codex' | 'claude' | 'grok' })}><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="grok">Grok Build</option></select>
           <input list="worker-workspaces" placeholder="本机 workspace 绝对路径" value={form.workspace} onChange={(e) => setForm({ ...form, workspace: e.target.value })} />
           <datalist id="worker-workspaces">{workspaceOptions.map((w) => <option key={w} value={w} />)}</datalist>
           <select value={form.workerId} onChange={(e) => setForm({ ...form, workerId: e.target.value })}><option value="">任意匹配 Worker</option>{workers.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}</select>
@@ -126,7 +140,7 @@ export default function WorkerPanel({ onClose }: Props) {
           <aside className="job-list">{jobs.map((job) => <button key={job.id} className={job.id === selectedId ? 'selected' : ''} onClick={() => setSelectedId(job.id)}><b>{statusLabel(job.status)}</b><span>{job.runner} · {job.prompt.slice(0, 48)}</span><small>{job.workspace}</small></button>)}</aside>
           <main className="job-detail">
             {!selected ? <div className="empty-note">选一条任务看子会话</div> : <>
-              <div className="job-detail-head"><div><b>{statusLabel(selected.status)}</b> · {selected.runner}<small>{selected.worker_id || '尚未认领'} · {selected.workspace}</small></div><span>{active.has(selected.status) && selected.status !== 'pending' && <button onClick={() => void action('pause')}>暂停</button>}{active.has(selected.status) && <button onClick={() => void action('cancel')}>取消</button>}{['paused','interrupted','failed'].includes(selected.status) && <button onClick={() => void action('resume')}>继续/重跑</button>}</span></div>
+              <div className="job-detail-head"><div><b>{statusLabel(selected.status)}</b> · {selected.runner}<small>{selected.worker_id || '尚未认领'} · {selected.workspace}</small></div><span>{active.has(selected.status) && selected.status !== 'pending' && <button type="button" onClick={() => void action('pause')}>暂停</button>}{active.has(selected.status) && <button type="button" onClick={() => void action('cancel')}>取消</button>}{['paused','interrupted','blocked','failed'].includes(selected.status) && <button type="button" onClick={() => void action('resume')}>继续/重跑</button>}<button type="button" className="del" title="删除任务窗口（软隐藏）" onClick={() => void hideSelected()}>删除窗口</button></span></div>
               <div className="job-messages">{messages.map((m) => <article key={m.id} className={`job-msg ${m.kind}`}><small>{m.sender} · {m.kind} · {formatLocalTime(m.created_at)}</small><pre>{m.content}</pre></article>)}</div>
             </>}
           </main>

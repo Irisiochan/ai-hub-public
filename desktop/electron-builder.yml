@@ -1,0 +1,23 @@
+appId: com.irisiochan.aihub
+productName: ai-hub
+# asar off for phase 1: server-dist is an ESM tree forked as a utilityProcess,
+# keeping it on the real filesystem avoids asar/ESM loader edge cases.
+asar: false
+directories:
+  output: release
+files:
+  - main.cjs
+  - server-dist/**/*
+  - web-dist/**/*
+win:
+  target:
+    - nsis
+    - portable
+  # unsigned build: skips the winCodeSign toolchain, whose archive contains
+  # macOS symlinks that fail to extract on Windows without Developer Mode
+  signAndEditExecutable: false
+nsis:
+  oneClick: true
+  perMachine: false
+  # keep userData (db, uploads, logs) on uninstall
+  deleteAppDataOnUninstall: false

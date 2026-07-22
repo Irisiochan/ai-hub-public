@@ -9,7 +9,7 @@ export interface ContactRow {
   name: string;
   avatar: string;
   color: string;
-  backend: 'claude-cli' | 'codex' | 'api';
+  backend: 'claude-cli' | 'codex' | 'grok-cli' | 'api';
   kind: 'dm' | 'room';
   config: string; // JSON
   sort_order: number;
@@ -78,8 +78,14 @@ export interface JobRow {
   permissions: string;
   result: string | null;
   error: string | null;
+  delivery_state: string | null;
+  delivery_meta: string | null;
   origin_contact_id: string | null;
   origin_anchor_id: number | null;
+  /** JSON: {model?, reasoning?} — 派单时指定的模型和推理强度覆盖 */
+  options: string;
+  /** 1 = 任务窗口已软删/隐藏（UI 不再展示；行与审计日志保留） */
+  deleted: number;
   created_at: string;
   updated_at: string;
 }
@@ -226,6 +232,34 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE workers ADD COLUMN accepting_jobs INTEGER NOT NULL DEFAULT 1;
   ALTER TABLE workers ADD COLUMN boot_id TEXT;
+  `,
+  `
+  ALTER TABLE jobs ADD COLUMN delivery_state TEXT;
+  ALTER TABLE jobs ADD COLUMN delivery_meta TEXT;
+  `,
+  `
+  UPDATE contacts
+     SET config = json_set(
+       config,
+       '$.baseUrl',
+       rtrim(json_extract(config, '$.baseUrl'), '/') ||
+         CASE
+           WHEN json_extract(config, '$.provider') = 'anthropic' THEN '/v1/messages'
+           ELSE '/v1/chat/completions'
+         END
+     )
+   WHERE backend = 'api'
+     AND json_valid(config)
+     AND typeof(json_extract(config, '$.baseUrl')) = 'text'
+     AND trim(json_extract(config, '$.baseUrl')) <> ''
+     AND rtrim(json_extract(config, '$.baseUrl'), '/') NOT LIKE '%/messages'
+     AND rtrim(json_extract(config, '$.baseUrl'), '/') NOT LIKE '%/chat/completions';
+  `,
+  `
+  ALTER TABLE jobs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+  `,
+  `
+  ALTER TABLE jobs ADD COLUMN options TEXT NOT NULL DEFAULT '{}';
   `,
 ];
 

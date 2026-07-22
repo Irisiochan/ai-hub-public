@@ -7,12 +7,15 @@
   ],
   "runners": [
     "codex",
-    "claude"
+    "claude",
+    "grok"
   ],
   "codexCommand": "codex.cmd",
   "codexModel": "",
   "codexWindowsSandbox": "unelevated",
   "claudeCommand": "claude.cmd",
   "allowShell": false,
-  "allowSsh": false
+  "allowSsh": false,
+  "grokCommand": "C:\\Users\\YOUR-USER\\.grok\\bin\\grok.exe",
+  "grokModel": ""
 }

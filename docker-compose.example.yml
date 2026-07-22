@@ -1,8 +1,9 @@
 services:
   memory-vault:
     build:
-      context: ./memory-vault
-      dockerfile: Dockerfile
+      # Keep the memory system as a versioned external dependency. Override
+      # MEMORY_VAULT_VERSION only when intentionally testing another release.
+      context: "https://github.com/Irisiochan/memory-vault.git#${MEMORY_VAULT_VERSION:-v0.4.1}"
     restart: unless-stopped
     init: true
     env_file:
@@ -13,6 +14,8 @@ services:
       VAULT_GIT_SYNC: auto
     volumes:
       - ./vault-data:/vault
+    ports:
+      - "127.0.0.1:8900:8900"
     healthcheck:
       test:
         - CMD

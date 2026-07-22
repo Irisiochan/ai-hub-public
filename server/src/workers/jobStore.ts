@@ -12,11 +12,19 @@ import type { SseHub } from '../sse.js';
  */
 
 export const ACTIVE_STATUSES = new Set(['claimed', 'running', 'pause_requested', 'cancel_requested']);
+/** Statuses where the PC worker may still be executing; soft-deleting the window needs force. */
+export const RUNNING_WINDOW_STATUSES = new Set([
+  'pending',
+  'claimed',
+  'running',
+  'pause_requested',
+  'cancel_requested',
+]);
 export const LEASE_SECONDS = 45;
 
 export interface CreateJobInput {
   requestedBy: string;
-  runner: 'claude' | 'codex';
+  runner: 'claude' | 'codex' | 'grok';
   workspace: string;
   prompt: string;
   workerId?: string | null;
@@ -24,27 +32,92 @@ export interface CreateJobInput {
   ttlMinutes?: number;
   idempotencyKey?: string;
   permissions: { write: boolean; shell: boolean; ssh: boolean };
+  /** 派单时指定的模型和推理强度，覆盖 Worker config 默认值。 */
+  options?: { model?: string; reasoning?: string };
   /** 委派发生的聊天（DM/群）与当时的最后一条消息 id——前端把任务 thread 挂回这条消息下。 */
   originContactId?: string | null;
   originAnchorId?: number | null;
 }
 
+function isWindowsWorkspace(workspace: string): boolean {
+  return path.win32.isAbsolute(workspace.trim());
+}
+
+export function normalizeWorkspace(workspace: string): string {
+  const trimmed = workspace.trim();
+  if (isWindowsWorkspace(trimmed)) return path.win32.normalize(trimmed);
+  if (path.posix.isAbsolute(trimmed)) return path.posix.normalize(trimmed);
+  return trimmed;
+}
+
 export function workspaceAllowed(workspace: string, roots: string[]): boolean {
-  const target = path.resolve(workspace).toLowerCase();
+  const targetIsWindows = isWindowsWorkspace(workspace);
+  const target = normalizeWorkspace(workspace);
   return roots.some((root) => {
-    const base = path.resolve(root).toLowerCase();
-    return target === base || target.startsWith(base + path.sep);
+    if (targetIsWindows !== isWindowsWorkspace(root)) return false;
+    const base = normalizeWorkspace(root);
+    const separator = targetIsWindows ? path.win32.sep : path.posix.sep;
+    const comparableTarget = targetIsWindows ? target.toLowerCase() : target;
+    const comparableBase = targetIsWindows ? base.toLowerCase() : base;
+    return comparableTarget === comparableBase
+      || comparableTarget.startsWith(comparableBase + separator);
   });
 }
 
 export class JobStore {
-  /** Terminal transition hook (done/failed/interrupted). Set by index.ts. */
+  /** Terminal transition hook (done/blocked/failed/interrupted). Set by index.ts. */
   onFinished: ((job: JobRow) => void) | null = null;
 
   constructor(private db: Db, private sse: SseHub) {}
 
   get(id: string): JobRow | undefined {
     return this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined;
+  }
+
+  /**
+   * Soft-delete (hide) a job window. Keeps the row + job_messages for audit/recovery.
+   * Active/queued jobs require `force: true` — caller must have warned the user that
+   * the PC worker may keep running in the background unless they cancel first.
+   */
+  softDelete(
+    id: string,
+    actor: string,
+    opts: { force?: boolean } = {}
+  ): { ok: true; job: JobRow } | { error: string; code: 404 | 409 } {
+    this.reap();
+    const job = this.get(id);
+    if (!job) return { error: 'job not found', code: 404 };
+    if (job.deleted === 1) return { error: 'job already hidden', code: 404 };
+    if (RUNNING_WINDOW_STATUSES.has(job.status) && !opts.force) {
+      return {
+        error:
+          '任务仍在队列或执行中：请先取消，或 force=true 仅隐藏窗口（后台仍可能继续）',
+        code: 409,
+      };
+    }
+    this.db
+      .prepare(`UPDATE jobs SET deleted = 1, updated_at = datetime('now') WHERE id = ? AND deleted = 0`)
+      .run(job.id);
+    this.addMessage(
+      job.id,
+      actor,
+      'state',
+      RUNNING_WINDOW_STATUSES.has(job.status)
+        ? `window hidden (force): status was ${job.status}; worker may still run until cancel/complete`
+        : `window hidden: status was ${job.status}`
+    );
+    // Pending jobs must leave the claim queue; cancel_requested if still leased so
+    // worker heartbeats can stop side effects when the user only meant to hide.
+    if (job.status === 'pending') {
+      this.db
+        .prepare(
+          `UPDATE jobs SET status = 'cancelled', lease_until = NULL, updated_at = datetime('now') WHERE id = ? AND status = 'pending'`
+        )
+        .run(job.id);
+      this.addMessage(job.id, actor, 'state', 'hidden pending job cancelled so it will not be claimed');
+    }
+    this.emitJob(job.id);
+    return { ok: true, job: this.get(id)! };
   }
 
   messages(jobId: string, limit = 200): unknown[] {
@@ -119,28 +192,32 @@ export class JobStore {
       return { error: 'Codex 的文件读取/编辑都通过 Shell 工具；Codex 任务必须显式开启 Shell' };
 
     const id = crypto.randomUUID();
+    const workspace = normalizeWorkspace(input.workspace);
     const ttlMinutes = Math.min(Math.max(Number(input.ttlMinutes) || 1440, 5), 10080);
+    const options = input.options && (input.options.model || input.options.reasoning)
+      ? JSON.stringify(input.options) : '{}';
     try {
       this.db
         .prepare(
           `INSERT INTO jobs
            (id, requested_by, worker_id, runner, workspace, prompt, priority, ttl_at, idempotency_key, permissions,
-            origin_contact_id, origin_anchor_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, ?)`
+            origin_contact_id, origin_anchor_id, options)
+           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, ?, ?)`
         )
         .run(
           id,
           input.requestedBy,
           input.workerId || null,
           input.runner,
-          input.workspace.trim(),
+          workspace,
           input.prompt.trim(),
           Math.min(Math.max(Number(input.priority) || 0, -10), 10),
           `+${ttlMinutes} minutes`,
           input.idempotencyKey?.slice(0, 200) || id,
           JSON.stringify(input.permissions),
           input.originContactId ?? null,
-          input.originAnchorId ?? null
+          input.originAnchorId ?? null,
+          options
         );
     } catch (e: any) {
       if (String(e.message).includes('UNIQUE')) return { error: 'duplicate idempotency key' };
@@ -148,7 +225,7 @@ export class JobStore {
     }
     this.addMessage(id, input.requestedBy, 'prompt', input.prompt.trim(), {
       runner: input.runner,
-      workspace: input.workspace.trim(),
+      workspace,
       permissions: input.permissions,
     });
     this.emitJob(id);
@@ -163,7 +240,7 @@ export class JobStore {
     if (action === 'cancel' && job.status === 'pending') next = 'cancelled';
     else if (action === 'cancel' && ACTIVE_STATUSES.has(job.status)) next = 'cancel_requested';
     else if (action === 'pause' && ACTIVE_STATUSES.has(job.status)) next = 'pause_requested';
-    else if (action === 'resume' && ['paused', 'interrupted', 'failed'].includes(job.status)) next = 'pending';
+    else if (action === 'resume' && ['paused', 'interrupted', 'blocked', 'failed'].includes(job.status)) next = 'pending';
     if (!next) return { error: `cannot ${action} from ${job.status}` };
     this.db
       .prepare(
@@ -175,10 +252,40 @@ export class JobStore {
     return { status: next };
   }
 
-  /** Worker complete 回传的收口，含终态通知（done/failed 才通知；cancelled/paused 是 User 主导的）。 */
-  complete(job: JobRow, requested: unknown, result: string | null, error: string | null): string {
+  reconcileBlocked(
+    job: JobRow,
+    actor: string,
+    deliveryMeta: string,
+    head: string
+  ): { status: 'done' } | { error: string } {
+    if (job.status !== 'blocked') return { error: `cannot reconcile from ${job.status}` };
+    if (!['blocked_local_changes', 'blocked_unpushed'].includes(job.delivery_state ?? '')) {
+      return { error: `delivery state ${job.delivery_state ?? 'missing'} is not reconcilable` };
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE jobs SET status = 'done', error = NULL, delivery_state = 'delivered', delivery_meta = ?,
+         lease_until = NULL, updated_at = datetime('now') WHERE id = ? AND status = 'blocked'`
+      )
+      .run(deliveryMeta, job.id);
+    if (!result.changes) return { error: 'job changed before reconciliation' };
+    this.addMessage(job.id, actor, 'state', `外部续接已自动确认完成（HEAD ${head.slice(0, 12)}，已同步 upstream）`);
+    this.emitJob(job.id);
+    return { status: 'done' };
+  }
+
+  /** Worker complete 回传的收口，含终态通知；cancelled/paused 是 Iris 主导的。 */
+  complete(
+    job: JobRow,
+    requested: unknown,
+    result: string | null,
+    error: string | null,
+    deliveryState: string | null = null,
+    deliveryMeta: string | null = null
+  ): string {
     let status =
       requested === 'done' ? 'done'
+      : requested === 'blocked' ? 'blocked'
       : requested === 'paused' ? 'paused'
       : requested === 'interrupted' ? 'interrupted'
       : 'failed';
@@ -186,13 +293,13 @@ export class JobStore {
     if (job.status === 'pause_requested') status = 'paused';
     this.db
       .prepare(
-        `UPDATE jobs SET status = ?, result = ?, error = ?, lease_until = NULL,
+        `UPDATE jobs SET status = ?, result = ?, error = ?, delivery_state = ?, delivery_meta = ?, lease_until = NULL,
          updated_at = datetime('now') WHERE id = ?`
       )
-      .run(status, result, error, job.id);
+      .run(status, result, error, deliveryState, deliveryMeta, job.id);
     this.addMessage(job.id, job.worker_id ?? 'worker', status === 'done' ? 'result' : 'state', result || error || status);
     this.emitJob(job.id);
-    if (['done', 'failed', 'interrupted'].includes(status)) this.notifyFinished(job.id);
+    if (['done', 'blocked', 'failed', 'interrupted'].includes(status)) this.notifyFinished(job.id);
     return status;
   }
 }

@@ -12,6 +12,7 @@ export interface ClaudeCliBackendOpts {
   cliPath: string;
   cwd: string;
   model?: string;
+  effort?: string;
   allowedTools?: string[];
   disallowedTools?: string[];
   appendSystemPrompt?: string;
@@ -103,6 +104,7 @@ export class ClaudeCliBackend implements AgentBackend {
     ];
     if (resumeToken) args.push('--resume', resumeToken);
     if (this.opts.model) args.push('--model', this.opts.model);
+    if (this.opts.effort) args.push('--effort', this.opts.effort);
     if (this.opts.permissionMode) args.push('--permission-mode', this.opts.permissionMode);
     if (this.opts.allowedTools?.length) args.push('--allowedTools', this.opts.allowedTools.join(','));
     if (this.opts.disallowedTools?.length)

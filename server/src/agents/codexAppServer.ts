@@ -12,6 +12,7 @@ export interface CodexAppServerBackendOpts {
   cliPath: string;
   cwd: string;
   model?: string;
+  effort?: string;
   developerInstructions?: string;
   mcpServers?: CodexMcpServerConfig[];
   sandbox?: 'read-only' | 'workspace-write';
@@ -56,6 +57,14 @@ export interface CodexModelOption {
   label: string;
   description?: string;
   isDefault?: boolean;
+  supportedReasoningEfforts?: CodexReasoningEffortOption[];
+  defaultReasoningEffort?: string;
+}
+
+export interface CodexReasoningEffortOption {
+  id: string;
+  label: string;
+  description?: string;
 }
 
 export interface CodexRateLimitWindow {
@@ -76,6 +85,75 @@ export function codexTurnInput(text: string, imagePaths: string[] = []): Record<
   ];
 }
 
+export type CodexErrorCategory =
+  | 'capacity'
+  | 'rate_limit'
+  | 'quota'
+  | 'model_unavailable'
+  | 'auth'
+  | 'server'
+  | 'unknown';
+
+export interface CodexErrorInfo {
+  category: CodexErrorCategory;
+  title: string;
+  detail: string;
+  rawSnippet: string;
+}
+
+function compactCodexError(value: unknown): string {
+  try {
+    return (typeof value === 'string' ? value : JSON.stringify(value)).replace(/\s+/g, ' ').trim().slice(0, 500);
+  } catch {
+    return '';
+  }
+}
+
+export function classifyCodexAppServerError(error: unknown): CodexErrorInfo {
+  const rawSnippet = compactCodexError(error);
+  const detail = typeof (error as any)?.message === 'string'
+    ? (error as any).message
+    : rawSnippet || 'Codex app-server returned an error';
+  const haystack = rawSnippet.toLowerCase();
+  let category: CodexErrorCategory = 'unknown';
+  let title = 'Codex 上游错误';
+
+  if (haystack.includes('capacity') || haystack.includes('overloaded')) {
+    category = 'capacity';
+    title = 'Codex 模型容量不足';
+  } else if (haystack.includes('quota') || haystack.includes('billing')) {
+    category = 'quota';
+    title = 'Codex 额度不足';
+  } else if (haystack.includes('rate limit') || haystack.includes('rate_limit') || haystack.includes('429')) {
+    category = 'rate_limit';
+    title = 'Codex 上游限流';
+  } else if (
+    haystack.includes('model_not_found') ||
+    haystack.includes('model not found') ||
+    haystack.includes('selected model') ||
+    haystack.includes('not available') ||
+    haystack.includes('unsupported model')
+  ) {
+    category = 'model_unavailable';
+    title = 'Codex 模型不可用';
+  } else if (haystack.includes('unauthorized') || haystack.includes('forbidden') || haystack.includes('401') || haystack.includes('403')) {
+    category = 'auth';
+    title = 'Codex 鉴权失败';
+  } else if (haystack.includes('500') || haystack.includes('502') || haystack.includes('503') || haystack.includes('504')) {
+    category = 'server';
+    title = 'Codex 服务错误';
+  }
+
+  return { category, title, detail, rawSnippet };
+}
+
+function formatCodexAppServerError(error: unknown): string {
+  const info = classifyCodexAppServerError(error);
+  const raw = info.rawSnippet && info.rawSnippet !== info.detail
+    ? `；原始错误：${info.rawSnippet}`
+    : '';
+  return `${info.title}：${info.detail}${raw}`;
+}
 interface PendingRequest {
   resolve: (value: any) => void;
   reject: (error: Error) => void;
@@ -126,16 +204,34 @@ export class CodexAppServerBackend implements AgentBackend {
         const result = await client.request('model/list', {
           cursor,
           limit: 100,
-          includeHidden: false,
+          // Hidden GPT entries can still be explicitly selected (for example
+          // GPT-5.4); internal codex-* helpers are not conversation models.
+          includeHidden: true,
         });
         for (const model of result?.data ?? []) {
           const id = String(model.model ?? model.id ?? '').trim();
-          if (!id || models.some((m) => m.id === id)) continue;
+          if (!id || id.startsWith('codex-') || models.some((m) => m.id === id)) continue;
           models.push({
             id,
             label: String(model.displayName ?? id),
             description: typeof model.description === 'string' ? model.description : undefined,
             isDefault: model.isDefault === true,
+            supportedReasoningEfforts: Array.isArray(model.supportedReasoningEfforts)
+              ? model.supportedReasoningEfforts
+                .map((option: any) => {
+                  const effort = String(option?.reasoningEffort ?? '').trim();
+                  if (!effort) return null;
+                  return {
+                    id: effort,
+                    label: effort,
+                    description: typeof option.description === 'string' ? option.description : undefined,
+                  };
+                })
+                .filter((option: CodexReasoningEffortOption | null): option is CodexReasoningEffortOption => option !== null)
+              : [],
+            defaultReasoningEffort: typeof model.defaultReasoningEffort === 'string'
+              ? model.defaultReasoningEffort
+              : undefined,
           });
         }
         cursor = typeof result?.nextCursor === 'string' ? result.nextCursor : null;
@@ -276,6 +372,7 @@ export class CodexAppServerBackend implements AgentBackend {
     const result = await this.request('turn/start', {
       threadId: this.threadId,
       input: codexTurnInput(text, imagePaths),
+      ...(this.opts.effort ? { effort: this.opts.effort } : {}),
     });
     this.turnId = result?.turn?.id ?? this.turnId;
     this.turnTimer = setTimeout(() => {
@@ -317,7 +414,10 @@ export class CodexAppServerBackend implements AgentBackend {
       if (!pending) return;
       clearTimeout(pending.timer);
       this.pending.delete(Number(line.id));
-      if (line.error) pending.reject(new Error(line.error.message ?? JSON.stringify(line.error)));
+      if (line.error) {
+        this.opts.log(`json-rpc ${line.id} error: ${compactCodexError(line.error)}`);
+        pending.reject(new Error(formatCodexAppServerError(line.error)));
+      }
       else pending.resolve(line.result);
       return;
     }

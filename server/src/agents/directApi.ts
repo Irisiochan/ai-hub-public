@@ -1,7 +1,9 @@
 import type { ConversationSummaryRow, Db, MessageRow } from '../db.js';
 import { attachmentDataUrl, attachmentsForMessage } from '../attachments.js';
 import type { VaultClient } from '../memory/vaultClient.js';
+import { compactSummaryText } from './conversationSummary.js';
 import type { GatewayTool } from './gatewayTools.js';
+import { estimateTokens } from './tokenEstimate.js';
 import {
   AsyncQueue,
   type AgentBackend,
@@ -10,13 +12,21 @@ import {
   type TurnHandle,
 } from './types.js';
 
+export { estimateTokens } from './tokenEstimate.js';
+
 export interface DirectApiBackendOpts {
-  provider: 'anthropic' | 'openai-compat';
+  provider: 'anthropic' | 'openai-compat' | 'gemini';
   baseUrl: string;
   apiKey: string;
   model: string;
   /** Optional model used only when the turn contains images. Keeps the normal chat model unchanged. */
   visionModel?: string;
+  /**
+   * 是否允许把图片 content part 发给上游。undefined = 按 provider+model 自动推断
+   * （见 defaultSupportsImages）。为 false 时含图历史会被降级成文字占位，避免纯文字
+   * 模型（如 openai-compat 下的 deepseek）因 image_url content block 被上游 HTTP 400。
+   */
+  supportsImages?: boolean;
   systemPrompt?: string; // persona + 网关注入的记忆 preamble
   /** 单独标记记忆前缀，便于本地成本分项；不改变实际 prompt。 */
   memoryPreamble?: string;
@@ -24,8 +34,13 @@ export interface DirectApiBackendOpts {
   historyTokenBudget: number;
   minRecentTurns: number;
   summaryMaxTokens: number;
-  historySummaryStrategy: 'extractive' | 'off';
+  historySummaryStrategy: 'extractive' | 'off' | 'external';
   maxTokens: number;
+  /**
+   * 供应商上下文窗口上限（token 粗估）。历史预算会再扣掉输出/工具回填/附件预留，
+   * 避免 history+system+tools 把窗口顶满。0/未设则只按 historyTokenBudget。
+   */
+  contextWindowTokens?: number;
   turnTimeoutMs: number;
   db: Db;
   uploadsDir: string;
@@ -45,19 +60,146 @@ export interface DirectApiBackendOpts {
 }
 
 /** 每轮 turn 内最多几趟工具往返，防模型翻档案翻上瘾 */
-const MAX_TOOL_ROUNDS = 4;
-/** 单次工具结果回填上限（字符） */
-const TOOL_RESULT_MAX_CHARS = 12_000;
+export const MAX_TOOL_ROUNDS = 4;
+/**
+ * 单次工具结果回填上限（字符）。
+ * 12k × 最多 4 轮会把后续 prompt 再撑十几～几十 k；5k 仍够装一段核心记忆
+ * / 检索片段，截断后模型可继续用 search_vault / read_file 按需深挖。
+ */
+export const TOOL_RESULT_MAX_CHARS = 5_000;
 
-/** 中日韩字符通常接近 1 token；其余文本按约 4 字符/token。仅作本地趋势估算。 */
-export function estimateTokens(text: string): number {
-  let cjk = 0;
-  let other = 0;
-  for (const ch of text) {
-    if (/[\u3000-\u9fff\uf900-\ufaff]/.test(ch)) cjk++;
-    else other++;
+/** 图片被剥离后留给纯文字模型的占位，保留“这里本来有图”的语义，但不外发 base64/url。 */
+export const IMAGE_OMITTED_PLACEHOLDER = '[图片已省略，该模型不支持图片]';
+
+/**
+ * 未显式配置 supportsImages 时，按 provider + model 名推断能否发送图片 content part。
+ *
+ * - anthropic / gemini：本后端已按各自 schema 序列化图片，默认多模态。
+ * - openai-compat：既涵盖多模态模型（gpt-4o、*-vl、*-4v 等），也涵盖纯文字模型
+ *   （deepseek chat/coder/reasoner 等），后者对 `image_url` part 会 HTTP 400
+ *   “unknown variant image_url”。按模型名识别已知纯文字家族，其余保持既有发图行为。
+ *
+ * 该推断可被联系人配置里的 supportsImages 显式覆盖（true/false）。
+ */
+export function defaultSupportsImages(
+  provider: DirectApiBackendOpts['provider'],
+  model: string
+): boolean {
+  if (provider !== 'openai-compat') return true;
+  const m = (model ?? '').toLowerCase();
+  // 模型名带明确视觉标记 → 当作多模态（放行未来的 deepseek-vl 等）。
+  if (/vision|multimodal|-vl\b|\bvl\b|omni|4o\b|4v\b/.test(m)) return true;
+  // 已知纯文字家族：deepseek 走 openai-compat 时不吃 image_url。
+  if (/deepseek/.test(m)) return false;
+  // 其它未知 openai-compat 模型保持既有行为（发图）；纯文字模型可显式设 supportsImages=false。
+  return true;
+}
+
+export type UpstreamErrorCategory =
+  | 'capacity'
+  | 'rate_limit'
+  | 'quota'
+  | 'model_unavailable'
+  | 'auth'
+  | 'bad_request'
+  | 'server'
+  | 'network'
+  | 'unknown';
+
+export interface UpstreamErrorInfo {
+  provider: DirectApiBackendOpts['provider'];
+  model: string;
+  status: number;
+  category: UpstreamErrorCategory;
+  title: string;
+  detail: string;
+  rawSnippet: string;
+}
+
+function compactBody(raw: string): string {
+  return raw.replace(/\s+/g, ' ').trim().slice(0, 500);
+}
+
+function extractErrorDetail(raw: string): { type?: string; code?: string; message: string } {
+  const snippet = compactBody(raw);
+  if (!snippet) return { message: '' };
+  try {
+    const parsed = JSON.parse(raw);
+    const err = parsed?.error ?? parsed;
+    const message = String(err?.message ?? err?.detail ?? err?.error ?? snippet);
+    return {
+      type: typeof err?.type === 'string' ? err.type : undefined,
+      code: typeof err?.code === 'string' ? err.code : undefined,
+      message,
+    };
+  } catch {
+    return { message: snippet };
   }
-  return Math.max(0, Math.ceil(cjk + other / 4));
+}
+
+export function classifyUpstreamHttpError(
+  provider: DirectApiBackendOpts['provider'],
+  model: string,
+  status: number,
+  rawBody: string
+): UpstreamErrorInfo {
+  const rawSnippet = compactBody(rawBody);
+  const detail = extractErrorDetail(rawBody);
+  const haystack = `${status} ${detail.type ?? ''} ${detail.code ?? ''} ${detail.message}`.toLowerCase();
+  let category: UpstreamErrorCategory = 'unknown';
+  let title = '上游 API 请求失败';
+
+  if (haystack.includes('capacity') || haystack.includes('overloaded')) {
+    category = 'capacity';
+    title = '上游模型容量不足';
+  } else if (haystack.includes('quota') || haystack.includes('insufficient_quota') || haystack.includes('billing')) {
+    category = 'quota';
+    title = '上游额度不足';
+  } else if (status === 429 || haystack.includes('rate_limit') || haystack.includes('rate limit')) {
+    category = 'rate_limit';
+    title = '上游限流';
+  } else if (
+    haystack.includes('model_not_found') ||
+    haystack.includes('model not found') ||
+    haystack.includes('does not exist') ||
+    haystack.includes('not available') ||
+    haystack.includes('unsupported model')
+  ) {
+    category = 'model_unavailable';
+    title = '模型不可用';
+  } else if (status === 401 || status === 403 || haystack.includes('unauthorized') || haystack.includes('forbidden')) {
+    category = 'auth';
+    title = '上游鉴权失败';
+  } else if (status >= 500) {
+    category = 'server';
+    title = '上游服务错误';
+  } else if (status >= 400) {
+    category = 'bad_request';
+    title = '请求被上游拒绝';
+  }
+
+  return {
+    provider,
+    model,
+    status,
+    category,
+    title,
+    detail: detail.message || rawSnippet || `HTTP ${status}`,
+    rawSnippet,
+  };
+}
+
+function formatUpstreamError(info: UpstreamErrorInfo): string {
+  const raw = info.rawSnippet && info.rawSnippet !== info.detail
+    ? `；原始响应：${info.rawSnippet}`
+    : '';
+  return `${info.title}（${info.provider}，model=${info.model}，HTTP ${info.status}）：${info.detail}${raw}`;
+}
+
+class UpstreamHttpError extends Error {
+  constructor(readonly info: UpstreamErrorInfo) {
+    super(formatUpstreamError(info));
+  }
 }
 
 interface ImageContentPart {
@@ -79,7 +221,7 @@ const MEMORY_TOOLS: { name: string; description: string; schema: Record<string, 
   {
     name: 'search_vault',
     description:
-      '在 User 的共享记忆库中按关键词搜索（多个词空格分隔，AND 逻辑），返回匹配的文件清单。',
+      '在 Iris 的共享记忆库中按关键词搜索（多个词空格分隔，AND 逻辑），返回匹配的文件清单。',
     schema: {
       type: 'object',
       properties: { query: { type: 'string', description: '搜索关键词' } },
@@ -88,7 +230,7 @@ const MEMORY_TOOLS: { name: string; description: string; schema: Record<string, 
   },
   {
     name: 'read_file',
-    description: '读取记忆库中某个文件的全文。path 是相对路径，例如 "memories/User-core.md"。',
+    description: '读取记忆库中某个文件的全文。path 是相对路径，例如 "memories/iris-core.md"。',
     schema: {
       type: 'object',
       properties: { path: { type: 'string', description: '相对于记忆库根目录的路径' } },
@@ -122,36 +264,39 @@ export class DirectApiBackend implements AgentBackend {
     this.stopped = true;
   }
 
-  private summaryLine(r: MessageRow): string {
-    const room = this.opts.roomMode;
-    const who = room
-      ? room.nameOf(r.sender)
-      : r.role === 'assistant'
-        ? '助手'
-        : 'User';
-    const compact = r.content.replace(/\s+/g, ' ').trim().slice(0, 240);
-    return `- ${who}：${compact}`;
+  private compactSummary(existing: string, rows: MessageRow[]): string {
+    // external：配置了可选项，但默认仍走本地 extractive，不把私人对话发给另一供应商
+    return compactSummaryText(existing, rows, {
+      summaryMaxTokens: this.opts.summaryMaxTokens,
+      historyTokenBudget: this.opts.historyTokenBudget,
+      nameOf: this.opts.roomMode?.nameOf,
+    });
   }
 
-  private compactSummary(existing: string, rows: MessageRow[]): string {
-    const appended = [existing.trim(), ...rows.map((r) => this.summaryLine(r))]
-      .filter(Boolean)
-      .join('\n');
-    const maxTokens = Math.max(
-      Math.min(this.opts.summaryMaxTokens, this.opts.historyTokenBudget - 512),
-      256
-    );
-    if (estimateTokens(appended) <= maxTokens) return appended;
-    // 保留更新、更可能仍影响当前对话的尾部；显式标记早期内容已淘汰。
-    const prefix = '[更早的摘要已按预算淘汰]\n';
-    let low = 0;
-    let high = appended.length;
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2);
-      if (estimateTokens(prefix + appended.slice(mid)) <= maxTokens) high = mid;
-      else low = mid + 1;
+  /**
+   * 历史原文可用预算：在 historyTokenBudget 上再扣输出/工具 schema/工具回填/附件预留。
+   * 有 contextWindowTokens 时，还会用 system+tools+预留 反推 history 上限。
+   */
+  private effectiveHistoryBudget(summaryBlock: string): number {
+    const toolDefs = this.toolDefs();
+    const toolSchemaTokens = estimateTokens(JSON.stringify(toolDefs));
+    const systemTokens = estimateTokens(this.opts.systemPrompt ?? '');
+    // 输出 + 最多几轮工具结果回填（字符→粗估 token）+ 多模态头
+    const outputReserve = Math.max(this.opts.maxTokens, 256);
+    const toolResultReserve = toolDefs.length
+      ? Math.ceil((TOOL_RESULT_MAX_CHARS * Math.min(MAX_TOOL_ROUNDS, 2)) / 4)
+      : 0;
+    const attachmentReserve = 1024;
+    const reserve = outputReserve + toolSchemaTokens + toolResultReserve + attachmentReserve;
+
+    let budget = this.opts.historyTokenBudget;
+    const window = this.opts.contextWindowTokens ?? 0;
+    if (window > 0) {
+      const fixed = systemTokens + toolSchemaTokens + reserve;
+      budget = Math.min(budget, Math.max(2048, window - fixed));
     }
-    return prefix + appended.slice(low);
+    const afterSummary = Math.max(budget - estimateTokens(summaryBlock) - Math.min(reserve, Math.floor(budget * 0.35)), 512);
+    return afterSummary;
   }
 
   private contentForRow(row: MessageRow, text = row.content): InternalContent {
@@ -179,10 +324,42 @@ export class DirectApiBackend implements AgentBackend {
       : content.filter((part): part is { type: 'text'; text: string } => part.type === 'text').map((part) => part.text).join('');
   }
 
+  private contentHasSignal(content: InternalContent): boolean {
+    if (typeof content === 'string') return content.trim().length > 0;
+    return content.some((part) => part.type === 'image' || part.text.trim().length > 0);
+  }
+
   private hasImages(history: HistoryBuild): boolean {
     return history.messages.some(
       (message) => Array.isArray(message.content) && message.content.some((part) => part.type === 'image')
     );
+  }
+
+  /** base（非 vision）模型是否可接收图片 content part。显式配置优先，否则按 provider+model 推断。 */
+  private baseSupportsImages(): boolean {
+    return typeof this.opts.supportsImages === 'boolean'
+      ? this.opts.supportsImages
+      : defaultSupportsImages(this.opts.provider, this.opts.model);
+  }
+
+  /**
+   * 把历史里的图片 part 原地降级成一条文字占位，返回剥离的图片数。
+   * 只影响本成员本轮请求：既保留“这里本来有图”的语义，又不把 base64/url 塞进上游。
+   */
+  private stripImages(history: HistoryBuild): number {
+    let removed = 0;
+    for (const message of history.messages) {
+      if (typeof message.content === 'string') continue;
+      const texts = message.content
+        .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+        .map((part) => part.text);
+      const imageCount = message.content.length - texts.length;
+      if (imageCount === 0) continue;
+      removed += imageCount;
+      const joined = texts.join('');
+      message.content = joined ? `${joined}\n${IMAGE_OMITTED_PLACEHOLDER}` : IMAGE_OMITTED_PLACEHOLDER;
+    }
+    return removed;
   }
 
   private history(currentText: string, currentMessageId?: number): HistoryBuild {
@@ -210,7 +387,7 @@ export class DirectApiBackend implements AgentBackend {
       const summaryBlock = summary
         ? `# 对话滚动摘要（覆盖更早消息）\n${summary}`
         : '';
-      const rawBudget = Math.max(this.opts.historyTokenBudget - estimateTokens(summaryBlock), 512);
+      const rawBudget = this.effectiveHistoryBudget(summaryBlock);
       let used = 0;
       let count = 0;
       let start = rows.length;
@@ -225,6 +402,7 @@ export class DirectApiBackend implements AgentBackend {
     };
 
     keepFrom = chooseKeepFrom();
+    // extractive / external 都走本地滚动摘要；external 仅表示「允许将来接 LLM」，当前不外发
     while (this.opts.historySummaryStrategy !== 'off' && keepFrom > 0) {
       const dropped = rows.splice(0, keepFrom);
       summary = this.compactSummary(summary, dropped);
@@ -255,7 +433,7 @@ export class DirectApiBackend implements AgentBackend {
           : { role: 'user' as const, content: this.contentForRow(r, `${room.nameOf(r.sender)}：${r.content}`) };
       }
       return { role: r.role as 'user' | 'assistant', content: this.contentForRow(r) };
-    });
+    }).filter((m) => this.contentHasSignal(m.content));
 
     // 相邻同角色合并（群聊里连续多条 user 很常见，anthropic 要求交替）
     const merged: { role: 'user' | 'assistant'; content: InternalContent }[] = [];
@@ -320,15 +498,32 @@ export class DirectApiBackend implements AgentBackend {
     void (async () => {
       try {
         const history = this.history(input.text, input.userMessageId);
-        const requestModel = this.hasImages(history) && this.opts.visionModel
-          ? this.opts.visionModel
-          : this.opts.model;
+        const historyHasImages = this.hasImages(history);
+        const useVisionModel = historyHasImages && !!this.opts.visionModel;
+        const requestModel = useVisionModel ? this.opts.visionModel! : this.opts.model;
+        // 纯文字模型（未配 visionModel 且 base model 不支持图片）：把图片降级成文字占位。
+        // 群聊里只对该成员这一趟请求生效，不影响支持图片的其他成员。
+        if (historyHasImages && !useVisionModel && !this.baseSupportsImages()) {
+          const removed = this.stripImages(history);
+          this.opts.log(
+            `stripped ${removed} image part(s): model=${requestModel} is text-only (image_url unsupported)`
+          );
+        }
         const estimate = this.estimateCost(history, input.text);
         this.opts.log(
           `token estimate total=${estimate.total} system=${estimate.system} memory=${estimate.memory} history=${estimate.history} summary=${estimate.summary} retrieval=${estimate.retrieval} tools=${estimate.tools} user=${estimate.user}`
         );
         if (this.opts.provider === 'anthropic') {
           await this.streamAnthropic(
+            history.messages,
+            queue,
+            abort.signal,
+            history.summarySystem,
+            estimate,
+            requestModel
+          );
+        } else if (this.opts.provider === 'gemini') {
+          await this.streamGemini(
             history.messages,
             queue,
             abort.signal,
@@ -349,7 +544,11 @@ export class DirectApiBackend implements AgentBackend {
       } catch (e: any) {
         queue.push({
           type: 'error',
-          message: abort.signal.aborted ? '请求超时/被打断' : `API 请求失败：${e.message}`,
+          message: abort.signal.aborted
+            ? '请求超时/被打断'
+            : e instanceof UpstreamHttpError
+              ? e.message
+              : `API 请求失败：${e.message}`,
           fatal: false,
         });
       } finally {
@@ -434,7 +633,7 @@ export class DirectApiBackend implements AgentBackend {
     estimate: TokenCostEstimate,
     requestModel: string
   ): Promise<void> {
-    const url = `${this.opts.baseUrl.replace(/\/+$/, '')}/v1/messages`;
+    const url = this.opts.baseUrl.trim();
     const defs = this.toolDefs();
     const tools = defs.length
       ? defs.map((t) => ({ name: t.name, description: t.description, input_schema: t.schema }))
@@ -483,7 +682,7 @@ export class DirectApiBackend implements AgentBackend {
       });
       if (!res.ok || !res.body) {
         const body = await res.text().catch(() => '');
-        throw new Error(`${res.status} ${body.slice(0, 200)}`);
+        throw new UpstreamHttpError(classifyUpstreamHttpError(this.opts.provider, requestModel, res.status, body));
       }
 
       type Block =
@@ -574,7 +773,7 @@ export class DirectApiBackend implements AgentBackend {
     estimate: TokenCostEstimate,
     requestModel: string
   ): Promise<void> {
-    const url = `${this.opts.baseUrl.replace(/\/+$/, '')}/v1/chat/completions`;
+    const url = this.opts.baseUrl.trim();
     const defs = this.toolDefs();
     const tools = defs.length
       ? defs.map((t) => ({
@@ -597,7 +796,7 @@ export class DirectApiBackend implements AgentBackend {
     ];
 
     let acc = '';
-    const usage = { input: 0, output: 0 };
+    const usage = { input: 0, output: 0, cacheRead: 0 };
     let toolRounds = 0;
 
     while (true) {
@@ -613,13 +812,17 @@ export class DirectApiBackend implements AgentBackend {
           model: requestModel,
           stream: true,
           stream_options: { include_usage: true },
+          // Bound total completion (incl. reasoning_content for GLM-style models).
+          // Anthropic/Gemini already send max_tokens; openai-compat was uncapped and
+          // room turns with larger context could burn a long time in pure thinking.
+          max_tokens: this.opts.maxTokens,
           ...(tools ? { tools, tool_choice: lastRound ? 'none' : 'auto' } : {}),
           messages: convo,
         }),
       });
       if (!res.ok || !res.body) {
         const body = await res.text().catch(() => '');
-        throw new Error(`${res.status} ${body.slice(0, 200)}`);
+        throw new UpstreamHttpError(classifyUpstreamHttpError(this.opts.provider, requestModel, res.status, body));
       }
 
       let roundText = '';
@@ -654,6 +857,7 @@ export class DirectApiBackend implements AgentBackend {
         if (ev.usage) {
           usage.input += ev.usage.prompt_tokens ?? ev.usage.input_tokens ?? 0;
           usage.output += ev.usage.completion_tokens ?? ev.usage.output_tokens ?? 0;
+          usage.cacheRead += ev.usage.prompt_cache_hit_tokens ?? 0;
         }
       }
 
@@ -681,6 +885,162 @@ export class DirectApiBackend implements AgentBackend {
       toolRounds++;
     }
 
+    queue.push({ type: 'done', finalText: acc, usage: { ...usage, estimate } });
+  }
+
+  private async streamGemini(
+    messages: { role: string; content: InternalContent }[],
+    queue: AsyncQueue<TurnEvent>,
+    signal: AbortSignal,
+    summarySystem: string,
+    estimate: TokenCostEstimate,
+    requestModel: string
+  ): Promise<void> {
+    // Gemini 的模型名在 URL 路径里。只替换显式占位符，绝不擅自追加 /v1/...。
+    const url = this.opts.baseUrl.trim().split('{model}').join(encodeURIComponent(requestModel));
+    const defs = this.toolDefs();
+    const tools = defs.length
+      ? [{
+          functionDeclarations: defs.map((t) => ({
+            name: t.name,
+            description: t.description,
+            parameters: t.schema,
+          })),
+        }]
+      : undefined;
+    const convo: { role: 'user' | 'model'; parts: Record<string, unknown>[] }[] = messages.map((m) => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: (typeof m.content === 'string' ? [{ type: 'text' as const, text: m.content }] : m.content)
+        .map((part) => part.type === 'text'
+          ? { text: part.text }
+          : {
+              inlineData: {
+                mimeType: part.mimeType,
+                data: part.dataUrl.slice(part.dataUrl.indexOf(',') + 1),
+              },
+            }),
+    }));
+
+    let acc = '';
+    // output 按轮累加（每趟新生成的 token 都计费）。
+    // input/cacheRead：多工具轮若对各趟 promptTokenCount 简单相加会把共享前缀重复计入，
+    // UI「本轮 input」虚高 ×1.5–3；展示口径改用最终轮，round 累加写入 inputRoundsSum 供对照。
+    const usage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      inputRoundsSum: 0,
+      providerRounds: 0,
+    };
+    let toolRounds = 0;
+
+    while (true) {
+      const lastRound = !tools || toolRounds >= MAX_TOOL_ROUNDS;
+      const systemText = [this.opts.systemPrompt, summarySystem].filter(Boolean).join('\n');
+      const res = await fetch(url, {
+        method: 'POST',
+        signal,
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': this.opts.apiKey,
+        },
+        body: JSON.stringify({
+          contents: convo,
+          ...(systemText ? { systemInstruction: { parts: [{ text: systemText }] } } : {}),
+          ...(tools
+            ? {
+                tools,
+                toolConfig: {
+                  functionCallingConfig: { mode: lastRound ? 'NONE' : 'AUTO' },
+                },
+              }
+            : {}),
+          generationConfig: { maxOutputTokens: this.opts.maxTokens },
+        }),
+      });
+      if (!res.ok || !res.body) {
+        const body = await res.text().catch(() => '');
+        throw new UpstreamHttpError(classifyUpstreamHttpError(this.opts.provider, requestModel, res.status, body));
+      }
+
+      // 每个 Part 原样保存。thoughtSignature 可能在 functionCall Part 或独立空 Part
+      // 上，合并、重建或过滤都会让下一趟请求被 Gemini 3 拒绝。
+      const roundParts: Record<string, any>[] = [];
+      let roundInput = 0;
+      let roundOutput = 0;
+      let roundCacheRead = 0;
+
+      for await (const data of this.sseEvents(res)) {
+        if (!data || data === '[DONE]') continue;
+        let ev: any;
+        try {
+          ev = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        if (ev.error) throw new Error(ev.error.message ?? 'Gemini stream error');
+
+        for (const candidate of ev.candidates ?? []) {
+          for (const part of candidate.content?.parts ?? []) {
+            roundParts.push(part);
+            if (typeof part.text === 'string' && part.text) {
+              if (part.thought === true) {
+                queue.push({ type: 'thinking', text: part.text });
+              } else {
+                acc += part.text;
+                queue.push({ type: 'delta', text: part.text });
+              }
+            }
+          }
+        }
+        if (ev.usageMetadata) {
+          // Gemini 在同一请求的流式块里报告累计值，取最大值避免重复相加。
+          roundInput = Math.max(roundInput, ev.usageMetadata.promptTokenCount ?? 0);
+          roundOutput = Math.max(
+            roundOutput,
+            (ev.usageMetadata.candidatesTokenCount ?? 0) + (ev.usageMetadata.thoughtsTokenCount ?? 0)
+          );
+          roundCacheRead = Math.max(roundCacheRead, ev.usageMetadata.cachedContentTokenCount ?? 0);
+        }
+      }
+      usage.providerRounds += 1;
+      usage.inputRoundsSum += roundInput;
+      // 展示口径：最终（最新）请求的 prompt / cache，不把各趟相加。
+      usage.input = roundInput;
+      usage.cacheRead = roundCacheRead;
+      usage.output += roundOutput;
+
+      const calls = roundParts
+        .map((part, index) => ({ part, index, call: part.functionCall }))
+        .filter((entry): entry is {
+          part: Record<string, any>;
+          index: number;
+          call: { name: string; args?: Record<string, unknown>; id?: string };
+        } => Boolean(entry.call?.name));
+      if (lastRound || calls.length === 0) break;
+
+      // 这是修复 thought_signature 400 的关键：把服务端刚吐出的全部 parts
+      // 一字不改地作为 model content 放回下一次 contents。
+      convo.push({ role: 'model', parts: roundParts });
+      const resultParts: Record<string, unknown>[] = [];
+      for (const { call } of calls) {
+        const r = await this.execTool(call.name, call.args ?? {}, queue);
+        resultParts.push({
+          functionResponse: {
+            name: call.name,
+            ...(call.id ? { id: call.id } : {}),
+            response: { output: r.text, ok: r.ok },
+          },
+        });
+      }
+      convo.push({ role: 'user', parts: resultParts });
+      toolRounds++;
+    }
+
+    this.opts.log(
+      `gemini usage display.input=${usage.input} roundsSum=${usage.inputRoundsSum} ` +
+        `output=${usage.output} cacheRead=${usage.cacheRead} providerRounds=${usage.providerRounds}`
+    );
     queue.push({ type: 'done', finalText: acc, usage: { ...usage, estimate } });
   }
 }
