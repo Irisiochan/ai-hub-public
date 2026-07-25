@@ -27,10 +27,14 @@ export class DeepSeekClient {
     this.categories = categories;
     this.pricing = config.pricing ?? {};
     this.timeoutMs = Number(config.timeoutMs ?? 30_000);
+    this.thinking = config.thinking?.type === 'enabled'
+      ? { type: 'enabled' }
+      : { type: 'disabled' };
   }
 
   async call(model, system, user, pricing = {}) {
     if (!this.key) throw new Error('DeepSeek API key environment variable is missing');
+    const startedAt = performance.now();
     const body = await jsonRequest(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -41,6 +45,7 @@ export class DeepSeekClient {
         model,
         temperature: 0,
         max_tokens: 400,
+        thinking: this.thinking,
         // DeepSeek's OpenAI-compatible endpoint supports JSON mode. The worker
         // performs the stricter enum/type validation locally before routing.
         response_format: { type: 'json_object' },
@@ -55,6 +60,7 @@ export class DeepSeekClient {
       result: parseTriageJson(content, this.categories),
       usage: body.usage ?? {},
       costCny: estimateCostCny(body.usage, pricing),
+      latencyMs: Math.round(performance.now() - startedAt),
     };
   }
 

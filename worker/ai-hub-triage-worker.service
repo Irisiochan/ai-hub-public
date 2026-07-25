@@ -1,6 +1,6 @@
 [Unit]
 Description=AI Hub autonomous triage worker
-After=network-online.target ai-hub.service memory-vault.service
+After=network-online.target ai-hub.service memory-vault-mcp.service
 Wants=network-online.target
 
 [Service]

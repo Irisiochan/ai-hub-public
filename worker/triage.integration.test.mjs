@@ -58,6 +58,7 @@ test('standalone worker closes the L0→L1→L2→L3 path with mocked services',
     req.on('end', () => {
       const body = JSON.parse(raw);
       assert.equal(body.model, 'deepseek-v4-flash');
+      assert.deepEqual(body.thinking, { type: 'disabled' });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         choices: [{
@@ -170,6 +171,8 @@ test('standalone worker closes the L0→L1→L2→L3 path with mocked services',
       const summary = store.dailySummary();
       assert.equal(summary.statuses.find((row) => row.status === 'dispatched').count, 1);
       assert.equal(summary.deliveries[0].recipient_id, 'cove');
+      assert.equal(summary.triagedCount, 1);
+      assert.equal(Number.isInteger(summary.avgTriageLatencyMs), true);
     } finally {
       store.close();
     }

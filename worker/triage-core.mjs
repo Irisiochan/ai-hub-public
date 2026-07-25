@@ -197,7 +197,8 @@ export class TriageStore {
         triage_result TEXT,
         recipient_id TEXT,
         error TEXT,
-        cost_cny REAL NOT NULL DEFAULT 0
+        cost_cny REAL NOT NULL DEFAULT 0,
+        triage_latency_ms INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_triage_events_claim
         ON triage_events(status, next_attempt_at, created_at);
@@ -216,6 +217,12 @@ export class TriageStore {
         updated_at INTEGER NOT NULL
       );
     `);
+    const columns = new Set(
+      this.db.prepare('PRAGMA table_info(triage_events)').all().map((column) => column.name),
+    );
+    if (!columns.has('triage_latency_ms')) {
+      this.db.exec('ALTER TABLE triage_events ADD COLUMN triage_latency_ms INTEGER');
+    }
   }
 
   enqueue(input) {
@@ -281,7 +288,7 @@ export class TriageStore {
     this.db.prepare(`
       UPDATE triage_events
       SET status = ?, updated_at = ?, triage_result = ?, recipient_id = ?,
-          error = ?, cost_cny = ?
+          error = ?, cost_cny = ?, triage_latency_ms = ?
       WHERE id = ?
     `).run(
       status,
@@ -290,6 +297,7 @@ export class TriageStore {
       fields.recipientId ?? null,
       fields.error ? boundedText(fields.error, 2000) : null,
       Number(fields.costCny ?? 0),
+      Number.isFinite(Number(fields.triageLatencyMs)) ? Math.max(0, Math.round(Number(fields.triageLatencyMs))) : null,
       id,
     );
   }
@@ -298,7 +306,8 @@ export class TriageStore {
     this.db.prepare(`
       UPDATE triage_events
       SET status = 'retry', next_attempt_at = ?, updated_at = ?, error = ?,
-          triage_result = COALESCE(?, triage_result), cost_cny = ?
+          triage_result = COALESCE(?, triage_result), cost_cny = ?,
+          triage_latency_ms = COALESCE(?, triage_latency_ms)
       WHERE id = ?
     `).run(
       now + Math.max(1000, delayMs),
@@ -306,6 +315,7 @@ export class TriageStore {
       boundedText(error, 2000),
       fields.triageResult ? stableJson(fields.triageResult) : null,
       Number(fields.costCny ?? 0),
+      Number.isFinite(Number(fields.triageLatencyMs)) ? Math.max(0, Math.round(Number(fields.triageLatencyMs))) : null,
       id,
     );
   }
@@ -346,6 +356,11 @@ export class TriageStore {
       FROM triage_deliveries WHERE delivered_at >= ?
       GROUP BY recipient_id ORDER BY count DESC
     `).all(start);
+    const latency = this.db.prepare(`
+      SELECT COUNT(*) AS count, AVG(triage_latency_ms) AS average
+      FROM triage_events
+      WHERE created_at >= ? AND triage_latency_ms IS NOT NULL
+    `).get(start);
     const total = statuses.reduce((sum, row) => sum + Number(row.count), 0);
     const noop = statuses.find((row) => row.status === 'noop');
     return {
@@ -354,6 +369,8 @@ export class TriageStore {
       noopRatio: total ? Number(noop?.count ?? 0) / total : 0,
       fallbackCount: Number(fallback.count),
       costCny: statuses.reduce((sum, row) => sum + Number(row.cost), 0),
+      triagedCount: Number(latency.count),
+      avgTriageLatencyMs: latency.average === null ? null : Math.round(Number(latency.average)),
       statuses,
       deliveries,
     };

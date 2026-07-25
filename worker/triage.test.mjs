@@ -66,21 +66,26 @@ test('SQLite queue deduplicates, recovers leases, retries, and reports metrics',
         rationale: 'cached',
       },
       costCny: 0.0002,
+      triageLatencyMs: 123,
     }, 2000);
     assert.equal(store.claim(2500), null);
     const final = store.claim(3000);
     assert.equal(final.triageResult.rationale, 'cached');
     assert.equal(final.cost_cny, 0.0002);
+    assert.equal(final.triage_latency_ms, 123);
     store.recordDelivery(final.id, 'cove', 3000);
     store.finish(final.id, 'dispatched', {
       recipientId: 'cove',
       triageResult: { fallbackUsed: false },
       costCny: 0.0005,
+      triageLatencyMs: 123,
     }, 3000);
     assert.equal(store.recipientUsage('cove', 3000).count, 1);
     const summary = store.dailySummary(3000);
     assert.equal(summary.total, 1);
     assert.equal(summary.deliveries[0].recipient_id, 'cove');
+    assert.equal(summary.triagedCount, 1);
+    assert.equal(summary.avgTriageLatencyMs, 123);
   } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });

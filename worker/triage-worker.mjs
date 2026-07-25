@@ -127,6 +127,9 @@ class TriageWorker {
     const event = this.store.claim();
     if (!event) return false;
     let costCny = Number(event.cost_cny ?? 0);
+    let triageLatencyMs = event.triage_latency_ms === null
+      ? null
+      : Number(event.triage_latency_ms);
     let triageResult = event.triageResult ?? null;
     try {
       const breaker = this.breakerReason();
@@ -143,14 +146,16 @@ class TriageWorker {
         }));
         triageResult = reviewed.result;
         costCny += reviewed.costCny;
+        triageLatencyMs = reviewed.latencyMs;
       }
       if (!triageResult.actionable) {
-        this.store.finish(event.id, 'noop', { triageResult, costCny });
+        this.store.finish(event.id, 'noop', { triageResult, costCny, triageLatencyMs });
         log('info', 'event classified NO_OP', {
           eventId: event.id,
           category: triageResult.category,
           priority: triageResult.priority,
           costCny,
+          triageLatencyMs,
         });
         return true;
       }
@@ -191,6 +196,7 @@ class TriageWorker {
           this.store.retry(event.id, route.reason, 15 * 60_000, {
             triageResult: storedResult,
             costCny,
+            triageLatencyMs,
           });
           log('info', 'event deferred by recipient policy', { eventId: event.id, reason: route.reason });
           return true;
@@ -202,6 +208,7 @@ class TriageWorker {
           triageResult: storedResult,
           error: route.reason,
           costCny,
+          triageLatencyMs,
         });
         log('warn', 'event parked without route', { eventId: event.id, reason: route.reason });
         return true;
@@ -213,6 +220,7 @@ class TriageWorker {
         triageResult: storedResult,
         recipientId: route.contact.id,
         costCny,
+        triageLatencyMs,
       });
       log('info', 'event dispatched', {
         eventId: event.id,
@@ -221,6 +229,7 @@ class TriageWorker {
         priority: storedResult.priority,
         fallbackUsed,
         costCny,
+        triageLatencyMs,
       });
     } catch (error) {
       if (event.attempts >= this.config.maxAttempts) {
@@ -232,12 +241,14 @@ class TriageWorker {
           triageResult,
           error: error.message,
           costCny,
+          triageLatencyMs,
         });
         log('error', 'event exhausted retries', { eventId: event.id, error: error.message });
       } else {
         this.store.retry(event.id, error.message, retryDelay(event.attempts), {
           triageResult,
           costCny,
+          triageLatencyMs,
         });
         log('warn', 'event scheduled for retry', {
           eventId: event.id,
