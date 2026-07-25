@@ -46,7 +46,7 @@ PC Worker (主动出站长轮询，无入站端口)
 ## 快速启动
 
 推荐用 Compose 一次启动前端、网关和记忆库。Compose 默认锁定
-`memory-vault` 的 `v0.5.1` 发布标签，不复制维护它的源码：
+`memory-vault` 的 `v0.6.0` 发布标签，不复制维护它的源码：
 
 ```bash
 cp .env.example .env
