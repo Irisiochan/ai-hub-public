@@ -120,6 +120,10 @@ test('SQLite queue deduplicates, recovers leases, retries, and reports metrics',
     assert.equal(summary.deliveries[0].recipient_id, 'cove');
     assert.equal(summary.triagedCount, 1);
     assert.equal(summary.avgTriageLatencyMs, 123);
+    // A signal-driven shutdown and the run() finally block both close the
+    // store; the second call must not throw ERR_INVALID_STATE.
+    store.close();
+    assert.doesNotThrow(() => store.close());
   } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });

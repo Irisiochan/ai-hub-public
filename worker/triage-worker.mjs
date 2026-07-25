@@ -89,6 +89,7 @@ class TriageWorker {
     this.hub = new HubClient(config.hub ?? {});
     this.vault = new VaultClient(config.vault ?? {});
     this.stopping = false;
+    this.closed = false;
     this.timers = [];
     this.watchers = [];
     this.server = null;
@@ -419,7 +420,17 @@ class TriageWorker {
     } while (!this.stopping);
   }
 
+  // Signals only ask the run loop to finish its current event. Tearing the
+  // store down from the handler raced with an in-flight processOne() and then
+  // ran a second time from the run() finally block, which crashed on an
+  // already closed database and made every graceful restart exit 1.
+  requestStop() {
+    this.stopping = true;
+  }
+
   async close() {
+    if (this.closed) return;
+    this.closed = true;
     this.stopping = true;
     for (const timer of this.timers) clearTimeout(timer);
     for (const watcher of this.watchers) watcher.close();
@@ -434,7 +445,7 @@ const worker = new TriageWorker(config);
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     log('info', 'shutdown requested', { signal });
-    void worker.close();
+    worker.requestStop();
   });
 }
 

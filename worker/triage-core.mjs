@@ -195,6 +195,7 @@ export function chooseRecipient({
 export class TriageStore {
   constructor(file) {
     fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
+    this.closed = false;
     this.db = new DatabaseSync(path.resolve(file));
     this.db.exec(`
       PRAGMA journal_mode = WAL;
@@ -405,6 +406,8 @@ export class TriageStore {
   }
 
   close() {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
   }
 }
