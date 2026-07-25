@@ -27,6 +27,7 @@ export class DeepSeekClient {
     this.categories = categories;
     this.pricing = config.pricing ?? {};
     this.timeoutMs = Number(config.timeoutMs ?? 30_000);
+    this.backlogMaxChars = Math.max(0, Number(config.backlogMaxChars ?? 2000));
     this.thinking = config.thinking?.type === 'enabled'
       ? { type: 'enabled' }
       : { type: 'disabled' };
@@ -79,7 +80,7 @@ export class DeepSeekClient {
         summary: event.summary,
         payload: event.payload,
       },
-      recentBacklog: backlogSummary?.slice(0, 12_000) || '(unavailable)',
+      recentBacklog: backlogSummary?.slice(0, this.backlogMaxChars) || '(unavailable)',
     });
     return this.call(this.flashModel, system, user, this.pricing.flash);
   }

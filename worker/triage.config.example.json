@@ -18,6 +18,7 @@
     "flashModel": "deepseek-v4-flash",
     "proModel": "deepseek-v4-pro",
     "timeoutMs": 30000,
+    "backlogMaxChars": 2000,
     "pricing": {
       "flash": {
         "inputCnyPerMillion": 0,

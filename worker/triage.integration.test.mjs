@@ -59,6 +59,7 @@ test('standalone worker closes the L0→L1→L2→L3 path with mocked services',
       const body = JSON.parse(raw);
       assert.equal(body.model, 'deepseek-v4-flash');
       assert.deepEqual(body.thinking, { type: 'disabled' });
+      assert.equal(JSON.parse(body.messages[1].content).recentBacklog, 'no e');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         choices: [{
@@ -145,6 +146,7 @@ test('standalone worker closes the L0→L1→L2→L3 path with mocked services',
       apiKeyEnv: 'TEST_DEEPSEEK_KEY',
       flashModel: 'deepseek-v4-flash',
       proModel: 'deepseek-v4-pro',
+      backlogMaxChars: 4,
       pricing: { flash: { inputCnyPerMillion: 1, outputCnyPerMillion: 1 } },
     },
     hub: { baseUrl: `http://127.0.0.1:${portOf(hub)}` },
