@@ -7,8 +7,10 @@ import test from 'node:test';
 import {
   chooseRecipient,
   estimateCostCny,
+  nextTimerDelay,
   normalizeEvent,
   parseTriageJson,
+  timerSchedule,
   TriageStore,
 } from './triage-core.mjs';
 import { VaultClient } from './triage-clients.mjs';
@@ -37,6 +39,38 @@ test('events require real context and derive stable dedupe ids', () => {
   const first = normalizeEvent({ source: 'file', summary: 'changed', payload: { path: 'a' } });
   const second = normalizeEvent({ source: 'file', summary: 'changed', payload: { path: 'a' } });
   assert.equal(first.id, second.id);
+});
+
+test('timer wakes keep at least one interval between them and never share a dedupe bucket', () => {
+  const source = { id: 'quarter-hour-check', intervalMinutes: 15, jitterSeconds: 900 };
+  const { intervalMs, jitterMs } = timerSchedule(source);
+  assert.equal(intervalMs, 15 * 60_000);
+  assert.equal(jitterMs, 900_000);
+
+  // The first wake may land anywhere inside the jitter window; every later wake
+  // must clear a full interval first.
+  assert.equal(nextTimerDelay(source, { first: true, random: () => 0 }), 0);
+  assert.equal(nextTimerDelay(source, { first: true, random: () => 0.999999 }), jitterMs);
+  assert.equal(nextTimerDelay(source, { first: false, random: () => 0 }), intervalMs);
+  assert.equal(nextTimerDelay(source, { first: false, random: () => 0.999999 }), intervalMs + jitterMs);
+
+  // Worst case is a maximum jitter wake followed by a zero jitter wake, which
+  // used to collapse to a few seconds on the old fixed-grid schedule.
+  const draws = [0.999999, 0, 0.5, 0.999999, 0.25, 0];
+  let now = 1_700_000_000_000;
+  let previous = null;
+  let previousBucket = null;
+  for (const [index, draw] of draws.entries()) {
+    now += nextTimerDelay(source, { first: index === 0, random: () => draw });
+    if (previous !== null) assert.ok(now - previous >= intervalMs, `wake ${index} fired too early`);
+    const bucket = Math.floor(now / intervalMs);
+    if (previousBucket !== null) assert.notEqual(bucket, previousBucket);
+    previous = now;
+    previousBucket = bucket;
+  }
+
+  // A source without explicit settings still cannot go below the 15 minute floor.
+  assert.ok(nextTimerDelay({ id: 'bare', intervalMinutes: 1 }, { random: () => 0 }) >= 15 * 60_000);
 });
 
 test('cost estimate uses separately configurable input and output prices', () => {

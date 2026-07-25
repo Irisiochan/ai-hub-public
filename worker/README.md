@@ -51,6 +51,15 @@ Set current DeepSeek prices in `deepseek.pricing`; zero means cost metrics are
 unknown rather than guessed. The daily event and cost breakers, per-recipient
 daily limit, and cooldown are all enforced before dispatch.
 
+`routing.rules` wins over the L1 suggestion, and the Pro fuzzy fallback only runs
+when no candidate exists at all. A rules table that covers every category
+therefore disables L2.5 completely — leave the long tail (`other`, and anything
+else without an obvious owner) unmapped if you want the fallback to run.
+
+Timer sources fire after `intervalMinutes` plus a fresh random jitter below
+`jitterSeconds`, so consecutive wakes are never closer than the interval. Only
+the first wake after start may land early, inside the jitter window alone.
+
 Each routable contact may add:
 
 ```json

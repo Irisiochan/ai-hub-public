@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import {
   chooseRecipient,
   DEFAULT_CATEGORIES,
+  nextTimerDelay,
+  timerSchedule,
   TriageStore,
 } from './triage-core.mjs';
 import { DeepSeekClient, HubClient, VaultClient } from './triage-clients.mjs';
@@ -314,27 +316,27 @@ class TriageWorker {
     for (const source of this.config.sources ?? []) {
       if (!source?.id || source.enabled === false) continue;
       if (source.type === 'timer') {
-        const intervalMs = Math.max(15 * 60_000, Number(source.intervalMinutes ?? 15) * 60_000);
-        const tick = () => {
-          const jitter = once
-            ? 0
-            : Math.floor(Math.random() * Math.max(1, Number(source.jitterSeconds ?? 900) * 1000));
-          const emit = () => this.enqueue({
-            source: source.id,
-            categoryHint: source.category ?? 'system',
-            dedupeKey: `${source.id}:${Math.floor(Date.now() / intervalMs)}`,
-            summary: source.summary ?? `Scheduled wake from ${source.id}`,
-            payload: source.payload ?? null,
-          });
-          if (once) {
-            emit();
-          } else {
-            const timer = setTimeout(emit, jitter);
-            this.timers.push(timer);
-          }
-        };
-        tick();
-        if (!once) this.timers.push(setInterval(tick, intervalMs));
+        const { intervalMs } = timerSchedule(source);
+        const emit = () => this.enqueue({
+          source: source.id,
+          categoryHint: source.category ?? 'system',
+          dedupeKey: `${source.id}:${Math.floor(Date.now() / intervalMs)}`,
+          summary: source.summary ?? `Scheduled wake from ${source.id}`,
+          payload: source.payload ?? null,
+        });
+        if (once) {
+          emit();
+        } else {
+          const slot = this.timers.push(null) - 1;
+          const schedule = (first) => {
+            if (this.stopping) return;
+            this.timers[slot] = setTimeout(() => {
+              emit();
+              schedule(false);
+            }, nextTimerDelay(source, { first }));
+          };
+          schedule(true);
+        }
       } else if (source.type === 'file') {
         if (once) continue;
         const watcher = fs.watch(path.resolve(source.path), { recursive: source.recursive === true }, (eventType, filename) => {

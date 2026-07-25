@@ -26,6 +26,22 @@ function boundedText(value, max = 20_000) {
   return text.trim().slice(0, max);
 }
 
+export function timerSchedule(source) {
+  const intervalMs = Math.max(15 * 60_000, Number(source?.intervalMinutes ?? 15) * 60_000);
+  const jitterMs = Math.max(0, Number(source?.jitterSeconds ?? 900) * 1000);
+  return { intervalMs, jitterMs };
+}
+
+// Jitter is added on top of a full interval instead of sliding inside a fixed
+// grid, so two consecutive wakes are never closer than intervalMs. The wall
+// clock dedupe bucket in triage-worker.mjs relies on that spacing to stay
+// collision free.
+export function nextTimerDelay(source, { first = false, random = Math.random } = {}) {
+  const { intervalMs, jitterMs } = timerSchedule(source);
+  const jitter = Math.floor(random() * (jitterMs + 1));
+  return first ? jitter : intervalMs + jitter;
+}
+
 export function eventId(event) {
   const explicit = typeof event.id === 'string' ? event.id.trim() : '';
   if (explicit) return explicit.slice(0, 200);
