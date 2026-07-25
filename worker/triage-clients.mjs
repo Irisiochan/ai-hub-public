@@ -68,7 +68,10 @@ export class DeepSeekClient {
   async triage(event, backlogSummary) {
     const system = [
       'You are the cheap L1 event triage gate for an autonomous AI hub.',
-      'Most events are not actionable. Be conservative and return only the required JSON object.',
+      'Most events are not actionable. Be conservative.',
+      'Return exactly one JSON object with this contract:',
+      '{"actionable":false,"category":"other","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
+      'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
       `Allowed categories: ${this.categories.join(', ')}.`,
       'Priority 1 is routine, 2 is important, 3 is urgent.',
       'suggestedRecipient is a configured routing key, or null when rules should decide.',
@@ -88,7 +91,9 @@ export class DeepSeekClient {
   async fuzzyRoute(event, triageResult, contacts) {
     const system = [
       'Choose exactly one recipient for an actionable event.',
-      'Return the same strict triage JSON shape.',
+      'Return exactly one JSON object with this contract:',
+      '{"actionable":true,"category":"other","priority":1,"suggestedRecipient":"recipient-key","rationale":"brief reason"}',
+      'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string.',
       'Set suggestedRecipient to one recipientKey from the provided list.',
       'Do not change actionable/category/priority.',
     ].join('\n');
