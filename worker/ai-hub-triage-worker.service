@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Hub autonomous triage worker
+After=network-online.target ai-hub.service memory-vault.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-hub
+Group=ai-hub
+WorkingDirectory=/opt/ai-hub/worker
+EnvironmentFile=/etc/ai-hub/triage.env
+ExecStart=/usr/bin/node /opt/ai-hub/worker/triage-worker.mjs /etc/ai-hub/triage.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ai-hub/triage
+
+[Install]
+WantedBy=multi-user.target

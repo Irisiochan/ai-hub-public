@@ -3,8 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "start": "node worker.mjs",
-    "test": "node --test delivery.test.mjs"
+    "start:triage": "node triage-worker.mjs",
+    "test": "node --test delivery.test.mjs triage.test.mjs triage.integration.test.mjs"
   }
 }

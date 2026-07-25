@@ -1,0 +1,94 @@
+{
+  "stateFile": "data/triage.db",
+  "pollMs": 1000,
+  "maxAttempts": 5,
+  "claimTimeoutMs": 300000,
+  "categories": [
+    "calendar",
+    "file-change",
+    "rss",
+    "backlog",
+    "message",
+    "system",
+    "other"
+  ],
+  "deepseek": {
+    "baseUrl": "https://api.deepseek.com",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "flashModel": "deepseek-v4-flash",
+    "proModel": "deepseek-v4-pro",
+    "timeoutMs": 30000,
+    "pricing": {
+      "flash": {
+        "inputCnyPerMillion": 0,
+        "outputCnyPerMillion": 0
+      },
+      "pro": {
+        "inputCnyPerMillion": 0,
+        "outputCnyPerMillion": 0
+      }
+    }
+  },
+  "hub": {
+    "baseUrl": "http://127.0.0.1:3900",
+    "tokenEnv": "HUB_TOKEN",
+    "timeoutMs": 30000
+  },
+  "vault": {
+    "url": "http://127.0.0.1:8900/mcp",
+    "tokenEnv": "VAULT_TOKEN",
+    "sourceTag": "codex",
+    "backlogQuery": "triage-backlog",
+    "cacheMs": 300000
+  },
+  "routing": {
+    "fuzzyFallback": true,
+    "rules": {
+      "calendar": "calendar-owner",
+      "file-change": "engineering",
+      "backlog": "task-owner"
+    }
+  },
+  "breakers": {
+    "dailyEvents": 2000,
+    "dailyCostCny": 5
+  },
+  "webhook": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 3911,
+    "tokenEnv": "TRIAGE_WEBHOOK_TOKEN"
+  },
+  "sources": [
+    {
+      "id": "quarter-hour-check",
+      "type": "timer",
+      "intervalMinutes": 15,
+      "jitterSeconds": 900,
+      "category": "system",
+      "summary": "Review current backlog and only act when there is concrete unfinished work."
+    },
+    {
+      "id": "vault-backlog",
+      "type": "vault-backlog",
+      "intervalMinutes": 15,
+      "query": "triage-backlog",
+      "emitInitial": false
+    },
+    {
+      "id": "project-watch",
+      "type": "file",
+      "path": "/srv/projects",
+      "recursive": false,
+      "category": "file-change"
+    },
+    {
+      "id": "example-feed",
+      "type": "http-diff",
+      "url": "https://example.com/feed.xml",
+      "intervalMinutes": 30,
+      "category": "rss",
+      "emitInitial": false
+    }
+  ]
+}
