@@ -207,6 +207,16 @@ export function buildDailyCheckSummary(source = {}, now = Date.now(), options = 
   ].join('\n');
 }
 
+export function summarizeTaskContext(value, maxChars = 800, maxItems = 5) {
+  const text = String(value ?? '').trim();
+  if (!text) return '';
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const header = lines.find((line) => line.startsWith('任务快照日期：'));
+  const tasks = lines.filter((line) => line.startsWith('- **')).slice(0, maxItems);
+  const summary = [header, ...tasks].filter(Boolean).join('\n');
+  return (summary || text).slice(0, Math.max(100, Number(maxChars) || 800));
+}
+
 export function timerSchedule(source) {
   const intervalMs = Math.max(15 * 60_000, Number(source?.intervalMinutes ?? 15) * 60_000);
   const jitterMs = Math.max(0, Number(source?.jitterSeconds ?? 900) * 1000);

@@ -116,7 +116,7 @@ the task/backlog gate:
   message has been delivered by `forceAfterHour` (default 18:00 Shanghai), the
   next wake must choose one low-pressure message. `minimumGapMinutes` defaults
   to 180 so later checks cannot spam.
-- **Real context**: L1 receives the current task snapshot, the three most recent
+- **Real context**: L1 receives a compact current task snapshot, the three most recent
   contact interaction timestamps, and the last daily delivery timestamp. Daily delivery
   mode is trusted from the event source only; a normal task cannot enter the
   daily pool by returning category `daily`.

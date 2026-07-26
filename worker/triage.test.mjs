@@ -18,6 +18,7 @@ import {
   normalizeProactiveConfig,
   parseTriageJson,
   shanghaiClock,
+  summarizeTaskContext,
   timerSchedule,
   TriageStore,
   validateTriageMode,
@@ -289,6 +290,16 @@ test('daily mode is source-owned and proactive safety config fails closed', () =
     count: 1,
     lastAt: afterFloor - 60 * 60_000,
   }, afterFloor).gapBlocked, true);
+
+  const compactTasks = summarizeTaskContext([
+    '任务快照日期：2026-07-26（Asia/Shanghai）',
+    '',
+    '## 时间敏感事项',
+    ...Array.from({ length: 8 }, (_, index) => `- **任务 ${index + 1}** (tasks/t${index + 1}.md)`),
+  ].join('\n'));
+  assert.equal(compactTasks.match(/^- \*\*/gm).length, 5);
+  assert.ok(compactTasks.length <= 800);
+  assert.doesNotMatch(compactTasks, /任务 6/);
 });
 
 test('legacy SQLite deliveries without pool column migrate on open', () => {

@@ -16,6 +16,7 @@ import {
   nextTimerDelay,
   normalizeProactiveConfig,
   shanghaiClock,
+  summarizeTaskContext,
   timerSchedule,
   TriageStore,
   validateTriageMode,
@@ -188,7 +189,7 @@ class TriageWorker {
       dailyDeliveryCount: usage.count,
       lastDailyDeliveryAt: usage.lastAt === null ? null : new Date(usage.lastAt).toISOString(),
       recentConversations,
-      openTaskSnapshot: openTasks.slice(0, 3000) || '(unavailable)',
+      openTaskSnapshot: summarizeTaskContext(openTasks) || '(unavailable)',
     };
   }
 
