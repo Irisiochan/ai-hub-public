@@ -5,9 +5,15 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import {
+  buildDailyCheckSummary,
   chooseRecipient,
   DEFAULT_CATEGORIES,
+  DELIVERY_POOL_DAILY,
+  DELIVERY_POOL_TASK,
+  isDailyMode,
+  isShanghaiSilentHour,
   nextTimerDelay,
+  normalizeProactiveConfig,
   timerSchedule,
   TriageStore,
 } from './triage-core.mjs';
@@ -35,6 +41,7 @@ function loadConfig() {
     dailyEvents: Math.max(1, Number(value.breakers?.dailyEvents ?? 2000)),
     dailyCostCny: Math.max(0, Number(value.breakers?.dailyCostCny ?? 5)),
   };
+  value.proactive = normalizeProactiveConfig(value.proactive ?? {});
   return value;
 }
 
@@ -126,6 +133,41 @@ class TriageWorker {
     return null;
   }
 
+  proactiveConfig() {
+    return this.config.proactive ?? normalizeProactiveConfig({});
+  }
+
+  isDailyEvent(event, triageResult = null) {
+    return isDailyMode(event) || isDailyMode(triageResult);
+  }
+
+  dailyPoolFull(now = Date.now()) {
+    const proactive = this.proactiveConfig();
+    if (!proactive.enabled || proactive.dailyDispatchLimit <= 0) return true;
+    return this.store.poolUsage(DELIVERY_POOL_DAILY, now).count >= proactive.dailyDispatchLimit;
+  }
+
+  routeOptions(isDaily) {
+    const proactive = this.proactiveConfig();
+    if (!isDaily) {
+      return {
+        rules: this.config.routing?.rules ?? {},
+        usageOf: (recipientId) => this.store.recipientUsage(recipientId, Date.now(), DELIVERY_POOL_TASK),
+        allowedRecipientKeys: null,
+        ignoreRecipientLimits: false,
+        modelOnly: false,
+      };
+    }
+    return {
+      // Daily proactive routing is model-owned: never apply the static task rules table.
+      rules: {},
+      usageOf: () => ({ count: 0, lastAt: null }),
+      allowedRecipientKeys: proactive.recipients,
+      ignoreRecipientLimits: true,
+      modelOnly: true,
+    };
+  }
+
   async processOne() {
     const event = this.store.claim();
     if (!event) return false;
@@ -142,11 +184,58 @@ class TriageWorker {
         return true;
       }
 
+      const looksDaily = this.isDailyEvent(event);
+      const proactive = this.proactiveConfig();
+      if (
+        looksDaily
+        && isShanghaiSilentHour(Date.now(), proactive.silentStartHour, proactive.silentEndHour)
+      ) {
+        const silentResult = triageResult ?? {
+          actionable: false,
+          category: 'daily',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'Shanghai quiet hours 00:00–09:00',
+        };
+        this.store.finish(event.id, 'noop', {
+          triageResult: silentResult,
+          costCny,
+          triageLatencyMs,
+        });
+        log('info', 'event suppressed by silent hours', { eventId: event.id });
+        return true;
+      }
+      if (looksDaily && this.dailyPoolFull()) {
+        const fullResult = triageResult ?? {
+          actionable: false,
+          category: 'daily',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'daily proactive pool exhausted for Shanghai day',
+        };
+        this.store.finish(event.id, 'noop', {
+          triageResult: fullResult,
+          costCny,
+          triageLatencyMs,
+        });
+        log('info', 'event suppressed by daily proactive pool', {
+          eventId: event.id,
+          limit: proactive.dailyDispatchLimit,
+        });
+        return true;
+      }
+
       if (!triageResult) {
-        const reviewed = await this.deepseek.triage(event, await this.backlog().catch((error) => {
-          log('warn', 'backlog unavailable', { error: error.message });
-          return '';
-        }));
+        const reviewed = await this.deepseek.triage(
+          event,
+          await this.backlog().catch((error) => {
+            log('warn', 'backlog unavailable', { error: error.message });
+            return '';
+          }),
+          looksDaily
+            ? { mode: 'daily', dailyRecipients: proactive.recipients }
+            : {},
+        );
         triageResult = reviewed.result;
         costCny += reviewed.costCny;
         triageLatencyMs = reviewed.latencyMs;
@@ -163,13 +252,27 @@ class TriageWorker {
         return true;
       }
 
+      const isDaily = this.isDailyEvent(event, triageResult);
+      if (isDaily && this.dailyPoolFull()) {
+        this.store.finish(event.id, 'noop', {
+          triageResult: {
+            ...triageResult,
+            actionable: false,
+            rationale: `${triageResult.rationale} | daily pool full`,
+          },
+          costCny,
+          triageLatencyMs,
+        });
+        log('info', 'actionable daily dropped: pool full', { eventId: event.id });
+        return true;
+      }
+
       const contacts = await this.hub.contacts();
-      const rules = this.config.routing?.rules ?? {};
+      const options = this.routeOptions(isDaily);
       let route = chooseRecipient({
         contacts,
         result: triageResult,
-        rules,
-        usageOf: (recipientId) => this.store.recipientUsage(recipientId),
+        ...options,
       });
       let fallbackUsed = triageResult.fallbackUsed === true;
       if (
@@ -178,7 +281,9 @@ class TriageWorker {
         && !fallbackUsed
         && this.config.routing?.fuzzyFallback !== false
       ) {
-        const fallback = await this.deepseek.fuzzyRoute(event, triageResult, contacts);
+        const fallback = await this.deepseek.fuzzyRoute(event, triageResult, contacts, {
+          allowedRecipientKeys: isDaily ? proactive.recipients : null,
+        });
         costCny += fallback.costCny;
         fallbackUsed = true;
         triageResult = {
@@ -188,8 +293,7 @@ class TriageWorker {
         route = chooseRecipient({
           contacts,
           result: triageResult,
-          rules: {},
-          usageOf: (recipientId) => this.store.recipientUsage(recipientId),
+          ...this.routeOptions(isDaily),
         });
       }
       const storedResult = { ...triageResult, fallbackUsed };
@@ -218,7 +322,12 @@ class TriageWorker {
       }
 
       await this.hub.dispatch(route.contact.id, dispatchPrompt(event, storedResult));
-      this.store.recordDelivery(event.id, route.contact.id);
+      this.store.recordDelivery(
+        event.id,
+        route.contact.id,
+        Date.now(),
+        isDaily ? DELIVERY_POOL_DAILY : DELIVERY_POOL_TASK,
+      );
       this.store.finish(event.id, 'dispatched', {
         triageResult: storedResult,
         recipientId: route.contact.id,
@@ -230,6 +339,7 @@ class TriageWorker {
         recipientId: route.contact.id,
         category: storedResult.category,
         priority: storedResult.priority,
+        pool: isDaily ? DELIVERY_POOL_DAILY : DELIVERY_POOL_TASK,
         fallbackUsed,
         costCny,
         triageLatencyMs,
@@ -318,13 +428,38 @@ class TriageWorker {
       if (!source?.id || source.enabled === false) continue;
       if (source.type === 'timer') {
         const { intervalMs } = timerSchedule(source);
-        const emit = () => this.enqueue({
-          source: source.id,
-          categoryHint: source.category ?? 'system',
-          dedupeKey: `${source.id}:${Math.floor(Date.now() / intervalMs)}`,
-          summary: source.summary ?? `Scheduled wake from ${source.id}`,
-          payload: source.payload ?? null,
-        });
+        const daily = isDailyMode(source);
+        const emit = () => {
+          const now = Date.now();
+          if (daily) {
+            const proactive = this.proactiveConfig();
+            if (!proactive.enabled) return;
+            if (isShanghaiSilentHour(now, proactive.silentStartHour, proactive.silentEndHour)) {
+              log('info', 'daily timer skipped: silent hours', { source: source.id });
+              return;
+            }
+            if (this.dailyPoolFull(now)) {
+              log('info', 'daily timer skipped: pool full', { source: source.id });
+              return;
+            }
+          }
+          this.enqueue({
+            source: source.id,
+            categoryHint: source.category ?? (daily ? 'daily' : 'system'),
+            dedupeKey: `${source.id}:${Math.floor(now / intervalMs)}`,
+            summary: daily
+              ? buildDailyCheckSummary({
+                ...source,
+                recipients: this.proactiveConfig().recipients,
+              }, now)
+              : (source.summary ?? `Scheduled wake from ${source.id}`),
+            payload: {
+              ...(source.payload && typeof source.payload === 'object' ? source.payload : {}),
+              mode: daily ? 'daily' : 'task',
+              emittedAt: now,
+            },
+          });
+        };
         if (once) {
           emit();
         } else {

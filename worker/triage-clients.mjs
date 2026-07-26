@@ -1,5 +1,10 @@
 import process from 'node:process';
-import { estimateCostCny, parseTriageJson } from './triage-core.mjs';
+import {
+  DEFAULT_DAILY_RECIPIENTS,
+  estimateCostCny,
+  isDailyMode,
+  parseTriageJson,
+} from './triage-core.mjs';
 
 function secretFromEnv(name) {
   if (!name) return '';
@@ -65,17 +70,36 @@ export class DeepSeekClient {
     };
   }
 
-  async triage(event, backlogSummary) {
-    const system = [
-      'You are the cheap L1 event triage gate for an autonomous AI hub.',
-      'Most events are not actionable. Be conservative.',
-      'Return exactly one JSON object with this contract:',
-      '{"actionable":false,"category":"other","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
-      'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
-      `Allowed categories: ${this.categories.join(', ')}.`,
-      'Priority 1 is routine, 2 is important, 3 is urgent.',
-      'suggestedRecipient is a configured routing key, or null when rules should decide.',
-    ].join('\n');
+  async triage(event, backlogSummary, options = {}) {
+    const daily = isDailyMode(event) || options.mode === 'daily';
+    const dailyRecipients = Array.isArray(options.dailyRecipients) && options.dailyRecipients.length
+      ? options.dailyRecipients
+      : DEFAULT_DAILY_RECIPIENTS;
+    const system = daily
+      ? [
+        'You are the L1 proactive daily-companion gate for an autonomous AI hub.',
+        'Decide whether Iris should receive a proactive message right now.',
+        'Allowed content: care/health/routine nudges, practical reminders, light chat openers, affectionate check-ins.',
+        'Stay selective — prefer NO_OP when nothing natural fits the current Shanghai time context.',
+        'Return exactly one JSON object with this contract:',
+        '{"actionable":false,"category":"daily","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
+        'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
+        'When actionable is true: category must be "daily" and suggestedRecipient must be exactly one of '
+          + `${dailyRecipients.join(', ')}.`,
+        'When actionable is false: suggestedRecipient must be null.',
+        'Priority 1 is light/routine, 2 is more important care, 3 is urgent (rare).',
+        'Pick the recipient by tone and relationship fit among the allowed list only.',
+      ].join('\n')
+      : [
+        'You are the cheap L1 event triage gate for an autonomous AI hub.',
+        'Most events are not actionable. Be conservative.',
+        'Return exactly one JSON object with this contract:',
+        '{"actionable":false,"category":"other","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
+        'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
+        `Allowed categories: ${this.categories.join(', ')}.`,
+        'Priority 1 is routine, 2 is important, 3 is urgent.',
+        'suggestedRecipient is a configured routing key, or null when rules should decide.',
+      ].join('\n');
     const user = JSON.stringify({
       event: {
         source: event.source,
@@ -83,12 +107,30 @@ export class DeepSeekClient {
         summary: event.summary,
         payload: event.payload,
       },
+      mode: daily ? 'daily' : 'task',
+      allowedRecipients: daily ? dailyRecipients : undefined,
       recentBacklog: backlogSummary?.slice(0, this.backlogMaxChars) || '(unavailable)',
     });
     return this.call(this.flashModel, system, user, this.pricing.flash);
   }
 
-  async fuzzyRoute(event, triageResult, contacts) {
+  async fuzzyRoute(event, triageResult, contacts, options = {}) {
+    const allowed = Array.isArray(options.allowedRecipientKeys) && options.allowedRecipientKeys.length
+      ? new Set(options.allowedRecipientKeys.map((item) => String(item).trim().toLowerCase()))
+      : null;
+    const recipients = contacts
+      .map((contact) => ({
+        recipientKey: contact.config?.routing?.recipientKey ?? contact.id,
+        id: contact.id,
+        name: contact.name,
+        kind: contact.kind,
+        categories: contact.config?.routing?.categories ?? [],
+      }))
+      .filter((contact) => {
+        if (!allowed) return true;
+        return allowed.has(String(contact.recipientKey).toLowerCase())
+          || allowed.has(String(contact.id).toLowerCase());
+      });
     const system = [
       'Choose exactly one recipient for an actionable event.',
       'Return exactly one JSON object with this contract:',
@@ -100,12 +142,7 @@ export class DeepSeekClient {
     const user = JSON.stringify({
       event: { source: event.source, summary: event.summary },
       triage: triageResult,
-      recipients: contacts.map((contact) => ({
-        recipientKey: contact.config?.routing?.recipientKey ?? contact.id,
-        name: contact.name,
-        kind: contact.kind,
-        categories: contact.config?.routing?.categories ?? [],
-      })),
+      recipients,
     });
     return this.call(this.proModel, system, user, this.pricing.pro);
   }

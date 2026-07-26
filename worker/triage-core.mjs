@@ -10,10 +10,16 @@ export const DEFAULT_CATEGORIES = [
   'backlog',
   'message',
   'system',
+  'daily',
   'other',
 ];
 
+export const DEFAULT_DAILY_RECIPIENTS = ['cheng', 'cove', 'aye'];
+export const DELIVERY_POOL_TASK = 'task';
+export const DELIVERY_POOL_DAILY = 'daily';
+
 const FINAL_STATES = new Set(['noop', 'dispatched', 'parked', 'dead']);
+const SHANGHAI_OFFSET_MS = 8 * 60 * 60_000;
 
 function stableJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
@@ -24,6 +30,92 @@ function stableJson(value) {
 function boundedText(value, max = 20_000) {
   const text = typeof value === 'string' ? value : stableJson(value);
   return text.trim().slice(0, max);
+}
+
+export function shanghaiDayStart(now = Date.now()) {
+  const shifted = new Date(now + SHANGHAI_OFFSET_MS);
+  shifted.setUTCHours(0, 0, 0, 0);
+  return shifted.getTime() - SHANGHAI_OFFSET_MS;
+}
+
+export function shanghaiClock(now = Date.now()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(now));
+  const read = (type) => parts.find((part) => part.type === type)?.value ?? '';
+  return {
+    date: `${read('year')}-${read('month')}-${read('day')}`,
+    weekday: read('weekday'),
+    hour: Number(read('hour')),
+    minute: Number(read('minute')),
+    second: Number(read('second')),
+    label: `${read('year')}-${read('month')}-${read('day')} ${read('weekday')} ${read('hour')}:${read('minute')}:${read('second')} Asia/Shanghai`,
+  };
+}
+
+// Silent window is half-open: [startHour, endHour) in Asia/Shanghai.
+// Default 0–9 means 00:00 inclusive through 09:00 exclusive.
+export function isShanghaiSilentHour(now = Date.now(), startHour = 0, endHour = 9) {
+  const start = Math.max(0, Math.min(23, Number(startHour)));
+  const end = Math.max(0, Math.min(24, Number(endHour)));
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start === end) return false;
+  const hour = shanghaiClock(now).hour;
+  if (start < end) return hour >= start && hour < end;
+  return hour >= start || hour < end;
+}
+
+export function isDailyMode(sourceOrResult) {
+  if (!sourceOrResult || typeof sourceOrResult !== 'object') return false;
+  if (sourceOrResult.mode === 'daily') return true;
+  if (sourceOrResult.category === 'daily') return true;
+  if (sourceOrResult.categoryHint === 'daily') return true;
+  if (sourceOrResult.category_hint === 'daily') return true;
+  if (sourceOrResult.payload && typeof sourceOrResult.payload === 'object'
+    && sourceOrResult.payload.mode === 'daily') {
+    return true;
+  }
+  return false;
+}
+
+export function normalizeProactiveConfig(raw = {}) {
+  const recipients = Array.isArray(raw.recipients) && raw.recipients.length
+    ? raw.recipients.map((item) => String(item).trim()).filter(Boolean)
+    : [...DEFAULT_DAILY_RECIPIENTS];
+  return {
+    enabled: raw.enabled !== false,
+    dailyDispatchLimit: Math.max(0, Number(raw.dailyDispatchLimit ?? 10)),
+    silentStartHour: Number.isFinite(Number(raw.silentStartHour)) ? Number(raw.silentStartHour) : 0,
+    silentEndHour: Number.isFinite(Number(raw.silentEndHour)) ? Number(raw.silentEndHour) : 9,
+    recipients,
+  };
+}
+
+export function buildDailyCheckSummary(source = {}, now = Date.now()) {
+  const clock = shanghaiClock(now);
+  const base = typeof source.summary === 'string' && source.summary.trim()
+    ? source.summary.trim()
+    : 'Proactive daily companion check for Iris.';
+  const recipients = Array.isArray(source.recipients) && source.recipients.length
+    ? source.recipients.join(', ')
+    : DEFAULT_DAILY_RECIPIENTS.join(', ');
+  return [
+    base,
+    `Current local time: ${clock.label}.`,
+    'Quiet hours are 00:00–09:00 Asia/Shanghai; this wake should only fire outside that window.',
+    'Decide whether a proactive message to Iris is worthwhile right now.',
+    'Allowed intents: care/health/routine nudges, practical reminders, light chat openers, or small affectionate check-ins.',
+    'Be selective — not every wake needs a message. Prefer NO_OP when nothing natural fits.',
+    `If actionable, set category to "daily" and choose exactly one suggestedRecipient among: ${recipients}.`,
+    'Route by tone and relationship fit; do not invent other recipients.',
+  ].join('\n');
 }
 
 export function timerSchedule(source) {
@@ -145,14 +237,29 @@ export function chooseRecipient({
   rules = {},
   usageOf = () => ({ count: 0, lastAt: null }),
   now = Date.now(),
+  allowedRecipientKeys = null,
+  ignoreRecipientLimits = false,
+  modelOnly = false,
 }) {
-  const target = rules[result.category] ?? result.suggestedRecipient ?? null;
+  const allowed = Array.isArray(allowedRecipientKeys) && allowedRecipientKeys.length
+    ? new Set(allowedRecipientKeys.map((item) => String(item).trim().toLowerCase()).filter(Boolean))
+    : null;
+  // modelOnly (daily proactive): never let the static rules table override L1.
+  const target = modelOnly
+    ? (result.suggestedRecipient ?? null)
+    : (rules[result.category] ?? result.suggestedRecipient ?? null);
   const targetKey = typeof target === 'string' ? target.trim().toLowerCase() : null;
   const candidates = contacts
     .filter((contact) => contact?.enabled !== false)
     .map((contact) => ({ contact, route: contactRoute(contact) }))
     .filter(({ contact, route }) => {
-      if (targetKey && contactKeys(contact).has(targetKey)) return true;
+      const keys = contactKeys(contact);
+      if (allowed) {
+        const inAllow = [...keys].some((key) => allowed.has(key));
+        if (!inAllow) return false;
+      }
+      if (targetKey && keys.has(targetKey)) return true;
+      if (modelOnly) return false;
       return route
         && route.categories.includes(result.category)
         && result.priority >= route.minPriority;
@@ -178,13 +285,19 @@ export function chooseRecipient({
       dailyLimit: 10,
       cooldownMinutes: 30,
     };
-    const usage = usageOf(contact.id);
-    const cooldownMs = policy.cooldownMinutes * 60_000;
-    if (usage.count >= policy.dailyLimit || (usage.lastAt && now - usage.lastAt < cooldownMs)) {
-      limited = true;
-      continue;
+    if (!ignoreRecipientLimits) {
+      const usage = usageOf(contact.id);
+      const cooldownMs = policy.cooldownMinutes * 60_000;
+      if (usage.count >= policy.dailyLimit || (usage.lastAt && now - usage.lastAt < cooldownMs)) {
+        limited = true;
+        continue;
+      }
     }
-    return { contact, route: policy, reason: targetKey ? 'explicit-or-rule' : 'category-profile' };
+    return {
+      contact,
+      route: policy,
+      reason: targetKey ? (modelOnly ? 'model-suggestion' : 'explicit-or-rule') : 'category-profile',
+    };
   }
   return {
     contact: null,
@@ -224,10 +337,13 @@ export class TriageStore {
         event_id TEXT NOT NULL,
         recipient_id TEXT NOT NULL,
         delivered_at INTEGER NOT NULL,
+        pool TEXT NOT NULL DEFAULT 'task',
         FOREIGN KEY(event_id) REFERENCES triage_events(id)
       );
       CREATE INDEX IF NOT EXISTS idx_triage_deliveries_recipient
         ON triage_deliveries(recipient_id, delivered_at);
+      CREATE INDEX IF NOT EXISTS idx_triage_deliveries_pool
+        ON triage_deliveries(pool, delivered_at);
       CREATE TABLE IF NOT EXISTS triage_source_state (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
@@ -239,6 +355,12 @@ export class TriageStore {
     );
     if (!columns.has('triage_latency_ms')) {
       this.db.exec('ALTER TABLE triage_events ADD COLUMN triage_latency_ms INTEGER');
+    }
+    const deliveryColumns = new Set(
+      this.db.prepare('PRAGMA table_info(triage_deliveries)').all().map((column) => column.name),
+    );
+    if (!deliveryColumns.has('pool')) {
+      this.db.exec(`ALTER TABLE triage_deliveries ADD COLUMN pool TEXT NOT NULL DEFAULT 'task'`);
     }
   }
 
@@ -337,29 +459,40 @@ export class TriageStore {
     );
   }
 
-  recordDelivery(eventIdValue, recipientId, now = Date.now()) {
+  recordDelivery(eventIdValue, recipientId, now = Date.now(), pool = DELIVERY_POOL_TASK) {
+    const normalizedPool = pool === DELIVERY_POOL_DAILY ? DELIVERY_POOL_DAILY : DELIVERY_POOL_TASK;
     this.db.prepare(`
-      INSERT INTO triage_deliveries (event_id, recipient_id, delivered_at)
-      VALUES (?, ?, ?)
-    `).run(eventIdValue, recipientId, now);
+      INSERT INTO triage_deliveries (event_id, recipient_id, delivered_at, pool)
+      VALUES (?, ?, ?, ?)
+    `).run(eventIdValue, recipientId, now, normalizedPool);
   }
 
-  recipientUsage(recipientId, now = Date.now()) {
+  // Task dispatches use a rolling 24h window and only count the task pool, so
+  // proactive daily outreach does not burn per-recipient work quotas.
+  recipientUsage(recipientId, now = Date.now(), pool = DELIVERY_POOL_TASK) {
     const since = now - 24 * 60 * 60_000;
     const row = this.db.prepare(`
       SELECT COUNT(*) AS count, MAX(delivered_at) AS last_at
       FROM triage_deliveries
-      WHERE recipient_id = ? AND delivered_at >= ?
-    `).get(recipientId, since);
+      WHERE recipient_id = ? AND delivered_at >= ? AND COALESCE(pool, 'task') = ?
+    `).get(recipientId, since, pool);
     return { count: Number(row.count), lastAt: row.last_at === null ? null : Number(row.last_at) };
+  }
+
+  // Daily proactive cap is a Shanghai calendar-day total across all recipients.
+  poolUsage(pool = DELIVERY_POOL_DAILY, now = Date.now()) {
+    const start = shanghaiDayStart(now);
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM triage_deliveries
+      WHERE delivered_at >= ? AND COALESCE(pool, 'task') = ?
+    `).get(start, pool);
+    return { count: Number(row.count), since: start };
   }
 
   dailySummary(now = Date.now()) {
     // Business-day metrics are pinned to Asia/Shanghai, independent of host timezone.
-    const shanghaiOffsetMs = 8 * 60 * 60_000;
-    const shifted = new Date(now + shanghaiOffsetMs);
-    shifted.setUTCHours(0, 0, 0, 0);
-    const start = shifted.getTime() - shanghaiOffsetMs;
+    const start = shanghaiDayStart(now);
     const statuses = this.db.prepare(`
       SELECT status, COUNT(*) AS count, COALESCE(SUM(cost_cny), 0) AS cost
       FROM triage_events WHERE created_at >= ? GROUP BY status
@@ -373,6 +506,11 @@ export class TriageStore {
       FROM triage_deliveries WHERE delivered_at >= ?
       GROUP BY recipient_id ORDER BY count DESC
     `).all(start);
+    const poolRows = this.db.prepare(`
+      SELECT COALESCE(pool, 'task') AS pool, COUNT(*) AS count
+      FROM triage_deliveries WHERE delivered_at >= ?
+      GROUP BY COALESCE(pool, 'task')
+    `).all(start);
     const latency = this.db.prepare(`
       SELECT COUNT(*) AS count, AVG(triage_latency_ms) AS average
       FROM triage_events
@@ -380,6 +518,7 @@ export class TriageStore {
     `).get(start);
     const total = statuses.reduce((sum, row) => sum + Number(row.count), 0);
     const noop = statuses.find((row) => row.status === 'noop');
+    const pools = Object.fromEntries(poolRows.map((row) => [row.pool, Number(row.count)]));
     return {
       since: new Date(start).toISOString(),
       total,
@@ -390,6 +529,8 @@ export class TriageStore {
       avgTriageLatencyMs: latency.average === null ? null : Math.round(Number(latency.average)),
       statuses,
       deliveries,
+      pools,
+      dailyPoolDispatched: pools[DELIVERY_POOL_DAILY] ?? 0,
     };
   }
 

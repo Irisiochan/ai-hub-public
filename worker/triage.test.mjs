@@ -5,11 +5,16 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  buildDailyCheckSummary,
   chooseRecipient,
+  DELIVERY_POOL_DAILY,
+  DELIVERY_POOL_TASK,
   estimateCostCny,
+  isShanghaiSilentHour,
   nextTimerDelay,
   normalizeEvent,
   parseTriageJson,
+  shanghaiClock,
   timerSchedule,
   TriageStore,
 } from './triage-core.mjs';
@@ -185,6 +190,82 @@ test('router prefers explicit idle target then applies daily and cooldown limits
   });
   assert.equal(limited.contact, null);
   assert.equal(limited.reason, 'all-candidates-rate-limited');
+});
+
+test('daily model routing ignores rules and task recipient quotas', () => {
+  const contacts = [
+    { id: 'cheng', name: '橙', state: 'idle', config: { routing: { enabled: true, recipientKey: 'cheng', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
+    { id: 'cove', name: 'Cove', state: 'idle', config: { routing: { enabled: true, recipientKey: 'cove', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
+    { id: 'aye', name: '阿野', state: 'idle', config: { routing: { enabled: true, recipientKey: 'aye', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
+    { id: 'gem', name: 'Gemini', state: 'idle', config: { routing: { enabled: true, recipientKey: 'gem', categories: ['daily'], dailyLimit: 100, cooldownMinutes: 0 } } },
+  ];
+  const result = {
+    actionable: true,
+    category: 'daily',
+    priority: 1,
+    suggestedRecipient: 'aye',
+    rationale: 'light check-in fits Grok',
+  };
+  const routed = chooseRecipient({
+    contacts,
+    result,
+    rules: { daily: 'cheng' },
+    // Task quota already exhausted must not block the daily pool.
+    usageOf: () => ({ count: 99, lastAt: 1 }),
+    allowedRecipientKeys: ['cheng', 'cove', 'aye'],
+    ignoreRecipientLimits: true,
+    modelOnly: true,
+    now: 100_000,
+  });
+  assert.equal(routed.contact.id, 'aye');
+  assert.equal(routed.reason, 'model-suggestion');
+
+  const missing = chooseRecipient({
+    contacts,
+    result: { ...result, suggestedRecipient: null },
+    rules: { daily: 'cheng' },
+    allowedRecipientKeys: ['cheng', 'cove', 'aye'],
+    ignoreRecipientLimits: true,
+    modelOnly: true,
+  });
+  assert.equal(missing.contact, null);
+  assert.equal(missing.reason, 'no-route');
+});
+
+test('Shanghai silent window and daily delivery pools stay separate from task quotas', () => {
+  // 2026-07-25 16:30 UTC = 2026-07-26 00:30 Asia/Shanghai → silent
+  assert.equal(isShanghaiSilentHour(Date.parse('2026-07-25T16:30:00Z'), 0, 9), true);
+  // 2026-07-26 01:15 UTC = 09:15 Asia/Shanghai → open
+  assert.equal(isShanghaiSilentHour(Date.parse('2026-07-26T01:15:00Z'), 0, 9), false);
+  assert.match(buildDailyCheckSummary({ summary: 'hello' }, Date.parse('2026-07-26T01:15:00Z')), /Asia\/Shanghai/);
+  assert.equal(shanghaiClock(Date.parse('2026-07-26T01:15:00Z')).hour, 9);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-triage-pool-'));
+  const store = new TriageStore(path.join(dir, 'triage.db'));
+  try {
+    const now = Date.parse('2026-07-26T04:00:00Z'); // 12:00 Shanghai
+    store.enqueue({ source: 'task', summary: 'work item', dedupeKey: 't1' });
+    store.enqueue({ source: 'daily', summary: 'care item', dedupeKey: 'd1' });
+    const task = store.claim(now);
+    store.recordDelivery(task.id, 'cheng', now, DELIVERY_POOL_TASK);
+    store.finish(task.id, 'dispatched', { recipientId: 'cheng' }, now);
+    const daily = store.claim(now + 1);
+    store.recordDelivery(daily.id, 'cheng', now + 1, DELIVERY_POOL_DAILY);
+    store.finish(daily.id, 'dispatched', { recipientId: 'cheng' }, now + 1);
+
+    assert.equal(store.recipientUsage('cheng', now + 1, DELIVERY_POOL_TASK).count, 1);
+    assert.equal(store.recipientUsage('cheng', now + 1, DELIVERY_POOL_DAILY).count, 1);
+    // Task quota path only sees the task pool.
+    assert.equal(store.recipientUsage('cheng', now + 1).count, 1);
+    assert.equal(store.poolUsage(DELIVERY_POOL_DAILY, now + 1).count, 1);
+    const summary = store.dailySummary(now + 1);
+    assert.equal(summary.dailyPoolDispatched, 1);
+    assert.equal(summary.pools.task, 1);
+    assert.equal(summary.pools.daily, 1);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('minimal streamable HTTP MCP client initializes a session and calls a vault tool', async () => {
