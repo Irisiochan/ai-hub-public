@@ -4,6 +4,14 @@ import { CodexAppServerBackend, type CodexModelOption } from '../agents/codexApp
 import type { HubConfig } from '../config.js';
 import type { Db, ContactRow } from '../db.js';
 import type { SseHub } from '../sse.js';
+import type { HubLogger } from '../logger.js';
+import { modelCatalog, type ModelOption } from '../modelCatalog.js';
+import {
+  contactConfig,
+  formatContactConfigError,
+  openContact,
+  validateContactConfig,
+} from '../agents/configSchemas.js';
 
 /** apiKey never leaves the server in clear — mask to ••••+last4 for the UI. */
 function maskConfig(config: Record<string, any>): Record<string, any> {
@@ -16,36 +24,6 @@ function maskConfig(config: Record<string, any>): Record<string, any> {
 function isMaskedKey(v: unknown): boolean {
   return typeof v === 'string' && (v === '' || v.startsWith('••••'));
 }
-
-interface ModelOption {
-  id: string;
-  label: string;
-  description?: string;
-  isDefault?: boolean;
-}
-
-const CLAUDE_MODELS: ModelOption[] = [
-  { id: '', label: '默认（Claude CLI 自动选择）', isDefault: true },
-  { id: 'sonnet', label: 'Sonnet（最新）' },
-  { id: 'opus', label: 'Opus（最新）' },
-  { id: 'haiku', label: 'Haiku（最新）' },
-  { id: 'fable', label: 'Fable' },
-  { id: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { id: 'claude-opus-4-6', label: 'Opus 4.6' },
-  { id: 'claude-opus-4-5', label: 'Opus 4.5' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-  { id: 'claude-sonnet-4-5', label: 'Sonnet 4.5' },
-];
-
-// claude CLI 的 --effort 档位；'' 表示不传 flag，交给 CLI 默认（当前是 xhigh）
-const CLAUDE_EFFORTS: ModelOption[] = [
-  { id: '', label: '默认强度', isDefault: true },
-  { id: 'low', label: 'low' },
-  { id: 'medium', label: 'medium' },
-  { id: 'high', label: 'high' },
-  { id: 'xhigh', label: 'xhigh' },
-  { id: 'max', label: 'max' },
-];
 
 const CODEX_EFFORT_IDS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 
@@ -87,10 +65,14 @@ export function contactsRouter(
   db: Db,
   sse: SseHub,
   manager: AgentManager,
-  hubConfig: HubConfig
+  hubConfig: HubConfig,
+  logger?: HubLogger
 ): Router {
   const r = Router();
   let codexCache: { expires: number; models: CodexModelOption[] } | null = null;
+
+  const catalogLog = (message: string) => logger?.warn({ component: 'models' }, message);
+  const catalogOf = (backend: string) => modelCatalog(backend, catalogLog);
 
   const loadCodexModels = async (cfg: Record<string, any>): Promise<CodexModelOption[]> => {
     if (!codexCache || codexCache.expires < Date.now()) {
@@ -99,7 +81,7 @@ export function contactsRouter(
         models: await CodexAppServerBackend.listModels({
           cliPath: cfg.cliPath ?? hubConfig.codex.cliPath,
           cwd: hubConfig.agentsDir,
-          log: (m) => console.log(`  [models] ${m}`),
+          log: (message) => logger?.info({ component: 'models' }, message),
         }),
       };
     }
@@ -107,10 +89,11 @@ export function contactsRouter(
   };
 
   const publicRow = (c: ContactRow) => {
+    c = openContact(c);
     const status = manager.statusOf(c.id);
     return {
       ...c,
-      config: maskConfig(JSON.parse(c.config || '{}')),
+      config: maskConfig(c.configParsed!),
       state: status.state,
       // Room busy member display name (undefined for DM / idle). Used by resync
       // so thinking labels stay on the contact, not the room title.
@@ -140,7 +123,7 @@ export function contactsRouter(
     if (!contact) return res.status(404).json({ error: 'contact not found' });
     if (contact.kind === 'room') return res.json({ models: [], current: '', dynamic: false });
 
-    const cfg = JSON.parse(contact.config || '{}');
+    const cfg = contactConfig(contact);
     const current = typeof cfg.model === 'string' ? cfg.model : '';
     let models: ModelOption[] = [];
     let dynamic = false;
@@ -159,12 +142,12 @@ export function contactsRouter(
       }
       models = [{ id: '', label: '默认（Codex 自动选择）' }, ...models, ...customModels(cfg)];
     } else if (contact.backend === 'claude-cli') {
-      models = [...CLAUDE_MODELS, ...customModels(cfg)];
-      efforts = CLAUDE_EFFORTS;
+      const catalog = catalogOf('claude-cli');
+      models = [...catalog.models, ...customModels(cfg)];
+      efforts = catalog.efforts;
       currentEffort = typeof cfg.effort === 'string' ? cfg.effort : '';
     } else if (contact.backend === 'grok-cli') {
-      // grok build 还在 beta，模型 id 没有稳定目录——默认自动选择，特定 id 走 modelOptions
-      models = [{ id: '', label: '默认（Grok CLI 自动选择）', isDefault: true }, ...customModels(cfg)];
+      models = [...catalogOf('grok-cli').models, ...customModels(cfg)];
     } else {
       models = [...customModels(cfg)];
       if (current) models.unshift({ id: current, label: current });
@@ -185,24 +168,27 @@ export function contactsRouter(
 
     const model: string | null = typeof req.body?.model === 'string' ? req.body.model.trim() : null;
     if (model === null || model.length > 160) return res.status(400).json({ error: 'model 无效' });
-    const cfg = JSON.parse(contact.config || '{}');
+    const cfg = contactConfig(contact);
     const previous = typeof cfg.model === 'string' ? cfg.model : '';
     if (previous === model) return res.json(publicRow(contact));
 
-    if (model) cfg.model = model;
-    else delete cfg.model;
+    cfg.model = model;
     if (contact.backend === 'codex' && typeof cfg.effort === 'string') {
       try {
         const models = await loadCodexModels(cfg);
         const selected = (model && models.find((item) => item.id === model))
           || models.find((item) => item.isDefault);
         const supported = selected?.supportedReasoningEfforts?.some((item) => item.id === cfg.effort);
-        if (selected && !supported) delete cfg.effort;
+        if (selected && !supported) cfg.effort = '';
       } catch {
         // Switching the model should still work if the optional catalog lookup is unavailable.
       }
     }
-    db.prepare('UPDATE contacts SET config = ? WHERE id = ?').run(JSON.stringify(cfg), contact.id);
+    const checked = validateContactConfig(contact.backend, contact.kind, cfg);
+    if (!checked.success) {
+      return res.status(400).json({ error: formatContactConfigError(checked.error) });
+    }
+    db.prepare('UPDATE contacts SET config = ? WHERE id = ?').run(JSON.stringify(checked.data), contact.id);
     const updated = db.prepare('SELECT * FROM contacts WHERE id = ?').get(contact.id) as ContactRow;
     await manager.switchContactModel(updated);
 
@@ -237,12 +223,12 @@ export function contactsRouter(
 
     const effort: string | null = typeof req.body?.effort === 'string' ? req.body.effort.trim() : null;
     const validEffort = contact.backend === 'claude-cli'
-      ? CLAUDE_EFFORTS.some((item) => item.id === effort)
+      ? (catalogOf('claude-cli').efforts ?? []).some((item) => item.id === effort)
       : effort === '' || CODEX_EFFORT_IDS.some((id) => id === effort);
     if (effort === null || !validEffort) {
       return res.status(400).json({ error: 'effort 无效' });
     }
-    const cfg = JSON.parse(contact.config || '{}');
+    const cfg = contactConfig(contact);
     if (contact.backend === 'codex' && effort) {
       try {
         const models = await loadCodexModels(cfg);
@@ -259,9 +245,12 @@ export function contactsRouter(
     const previous = typeof cfg.effort === 'string' ? cfg.effort : '';
     if (previous === effort) return res.json(publicRow(contact));
 
-    if (effort) cfg.effort = effort;
-    else delete cfg.effort;
-    db.prepare('UPDATE contacts SET config = ? WHERE id = ?').run(JSON.stringify(cfg), contact.id);
+    cfg.effort = effort;
+    const checked = validateContactConfig(contact.backend, contact.kind, cfg);
+    if (!checked.success) {
+      return res.status(400).json({ error: formatContactConfigError(checked.error) });
+    }
+    db.prepare('UPDATE contacts SET config = ? WHERE id = ?').run(JSON.stringify(checked.data), contact.id);
     const updated = db.prepare('SELECT * FROM contacts WHERE id = ?').get(contact.id) as ContactRow;
     // 两种 CLI 都在新底层会话应用 effort，并自动衔接近期聊天。
     await manager.switchContactModel(updated);
@@ -320,6 +309,10 @@ export function contactsRouter(
       : ['claude-cli', 'codex', 'grok-cli', 'api'].includes(backend)
         ? backend
         : 'api';
+    const checked = validateContactConfig(backendKind, isRoom ? 'room' : 'dm', cfg);
+    if (!checked.success) {
+      return res.status(400).json({ error: formatContactConfigError(checked.error) });
+    }
 
     // 软删过的同名坑位：UPDATE 复活并覆盖（消息表有外键，不能 DELETE；历史正好延续）
     db.prepare(
@@ -336,7 +329,7 @@ export function contactsRouter(
       typeof color === 'string' && color ? color : '#8888aa',
       backendKind,
       isRoom ? 'room' : 'dm',
-      JSON.stringify(cfg)
+      JSON.stringify(checked.data)
     );
 
     const created = db.prepare('SELECT * FROM contacts WHERE id = ?').get(slug) as ContactRow;
@@ -354,11 +347,15 @@ export function contactsRouter(
     const { name, avatar, color, config } = req.body ?? {};
     let nextConfig = contact.config;
     if (config && typeof config === 'object') {
-      const oldConfig = JSON.parse(contact.config || '{}');
+      const oldConfig = contactConfig(contact);
       const merged = { ...config };
       // masked/empty key from the UI means "keep the stored one"
       if (isMaskedKey(merged.apiKey) && oldConfig.apiKey) merged.apiKey = oldConfig.apiKey;
-      nextConfig = JSON.stringify(merged);
+      const checked = validateContactConfig(contact.backend, contact.kind, merged);
+      if (!checked.success) {
+        return res.status(400).json({ error: formatContactConfigError(checked.error) });
+      }
+      nextConfig = JSON.stringify(checked.data);
     }
     db.prepare('UPDATE contacts SET name = ?, avatar = ?, color = ?, config = ? WHERE id = ?').run(
       typeof name === 'string' && name.trim() ? name.trim() : contact.name,

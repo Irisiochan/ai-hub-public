@@ -7,6 +7,21 @@ import {
   validateTriageMode,
 } from './triage-core.mjs';
 
+const IDEA_CATEGORIES = [
+  'daily-life',
+  'imagination',
+  'ethics',
+  'relationships',
+  'creativity',
+  'society',
+  'technology',
+  'pets',
+  'work',
+  'learning',
+  'humor',
+  'philosophy',
+];
+
 function secretFromEnv(name) {
   if (!name) return '';
   return process.env[name]?.trim() ?? '';
@@ -24,6 +39,18 @@ async function jsonRequest(url, init, timeoutMs = 30_000) {
   return body;
 }
 
+function parseJsonObject(raw, label) {
+  if (typeof raw !== 'string') throw new Error(`${label} response must be text`);
+  let text = raw.trim();
+  if (text.startsWith('```')) {
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  }
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) throw new Error(`${label} response did not contain a JSON object`);
+  return JSON.parse(text.slice(start, end + 1));
+}
+
 export class DeepSeekClient {
   constructor(config, categories) {
     this.baseUrl = String(config.baseUrl ?? 'https://api.deepseek.com').replace(/\/+$/, '');
@@ -39,7 +66,7 @@ export class DeepSeekClient {
       : { type: 'disabled' };
   }
 
-  async call(model, system, user, pricing = {}, categories = this.categories) {
+  async callJson(model, system, user, pricing = {}, maxTokens = 400) {
     if (!this.key) throw new Error('DeepSeek API key environment variable is missing');
     const startedAt = performance.now();
     const body = await jsonRequest(`${this.baseUrl}/chat/completions`, {
@@ -51,7 +78,7 @@ export class DeepSeekClient {
       body: JSON.stringify({
         model,
         temperature: 0,
-        max_tokens: 400,
+        max_tokens: maxTokens,
         thinking: this.thinking,
         // DeepSeek's OpenAI-compatible endpoint supports JSON mode. The worker
         // performs the stricter enum/type validation locally before routing.
@@ -64,10 +91,18 @@ export class DeepSeekClient {
     }, this.timeoutMs);
     const content = body.choices?.[0]?.message?.content;
     return {
-      result: parseTriageJson(content, categories),
+      result: parseJsonObject(content, 'DeepSeek JSON'),
       usage: body.usage ?? {},
       costCny: estimateCostCny(body.usage, pricing),
       latencyMs: Math.round(performance.now() - startedAt),
+    };
+  }
+
+  async call(model, system, user, pricing = {}, categories = this.categories) {
+    const response = await this.callJson(model, system, user, pricing);
+    return {
+      ...response,
+      result: parseTriageJson(JSON.stringify(response.result), categories),
     };
   }
 
@@ -81,7 +116,7 @@ export class DeepSeekClient {
     const system = daily
       ? [
         'You are the L1 proactive daily-companion gate for an autonomous AI hub.',
-        'Decide whether Iris should receive a proactive message right now.',
+        'Decide whether the AI Hub user should receive a proactive message right now.',
         'Allowed content: care/health/routine nudges, practical reminders, light chat openers, affectionate check-ins.',
         forceActionable
           ? 'This is the guaranteed daily slot. Choose one natural, low-pressure proactive message; actionable must be true.'
@@ -170,6 +205,72 @@ export class DeepSeekClient {
     });
     return this.call(this.proModel, system, user, this.pricing.pro);
   }
+
+  async ideaTopic({ room, members, recentTopics }) {
+    const system = [
+      'You host a daily free-form idea discussion for a private multi-AI room.',
+      'Choose one genuinely discussable topic. It may be playful, practical, philosophical, creative, or surprising; it is not limited to project optimization.',
+      'Avoid the same semantic category and wording as the recent topics.',
+      'Choose either all room members or a purposeful subset.',
+      'Return exactly one JSON object:',
+      '{"topic":"one concise Chinese discussion prompt","category":"short semantic category","targetIds":["all"],"rationale":"brief novelty reason"}',
+      `category must be exactly one of: ${IDEA_CATEGORIES.join(', ')}.`,
+      'targetIds must contain "all" alone, or one or more exact member ids from the provided list.',
+      'Do not include @ mentions inside topic.',
+    ].join('\n');
+    const user = JSON.stringify({
+      room: { id: room.id, name: room.name },
+      members: members.map((member) => ({ id: member.id, name: member.name })),
+      recentTopics,
+    });
+    const response = await this.callJson(
+      this.proModel,
+      system,
+      user,
+      this.pricing.pro,
+      600,
+    );
+    const value = response.result;
+    const topic = typeof value.topic === 'string' ? value.topic.trim().slice(0, 1000) : '';
+    const category = typeof value.category === 'string'
+      ? value.category.trim().toLowerCase().slice(0, 100)
+      : '';
+    const targetIds = Array.isArray(value.targetIds)
+      ? [...new Set(value.targetIds.map((item) => String(item).trim()).filter(Boolean))]
+      : [];
+    const rationale = typeof value.rationale === 'string'
+      ? value.rationale.trim().slice(0, 1000)
+      : '';
+    if (!topic || !category || !targetIds.length || !rationale) {
+      throw new Error('idea topic JSON is missing topic/category/targetIds/rationale');
+    }
+    if (!IDEA_CATEGORIES.includes(category)) {
+      throw new Error(`idea topic category is invalid: ${category}`);
+    }
+    return { ...response, result: { topic, category, targetIds, rationale } };
+  }
+
+  async ideaSummary({ topic, transcript }) {
+    const system = [
+      'You are closing a private multi-AI room discussion.',
+      'Write a compact Chinese host wrap-up that captures distinct viewpoints, useful disagreements, and one memorable takeaway.',
+      'Do not claim anyone said something absent from the transcript.',
+      'Return exactly one JSON object: {"summary":"final host message"}',
+    ].join('\n');
+    const user = JSON.stringify({ topic, transcript: transcript.slice(0, 30_000) });
+    const response = await this.callJson(
+      this.proModel,
+      system,
+      user,
+      this.pricing.pro,
+      1000,
+    );
+    const summary = typeof response.result.summary === 'string'
+      ? response.result.summary.trim().slice(0, 6000)
+      : '';
+    if (!summary) throw new Error('idea summary JSON is missing summary');
+    return { ...response, result: { summary } };
+  }
 }
 
 export class HubClient {
@@ -200,6 +301,49 @@ export class HubClient {
       headers: this.headers(),
       body: JSON.stringify({ content }),
     }, this.timeoutMs);
+  }
+
+  async dispatchRoomHost(contactId, input) {
+    return jsonRequest(
+      `${this.baseUrl}/api/contacts/${encodeURIComponent(contactId)}/room-host/messages`,
+      {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify(input),
+      },
+      this.timeoutMs,
+    );
+  }
+
+  async roomRound(contactId, roundId) {
+    return jsonRequest(
+      `${this.baseUrl}/api/contacts/${encodeURIComponent(contactId)}/room-rounds/${encodeURIComponent(roundId)}`,
+      { headers: this.headers() },
+      this.timeoutMs,
+    );
+  }
+
+  async waitRoomRound(contactId, roundId, { pollMs = 2000, timeoutMs = 20 * 60_000 } = {}) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const status = await this.roomRound(contactId, roundId);
+      if (status.status === 'done') return status;
+      if (status.status === 'error') {
+        throw new Error(`room round failed: ${status.error || 'unknown error'}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+    throw new Error(`room round timed out after ${timeoutMs}ms`);
+  }
+
+  async messages(contactId, after, limit = 200) {
+    const query = new URLSearchParams({ after: String(after), limit: String(limit) });
+    const body = await jsonRequest(
+      `${this.baseUrl}/api/contacts/${encodeURIComponent(contactId)}/messages?${query}`,
+      { headers: this.headers() },
+      this.timeoutMs,
+    );
+    return body.messages ?? [];
   }
 }
 

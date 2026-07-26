@@ -11,12 +11,14 @@ export const DEFAULT_CATEGORIES = [
   'message',
   'system',
   'daily',
+  'idea',
   'other',
 ];
 
-export const DEFAULT_DAILY_RECIPIENTS = ['cheng', 'cove', 'aye'];
+export const DEFAULT_DAILY_RECIPIENTS = ['claude-code', 'codex', 'grok-build'];
 export const DELIVERY_POOL_TASK = 'task';
 export const DELIVERY_POOL_DAILY = 'daily';
+export const DELIVERY_POOL_IDEA = 'idea';
 
 const FINAL_STATES = new Set(['noop', 'dispatched', 'parked', 'dead']);
 const SHANGHAI_OFFSET_MS = 8 * 60 * 60_000;
@@ -93,6 +95,19 @@ export function isDailyMode(sourceOrResult) {
   return false;
 }
 
+export function isIdeaMode(sourceOrResult) {
+  if (!sourceOrResult || typeof sourceOrResult !== 'object') return false;
+  if (sourceOrResult.mode === 'idea') return true;
+  if (sourceOrResult.category === 'idea') return true;
+  if (sourceOrResult.categoryHint === 'idea') return true;
+  if (sourceOrResult.category_hint === 'idea') return true;
+  if (sourceOrResult.payload && typeof sourceOrResult.payload === 'object'
+    && sourceOrResult.payload.mode === 'idea') {
+    return true;
+  }
+  return false;
+}
+
 export function normalizeProactiveConfig(raw = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('proactive must be an object');
@@ -137,6 +152,49 @@ export function normalizeProactiveConfig(raw = {}) {
     silentStartHour: integerConfig(raw.silentStartHour, 0, 'proactive.silentStartHour', 0, 23),
     silentEndHour: integerConfig(raw.silentEndHour, 9, 'proactive.silentEndHour', 0, 24),
     recipients,
+  };
+}
+
+export function normalizeIdeaConfig(raw = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('idea must be an object');
+  }
+  const roomId = typeof raw.roomId === 'string' ? raw.roomId.trim() : '';
+  return {
+    enabled: raw.enabled === true,
+    roomId,
+    hostName: typeof raw.hostName === 'string' && raw.hostName.trim()
+      ? raw.hostName.trim().slice(0, 80)
+      : 'DS 主持',
+    dailyDispatchLimit: integerConfig(
+      raw.dailyDispatchLimit,
+      1,
+      'idea.dailyDispatchLimit',
+      0,
+      30,
+    ),
+    reactionRounds: integerConfig(raw.reactionRounds, 3, 'idea.reactionRounds', 0, 3),
+    recentTopicLimit: integerConfig(raw.recentTopicLimit, 12, 'idea.recentTopicLimit', 3, 100),
+    maxTopicAttempts: integerConfig(raw.maxTopicAttempts, 3, 'idea.maxTopicAttempts', 1, 10),
+    roundPollMs: integerConfig(raw.roundPollMs, 2000, 'idea.roundPollMs', 100, 60_000),
+    roundTimeoutMs: integerConfig(
+      raw.roundTimeoutMs,
+      20 * 60_000,
+      'idea.roundTimeoutMs',
+      10_000,
+      60 * 60_000,
+    ),
+  };
+}
+
+export function ideaPolicyState(idea, usage = {}) {
+  const config = normalizeIdeaConfig(idea);
+  const count = Math.max(0, Number(usage.count ?? 0));
+  return {
+    poolFull: !config.enabled
+      || !config.roomId
+      || config.dailyDispatchLimit <= 0
+      || count >= config.dailyDispatchLimit,
   };
 }
 
@@ -188,7 +246,7 @@ export function buildDailyCheckSummary(source = {}, now = Date.now(), options = 
   const proactive = normalizeProactiveConfig(options.proactive ?? {});
   const base = typeof source.summary === 'string' && source.summary.trim()
     ? source.summary.trim()
-    : 'Proactive daily companion check for Iris.';
+    : 'Proactive daily companion check for the AI Hub user.';
   const recipients = Array.isArray(source.recipients) && source.recipients.length
     ? source.recipients.join(', ')
     : DEFAULT_DAILY_RECIPIENTS.join(', ');
@@ -197,7 +255,7 @@ export function buildDailyCheckSummary(source = {}, now = Date.now(), options = 
     `Current local time: ${clock.label}.`,
     `Quiet hours are ${String(proactive.silentStartHour).padStart(2, '0')}:00–`
       + `${String(proactive.silentEndHour).padStart(2, '0')}:00 Asia/Shanghai; this wake should only fire outside that window.`,
-    'Decide whether a proactive message to Iris is worthwhile right now.',
+    'Decide whether a proactive message to the AI Hub user is worthwhile right now.',
     'Allowed intents: care/health/routine nudges, practical reminders, light chat openers, or small affectionate check-ins.',
     options.forceActionable
       ? 'This is the guaranteed daily slot: choose one natural, low-pressure message instead of NO_OP.'
@@ -563,7 +621,11 @@ export class TriageStore {
   }
 
   recordDelivery(eventIdValue, recipientId, now = Date.now(), pool = DELIVERY_POOL_TASK) {
-    const normalizedPool = pool === DELIVERY_POOL_DAILY ? DELIVERY_POOL_DAILY : DELIVERY_POOL_TASK;
+    const normalizedPool = pool === DELIVERY_POOL_DAILY
+      ? DELIVERY_POOL_DAILY
+      : pool === DELIVERY_POOL_IDEA
+        ? DELIVERY_POOL_IDEA
+        : DELIVERY_POOL_TASK;
     this.db.prepare(`
       INSERT INTO triage_deliveries (event_id, recipient_id, delivered_at, pool)
       VALUES (?, ?, ?, ?)
@@ -629,10 +691,17 @@ export class TriageStore {
       FROM triage_events
       WHERE created_at >= ? AND triage_result LIKE '%"category":"daily"%'
     `).get(start);
+    const ideaChecks = this.db.prepare(`
+      SELECT COUNT(*) AS count,
+             SUM(CASE WHEN status = 'noop' THEN 1 ELSE 0 END) AS noop_count
+      FROM triage_events
+      WHERE created_at >= ? AND triage_result LIKE '%"category":"idea"%'
+    `).get(start);
     const total = statuses.reduce((sum, row) => sum + Number(row.count), 0);
     const noop = statuses.find((row) => row.status === 'noop');
     const pools = Object.fromEntries(poolRows.map((row) => [row.pool, Number(row.count)]));
     const dailyUsage = this.poolUsage(DELIVERY_POOL_DAILY, now);
+    const ideaUsage = this.poolUsage(DELIVERY_POOL_IDEA, now);
     return {
       since: new Date(start).toISOString(),
       total,
@@ -645,12 +714,38 @@ export class TriageStore {
       deliveries,
       pools,
       dailyPoolDispatched: pools[DELIVERY_POOL_DAILY] ?? 0,
+      ideaPoolDispatched: pools[DELIVERY_POOL_IDEA] ?? 0,
       dailyChecks: Number(dailyChecks.count),
       dailyNoops: Number(dailyChecks.noop_count ?? 0),
+      ideaChecks: Number(ideaChecks.count),
+      ideaNoops: Number(ideaChecks.noop_count ?? 0),
       lastDailyDeliveryAt: dailyUsage.lastAt === null
         ? null
         : new Date(dailyUsage.lastAt).toISOString(),
+      lastIdeaDeliveryAt: ideaUsage.lastAt === null
+        ? null
+        : new Date(ideaUsage.lastAt).toISOString(),
     };
+  }
+
+  recentIdeaTopics(limit = 12) {
+    const rows = this.db.prepare(`
+      SELECT triage_result FROM triage_events
+      WHERE status = 'dispatched' AND triage_result LIKE '%"category":"idea"%'
+      ORDER BY updated_at DESC LIMIT ?
+    `).all(Math.max(1, Number(limit) || 12));
+    return rows.flatMap((row) => {
+      try {
+        const value = JSON.parse(row.triage_result);
+        if (!value?.topic || !value?.ideaCategory) return [];
+        return [{
+          topic: String(value.topic).slice(0, 500),
+          category: String(value.ideaCategory).slice(0, 100),
+        }];
+      } catch {
+        return [];
+      }
+    });
   }
 
   getSourceState(key) {

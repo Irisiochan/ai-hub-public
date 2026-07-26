@@ -100,12 +100,12 @@ else without an obvious owner) unmapped if you want the fallback to run.
 ### Proactive daily companion
 
 A separate timer source with `"mode": "daily"` (and category `daily`) asks L1
-whether Iris should get a proactive message: care/routine nudges, practical
+whether the AI Hub user should get a proactive message: care/routine nudges, practical
 reminders, or light chat openers are all allowed. This path is independent of
 the task/backlog gate:
 
-- **Model routing only** among `proactive.recipients` (default `cheng`, `cove`,
-  `aye`). Static `routing.rules` never override daily category.
+- **Model routing only** among `proactive.recipients` (default `claude-code`, `codex`,
+  `grok-build`). Static `routing.rules` never override daily category.
 - **Shanghai quiet hours** default `00:00–09:00` — the daily timer does not emit
   inside that window, and any queued daily event is forced to NO_OP.
 - **Separate daily pool**: `proactive.dailyDispatchLimit` (default 10) counts
@@ -132,7 +132,7 @@ the task/backlog gate:
     "minimumGapMinutes": 180,
     "silentStartHour": 0,
     "silentEndHour": 9,
-    "recipients": ["cheng", "cove", "aye"]
+    "recipients": ["claude-code", "codex", "grok-build"]
   },
   "sources": [
     {
@@ -142,11 +142,29 @@ the task/backlog gate:
       "intervalMinutes": 45,
       "jitterSeconds": 900,
       "category": "daily",
-      "summary": "Proactive daily companion check for Iris."
+      "summary": "Proactive daily companion check for the AI Hub user."
     }
   ]
 }
 ```
+
+### Daily idea room
+
+A timer source with `"mode": "idea"` uses DeepSeek Pro to choose one free-form
+discussion topic and either `@all` or a purposeful subset of a configured room.
+The host message is stored as `sender=room-host`, rendered as `DS 主持`, and never
+enters Memory Vault capture as if the AI Hub user had authored it. The worker polls the
+durable room-round status, fetches the transcript, then posts a Pro-generated
+wrap-up without opening another member round.
+
+- `idea.dailyDispatchLimit` defaults to 1 and counts the independent Shanghai-day
+  delivery pool `idea`; task and daily-companion quotas are untouched.
+- `reactionRounds` is clamped to 0–3 and defaults to 3.
+- Recently completed topics are fed back into Pro. A new topic cannot reuse either
+  of the previous two semantic categories, so every consecutive three are distinct.
+- The daily companion quiet hours also suppress idea starts.
+- `/health` exposes `ideaPoolDispatched`, `ideaChecks`, `ideaNoops`, and
+  `lastIdeaDeliveryAt`.
 
 Timer sources fire after `intervalMinutes` plus a fresh random jitter below
 `jitterSeconds`, so consecutive wakes are never closer than the interval. Only
@@ -171,4 +189,4 @@ Each routable contact may add:
 Copy `ai-hub-triage-worker.service` to systemd after adapting paths. Its sample
 uses `/etc/ai-hub/triage.env` for secrets and `/var/lib/ai-hub-triage` for the
 SQLite database. `/health` exposes the current NO_OP ratio, fallback count, cost,
-and per-recipient delivery distribution.
+per-recipient delivery distribution, and the separate daily/idea pool counters.

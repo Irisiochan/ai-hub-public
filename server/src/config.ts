@@ -11,6 +11,7 @@ export interface HubConfig {
   agentsDir: string;
   webDist: string;
   uploadsDir: string;
+  releasesDir: string;
   claude: {
     cliPath: string;
     turnTimeoutMs: number;
@@ -49,6 +50,7 @@ const defaults: HubConfig = {
   agentsDir: 'agents',
   webDist: '../web/dist',
   uploadsDir: 'data/uploads',
+  releasesDir: process.platform === 'linux' ? '/var/lib/ai-hub/releases' : 'data/releases',
   claude: {
     cliPath: 'claude',
     turnTimeoutMs: 300_000,
@@ -108,12 +110,14 @@ export function loadConfig(): HubConfig {
   if (process.env.HUB_PORT) cfg.port = Number(process.env.HUB_PORT);
   if (process.env.HUB_HOST) cfg.host = process.env.HUB_HOST;
   if (process.env.HUB_WEB_DIST) cfg.webDist = process.env.HUB_WEB_DIST;
+  if (process.env.HUB_RELEASES_DIR) cfg.releasesDir = process.env.HUB_RELEASES_DIR;
   const dataDir = process.env.HUB_DATA_DIR;
   if (dataDir) {
     cfg.dbPath = path.join(dataDir, 'hub.db');
     cfg.uploadsDir = path.join(dataDir, 'uploads');
     cfg.agentsDir = path.join(dataDir, 'agents');
     cfg.backup.dir = path.join(dataDir, 'backups');
+    if (!process.env.HUB_RELEASES_DIR) cfg.releasesDir = path.join(dataDir, 'releases');
   }
   // resolve relative paths against server root so cwd doesn't matter
   cfg.dbPath = path.resolve(serverRoot, cfg.dbPath);
@@ -121,8 +125,9 @@ export function loadConfig(): HubConfig {
   cfg.webDist = path.resolve(serverRoot, cfg.webDist);
   cfg.uploadsDir = path.resolve(serverRoot, cfg.uploadsDir);
   cfg.backup.dir = path.resolve(serverRoot, cfg.backup.dir);
+  cfg.releasesDir = path.resolve(serverRoot, cfg.releasesDir);
   if (cfg.memory.repoPath) cfg.memory.repoPath = path.resolve(serverRoot, cfg.memory.repoPath);
-  for (const dir of [path.dirname(cfg.dbPath), cfg.uploadsDir, cfg.agentsDir]) {
+  for (const dir of [path.dirname(cfg.dbPath), cfg.uploadsDir, cfg.agentsDir, cfg.releasesDir]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   return cfg;

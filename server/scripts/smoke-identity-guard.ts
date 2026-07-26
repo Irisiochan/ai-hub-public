@@ -1,6 +1,6 @@
 /** Compact identity-boundary regression with synthetic public fixtures. */
 import assert from 'node:assert/strict';
-import { buildSessionPreamble } from '../src/memory/inject.js';
+import { WORKFLOW_PRELOADED, buildSessionPreamble } from '../src/memory/inject.js';
 import type { VaultClient } from '../src/memory/vaultClient.js';
 
 const FAKE_CORE = [
@@ -22,7 +22,7 @@ const vault = {
 
 const alpha = await buildSessionPreamble(
   vault,
-  { id: 'agent-alpha', name: 'Agent Alpha', backend: 'api' },
+  { id: 'alpha', name: 'Agent Alpha', backend: 'api' },
   'compact'
 );
 
@@ -38,10 +38,23 @@ assert.ok(guardAt >= 0 && bodyAt > guardAt, 'identity boundary must precede memo
 
 const beta = await buildSessionPreamble(
   vault,
-  { id: 'agent-beta', name: 'Agent Beta', backend: 'api' },
+  { id: 'beta', name: 'Agent Beta', backend: 'api' },
   'compact'
 );
 assert.match(beta, /你当前是联系人「Agent Beta」/);
 assert.doesNotMatch(beta.split('# 记忆库上下文')[0] ?? '', /你当前是联系人「Agent Alpha」/);
+assert.match(beta, /称呼归属/);
+assert.match(beta, /亲密称呼|爱称|关系角色词/);
+assert.match(beta, /称呼是有方向的/);
+assert.match(beta, /你 → 用户不泛化/);
+assert.match(beta, /用户 → 你可按当前会话理解/);
+assert.doesNotMatch(
+  beta.split('# 记忆库上下文')[0] ?? '',
+  /你当前是联系人「Agent Alpha」/,
+  'identity guards must not bleed across contacts'
+);
+assert.match(WORKFLOW_PRELOADED, /<WORKFLOW_PRELOADED\|/);
+assert.match(WORKFLOW_PRELOADED, /global workflow files/);
+assert.doesNotMatch(WORKFLOW_PRELOADED, /\d{4}-\d{2}-\d{2}/);
 
 console.log('identity guard smoke: ok');

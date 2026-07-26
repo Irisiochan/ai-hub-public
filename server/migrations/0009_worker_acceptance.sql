@@ -1,0 +1,2 @@
+  ALTER TABLE workers ADD COLUMN accepting_jobs INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE workers ADD COLUMN boot_id TEXT;

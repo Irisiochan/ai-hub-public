@@ -1,5 +1,10 @@
 import { useState } from 'react';
+import { formatContactConfigError, validateContactConfig } from '@ai-hub/contact-config';
 import { api, type Contact } from '../api';
+import ApiFields from './contact-config/ApiFields';
+import CliFields from './contact-config/CliFields';
+import DelegationFields from './contact-config/DelegationFields';
+import RoomFields from './contact-config/RoomFields';
 
 interface Props {
   contact: Contact | null; // null = create new
@@ -45,6 +50,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
   const [memoryPreambleMode, setMemoryPreambleMode] = useState<'full' | 'compact' | 'off'>(
     cfg.memoryPreambleMode ?? 'compact'
   );
+  const [promptCache, setPromptCache] = useState<'auto' | 'off'>(cfg.promptCache ?? 'auto');
 
   const [memInject, setMemInject] = useState<boolean>(mem.injectOnSpawn ?? true);
   const [memSearch, setMemSearch] = useState<boolean>(mem.searchPerTurn ?? true);
@@ -116,6 +122,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
       summaryMaxTokens,
       historySummaryStrategy: historySummary ? 'extractive' : 'off',
       memoryPreambleMode,
+      promptCache,
       memory: { injectOnSpawn: memInject, searchPerTurn: memSearch, capture: memCapture },
     };
   };
@@ -124,7 +131,11 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
     setSaving(true);
     setError(null);
     try {
-      const config = buildConfig();
+      const rawConfig = buildConfig();
+      const backend = isRoom ? 'room' : creating ? 'api' : contact!.backend;
+      const checked = validateContactConfig(backend, isRoom ? 'room' : 'dm', rawConfig);
+      if (!checked.success) throw new Error(formatContactConfigError(checked.error));
+      const config = checked.data;
       if (creating) {
         if (!name.trim()) throw new Error('得有个名字');
         if (isRoom && members.length === 0) throw new Error('群聊至少拉一个人');
@@ -160,7 +171,10 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className={`modal contact-config-modal${isApi && !advanced ? ' contact-config-modal-api' : ''}`}
+        onClick={(e) => e.stopPropagation()}
+      >
         <header className="modal-header">
           <h2>{creating ? (isRoom ? '建群聊' : '新联系人（API 接入）') : `设置 · ${contact!.name}`}</h2>
           <button className="modal-close" onClick={onClose}>
@@ -168,9 +182,9 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
           </button>
         </header>
 
-        <div className="modal-body">
-          {creating && (
-            <div className="field-row">
+        <div className="modal-body contact-config-body">
+          <div className="contact-config-basics">
+            {creating && (
               <label className="field">
                 类型
                 <select value={createKind} onChange={(e) => setCreateKind(e.target.value as 'api' | 'room')}>
@@ -178,18 +192,16 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                   <option value="room">群聊（拉现有联系人）</option>
                 </select>
               </label>
-            </div>
-          )}
-          <div className="field-row">
-            <label className="field" style={{ flex: 2 }}>
+            )}
+            <label className="field field-wide">
               名称
               <input value={name} onChange={(e) => setName(e.target.value)} placeholder="比如 GLM" />
             </label>
-            <label className="field" style={{ flex: 1 }}>
+            <label className="field">
               头像
               <input value={avatar} onChange={(e) => setAvatar(e.target.value)} placeholder="🤖" />
             </label>
-            <label className="field" style={{ flex: 1 }}>
+            <label className="field">
               颜色
               <input type="color" value={color} onChange={(e) => setColor(e.target.value)} />
             </label>
@@ -203,364 +215,88 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
           )}
 
           {isRoom && !advanced && (
-            <fieldset className="mem-toggles">
-              <legend>群成员</legend>
-              {dmContacts.map((c) => (
-                <label key={c.id}>
-                  <input
-                    type="checkbox"
-                    checked={members.includes(c.id)}
-                    onChange={() => toggleMember(c.id)}
-                  />
-                  {c.avatar} {c.name}
-                  <span className="field-hint" style={{ marginLeft: 6 }}>
-                    ({c.backend})
-                  </span>
-                </label>
-              ))}
-              <p className="field-hint">
-                群里用 @名字 点名，@all 叫全员；默认无 @ 时不调用模型，避免无意消耗。
-              </p>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={respondAllByDefault}
-                  onChange={(e) => setRespondAllByDefault(e.target.checked)}
-                />
-                无 @ 时默认全员响应（更热闹，也更耗 token）
-              </label>
-              <label className="field" style={{ maxWidth: 160 }}>
-                接话轮数（0-3）
-                <input
-                  type="number"
-                  min={0}
-                  max={3}
-                  value={reactionRounds}
-                  onChange={(e) => setReactionRounds(Math.min(3, Math.max(0, Number(e.target.value) || 0)))}
-                />
-              </label>
-              <p className="field-hint">
-                每轮点名发言后，成员会看到彼此的新发言并可自然接话（或沉默）。0 = 关闭，回到纯点名制。
-              </p>
-            </fieldset>
+            <RoomFields
+              contacts={dmContacts}
+              members={members}
+              reactionRounds={reactionRounds}
+              respondAllByDefault={respondAllByDefault}
+              onToggleMember={toggleMember}
+              onReactionRounds={setReactionRounds}
+              onRespondAll={setRespondAllByDefault}
+            />
           )}
 
           {isApi && !advanced && (
-            <>
-              <div className="field-row">
-                <label className="field" style={{ flex: 1 }}>
-                  协议
-                  <select value={provider} onChange={(e) => setProvider(e.target.value)}>
-                    <option value="openai-compat">OpenAI 兼容（GLM/DeepSeek/…）</option>
-                    <option value="anthropic">Anthropic</option>
-                    <option value="gemini">Gemini 原生</option>
-                  </select>
-                </label>
-                <label className="field" style={{ flex: 1 }}>
-                  模型
-                  <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="glm-4-plus" />
-                </label>
-              </div>
-              <label className="field">
-                图片模型（可选）
-                <input
-                  value={visionModel}
-                  onChange={(e) => setVisionModel(e.target.value)}
-                  placeholder="例如 qwen3-vl-plus；留空则沿用普通模型"
-                />
-                <span className="field-hint">只在消息含图片时使用，不改变日常文字聊天模型。</span>
-              </label>
-              <label className="field">
-                图片支持
-                <select
-                  value={imageSupport}
-                  onChange={(e) => setImageSupport(e.target.value as 'auto' | 'on' | 'off')}
-                >
-                  <option value="auto">自动（按模型判断，deepseek 等纯文字模型自动去图）</option>
-                  <option value="on">支持（多模态模型）</option>
-                  <option value="off">不支持（纯文字，含图历史降级为文字占位）</option>
-                </select>
-                <span className="field-hint">
-                  未配图片模型时，纯文字模型收到含图历史会剥掉图片、换成占位，避免上游拒收 image_url。
-                </span>
-              </label>
-              <label className="field">
-                完整 API URL
-                <input
-                  value={baseUrl}
-                  onChange={(e) => setBaseUrl(e.target.value)}
-                  placeholder={
-                    provider === 'anthropic'
-                      ? 'https://api.anthropic.com/v1/messages'
-                      : provider === 'gemini'
-                        ? 'https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse'
-                        : 'https://api.openai.com/v1/chat/completions'
-                  }
-                />
-                <span className="field-hint">
-                  请求会原样发到这个地址，不再自动追加 /v1/… 路径。
-                  {provider === 'gemini' ? ' Gemini 原生地址可用 {model} 占位，以便图片模型自动切换。' : ''}
-                </span>
-              </label>
-              <label className="field">
-                API Key
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder={cfg.apiKey ? `已设置（${cfg.apiKey}），留空不改` : 'sk-…'}
-                />
-              </label>
-              <label className="field">
-                人设 / 系统提示
-                <textarea
-                  rows={3}
-                  value={systemPrompt}
-                  onChange={(e) => setSystemPrompt(e.target.value)}
-                  placeholder="这个 AI 是谁、怎么说话"
-                />
-              </label>
-              <div className="field-row">
-                <label className="field" style={{ flex: 1 }}>
-                  历史条数
-                  <input
-                    type="number"
-                    min={2}
-                    max={200}
-                    value={maxHistory}
-                    onChange={(e) => setMaxHistory(Number(e.target.value) || 60)}
-                  />
-                </label>
-                <label className="field" style={{ flex: 1 }}>
-                  历史 token 预算
-                  <input
-                    type="number"
-                    min={2048}
-                    step={1000}
-                    value={historyTokenBudget}
-                    onChange={(e) => setHistoryTokenBudget(Math.max(2048, Number(e.target.value) || 8000))}
-                  />
-                </label>
-                <label className="field" style={{ flex: 1 }}>
-                  至少保留近期轮数
-                  <input
-                    type="number"
-                    min={1}
-                    max={30}
-                    value={minRecentTurns}
-                    onChange={(e) => setMinRecentTurns(Math.min(30, Math.max(1, Number(e.target.value) || 6)))}
-                  />
-                </label>
-              </div>
-              <div className="field-row">
-                <label className="field" style={{ flex: 1 }}>
-                  滚动摘要上限（token）
-                  <input
-                    type="number"
-                    min={256}
-                    step={250}
-                    value={summaryMaxTokens}
-                    onChange={(e) => setSummaryMaxTokens(Math.max(256, Number(e.target.value) || 3000))}
-                  />
-                </label>
-                <label className="field" style={{ flex: 1 }}>
-                  记忆前缀
-                  <select
-                    value={memoryPreambleMode}
-                    onChange={(e) => setMemoryPreambleMode(e.target.value as 'full' | 'compact' | 'off')}
-                  >
-                    <option value="compact">compact（推荐，核心身份 + 动态检索）</option>
-                    <option value="full">full（完整 get_context）</option>
-                    <option value="off">off（不注入固定前缀）</option>
-                  </select>
-                </label>
-              </div>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={historySummary}
-                  onChange={(e) => setHistorySummary(e.target.checked)}
-                />
-                超预算时持久化滚动摘要（关闭后只裁剪旧原文）
-              </label>
-              <p className="field-hint">
-                历史条数是硬上限；token 预算先保近期原文，再把更早消息压成联系人独立摘要。
-                编辑/删除若落在摘要覆盖区会局部重建该窗，只改近期原文则保留摘要；供应商窗口会再预留输出/工具/附件空间。
-              </p>
-              <fieldset className="mem-toggles">
-                <legend>记忆库</legend>
-                <label>
-                  <input type="checkbox" checked={memInject} onChange={(e) => setMemInject(e.target.checked)} />
-                  开局注入核心记忆
-                </label>
-                <label>
-                  <input type="checkbox" checked={memSearch} onChange={(e) => setMemSearch(e.target.checked)} />
-                  每轮自动检索
-                </label>
-                <label>
-                  <input type="checkbox" checked={memCapture} onChange={(e) => setMemCapture(e.target.checked)} />
-                  触发词自动记录
-                </label>
-              </fieldset>
-            </>
+            <ApiFields
+              provider={provider}
+              model={model}
+              visionModel={visionModel}
+              imageSupport={imageSupport}
+              baseUrl={baseUrl}
+              apiKey={apiKey}
+              apiKeyPlaceholder={cfg.apiKey ? `已设置（${cfg.apiKey}），留空不改` : 'sk-…'}
+              systemPrompt={systemPrompt}
+              maxHistory={maxHistory}
+              historyTokenBudget={historyTokenBudget}
+              minRecentTurns={minRecentTurns}
+              summaryMaxTokens={summaryMaxTokens}
+              memoryPreambleMode={memoryPreambleMode}
+              promptCache={promptCache}
+              historySummary={historySummary}
+              memInject={memInject}
+              memSearch={memSearch}
+              memCapture={memCapture}
+              onProvider={setProvider}
+              onModel={setModel}
+              onVisionModel={setVisionModel}
+              onImageSupport={setImageSupport}
+              onBaseUrl={setBaseUrl}
+              onApiKey={setApiKey}
+              onSystemPrompt={setSystemPrompt}
+              onMaxHistory={setMaxHistory}
+              onHistoryTokenBudget={setHistoryTokenBudget}
+              onMinRecentTurns={setMinRecentTurns}
+              onSummaryMaxTokens={setSummaryMaxTokens}
+              onMemoryPreambleMode={setMemoryPreambleMode}
+              onPromptCache={setPromptCache}
+              onHistorySummary={setHistorySummary}
+              onMemInject={setMemInject}
+              onMemSearch={setMemSearch}
+              onMemCapture={setMemCapture}
+            />
           )}
 
           {!isRoom && !isApi && !advanced && (
-            <fieldset className="mem-toggles">
-              <legend>项目权限</legend>
-              {contact?.backend === 'grok-cli' ? (
-                <p className="field-hint">grok-cli 后端暂不支持项目写权限。</p>
-              ) : (
-              <label>
-                <input
-                  type="checkbox"
-                  checked={projectEnabled}
-                  onChange={(e) => setProjectEnabled(e.target.checked)}
-                />
-                允许这个联系人修改指定项目
-              </label>
-              )}
-              {projectEnabled && contact?.backend !== 'grok-cli' && (
-                <>
-                  <label className="field">
-                    项目工作区（必须已存在，不能填磁盘根目录）
-                    <input
-                      value={projectWorkspace}
-                      onChange={(e) => setProjectWorkspace(e.target.value)}
-                      placeholder="/opt/my-project 或 E:\\projects\\my-project"
-                    />
-                  </label>
-                  {contact?.backend === 'claude-cli' && (
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={projectShell}
-                        onChange={(e) => setProjectShell(e.target.checked)}
-                      />
-                      同时允许 Bash（可运行测试/构建，风险更高）
-                    </label>
-                  )}
-                  <p className="field-hint">
-                    默认仍只读。开启后 Claude 获得 Read/Write/Edit，Codex 使用 workspace-write；工具调用会保留在聊天审计记录中，可随时关闭。
-                  </p>
-                </>
-              )}
-              <label className="field" style={{ maxWidth: 240 }}>
-                换新会话阈值（输入 token，0 = 关闭）
-                <input
-                  type="number"
-                  min={0}
-                  step={10000}
-                  value={sessionTokenLimit}
-                  onChange={(e) => setSessionTokenLimit(Math.max(0, Number(e.target.value) || 0))}
-                />
-              </label>
-              <p className="field-hint">达到阈值后自动开启新 thread，并注入最近对话的压缩回放与最新记忆。</p>
-            </fieldset>
+            <CliFields
+              contact={contact!}
+              projectEnabled={projectEnabled}
+              projectWorkspace={projectWorkspace}
+              projectShell={projectShell}
+              sessionTokenLimit={sessionTokenLimit}
+              onProjectEnabled={setProjectEnabled}
+              onProjectWorkspace={setProjectWorkspace}
+              onProjectShell={setProjectShell}
+              onSessionTokenLimit={setSessionTokenLimit}
+            />
           )}
 
           {!isRoom && !advanced && (
-            <fieldset className="mem-toggles">
-              <legend>PC Worker 委派</legend>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={delegEnabled}
-                  onChange={(e) => setDelegEnabled(e.target.checked)}
-                />
-                允许这个联系人把编码任务派给 PC Worker
-              </label>
-              {delegEnabled && (
-                <>
-                  <div className="deleg-workspaces">
-                    <span className="field-hint">workspace 白名单（PC 上的绝对路径，派单只能落在这些目录里）</span>
-                    {delegWorkspaces.length === 0 && (
-                      <p className="field-hint deleg-empty">⚠ 白名单为空时无法派单</p>
-                    )}
-                    {delegWorkspaces.map((ws) => (
-                      <div className="deleg-workspace-row" key={ws}>
-                        <code>{ws}</code>
-                        <button
-                          type="button"
-                          aria-label={`移除 ${ws}`}
-                          onClick={() => setDelegWorkspaces((prev) => prev.filter((w) => w !== ws))}
-                        >
-                          ×
-                        </button>
-                      </div>
-                    ))}
-                    <div className="deleg-workspace-add">
-                      <input
-                        value={delegWorkspaceDraft}
-                        placeholder="C:\projects\my-repo"
-                        onChange={(e) => setDelegWorkspaceDraft(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            addDelegWorkspace();
-                          }
-                        }}
-                      />
-                      <button type="button" onClick={addDelegWorkspace} disabled={!delegWorkspaceDraft.trim()}>
-                        添加
-                      </button>
-                    </div>
-                  </div>
-                  <div className="deleg-workspaces">
-                    <span className="field-hint">允许使用的本机 runner（至少保留一个）</span>
-                    <div className="field-row">
-                      {[
-                        ['claude', 'Claude'],
-                        ['codex', 'Codex'],
-                        ['grok', 'Grok'],
-                      ].map(([runner, label]) => (
-                        <label key={runner}>
-                          <input
-                            type="checkbox"
-                            checked={delegRunners.includes(runner)}
-                            onChange={() =>
-                              setDelegRunners((prev) =>
-                                prev.includes(runner)
-                                  ? prev.length > 1
-                                    ? prev.filter((item) => item !== runner)
-                                    : prev
-                                  : [...prev, runner]
-                              )
-                            }
-                          />
-                          {label}
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={delegShell}
-                      onChange={(e) => setDelegShell(e.target.checked)}
-                    />
-                    允许派带 Shell 的任务（Codex 任务必需；风险更高）
-                  </label>
-                  <label className="field" style={{ maxWidth: 200 }}>
-                    同时在跑/在排任务上限
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      value={delegMaxJobs}
-                      onChange={(e) => setDelegMaxJobs(Math.min(10, Math.max(1, Number(e.target.value) || 3)))}
-                    />
-                  </label>
-                  <p className="field-hint">
-                    SSH 等高影响能力永远不给模型，只能在 🖥 面板手动派。委派任务会以子会话形式挂在原聊天消息下。
-                    {contact?.backend === 'codex' &&
-                      ' Codex 会按联系人自动接入 hub MCP，无需修改全局 config.toml。'}
-                    {contact?.backend === 'grok-cli' &&
-                      ' Grok 使用部署机受信任的用户级 hub MCP；这里只控制是否授权委派，并仅自动批准这个接口。'}
-                  </p>
-                </>
-              )}
-            </fieldset>
+            <DelegationFields
+              contact={contact}
+              enabled={delegEnabled}
+              workspaces={delegWorkspaces}
+              runners={delegRunners}
+              workspaceDraft={delegWorkspaceDraft}
+              allowShell={delegShell}
+              maxOpenJobs={delegMaxJobs}
+              onEnabled={setDelegEnabled}
+              onWorkspaces={setDelegWorkspaces}
+              onRunners={setDelegRunners}
+              onWorkspaceDraft={setDelegWorkspaceDraft}
+              onAddWorkspace={addDelegWorkspace}
+              onAllowShell={setDelegShell}
+              onMaxOpenJobs={setDelegMaxJobs}
+            />
           )}
 
           <label className="advanced-toggle">

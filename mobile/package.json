@@ -1,7 +1,7 @@
 {
   "name": "ai-hub-mobile",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "ai-hub Android 伴侣壳（Capacitor）：打包 web/dist，连接远端 hub 网关",
   "scripts": {
     "sync": "cap sync android"
@@ -10,7 +10,10 @@
     "@capacitor/android": "^7.0.0",
     "@capacitor/app": "^7.0.0",
     "@capacitor/core": "^7.0.0",
-    "@capacitor/local-notifications": "^7.0.0"
+    "@capacitor/filesystem": "^7.1.8",
+    "@capacitor/local-notifications": "^7.0.0",
+    "@capacitor/status-bar": "^7.0.0",
+    "@capawesome-team/capacitor-file-opener": "^7.0.1"
   },
   "devDependencies": {
     "@capacitor/cli": "^7.0.0"

@@ -2,12 +2,13 @@
 // 不 import 任何 Capacitor npm 包：原生壳会把桥注入成 window.Capacitor，
 // 这里全部走桥的全局对象，Web 部署下所有函数都是 no-op，构建产物两端共用。
 
-interface CapacitorGlobal {
+export interface CapacitorGlobal {
   isNativePlatform?: () => boolean;
   Plugins?: {
     App?: {
       addListener: (event: 'backButton', cb: (data: { canGoBack?: boolean }) => void) => void;
       minimizeApp: () => Promise<void>;
+      getInfo: () => Promise<{ version: string; build: string }>;
     };
     LocalNotifications?: {
       requestPermissions: () => Promise<{ display: string }>;
@@ -15,11 +16,43 @@ interface CapacitorGlobal {
         notifications: Array<{ id: number; title: string; body: string }>;
       }) => Promise<unknown>;
     };
+    StatusBar?: {
+      setOverlaysWebView: (opts: { overlay: boolean }) => Promise<void>;
+      setStyle: (opts: { style: 'DARK' | 'LIGHT' | 'DEFAULT' }) => Promise<void>;
+    };
+    Filesystem?: {
+      writeFile: (opts: {
+        path: string; data: string; directory: 'DATA'; recursive?: boolean; encoding?: 'utf8';
+      }) => Promise<{ uri: string }>;
+      mkdir: (opts: {
+        path: string; directory: 'DATA'; recursive?: boolean;
+      }) => Promise<void>;
+      getUri: (opts: { path: string; directory: 'DATA' }) => Promise<{ uri: string }>;
+      readdir: (opts: { path: string; directory: 'DATA' }) => Promise<{
+        files: Array<{ name: string; type: 'file' | 'directory'; mtime?: number }>;
+      }>;
+      rmdir: (opts: { path: string; directory: 'DATA'; recursive?: boolean }) => Promise<void>;
+    };
+    FileOpener?: {
+      openFile: (opts: { path: string; mimeType?: string }) => Promise<void>;
+    };
+    WebView?: {
+      setServerAssetPath: (opts: { path: string }) => Promise<void>;
+      setServerBasePath: (opts: { path: string }) => Promise<void>;
+      getServerBasePath: () => Promise<{ path: string }>;
+      persistServerBasePath: () => Promise<void>;
+    };
   };
 }
 
 const cap = (): CapacitorGlobal | undefined =>
   (window as { Capacitor?: CapacitorGlobal }).Capacitor;
+
+export type NativePlugins = NonNullable<CapacitorGlobal['Plugins']>;
+
+export function getNativePlugins(): NativePlugins | undefined {
+  return cap()?.Plugins;
+}
 
 export const isNativeShell = (): boolean => cap()?.isNativePlatform?.() === true;
 
@@ -51,10 +84,12 @@ export function withBase(path: string): string {
   return base + path;
 }
 
-/** 壳内一次性初始化：Android 返回键最小化（SPA 无历史路由）+ 申请通知权限。 */
+/** 壳内一次性初始化：状态栏安全区 + Android 返回键最小化 + 通知权限。 */
 export function initNativeShell(): void {
   if (!isNativeShell()) return;
   const plugins = cap()?.Plugins;
+  void plugins?.StatusBar?.setOverlaysWebView({ overlay: true }).catch(() => {});
+  void plugins?.StatusBar?.setStyle({ style: 'DARK' }).catch(() => {});
   plugins?.App?.addListener('backButton', () => {
     void plugins.App?.minimizeApp();
   });

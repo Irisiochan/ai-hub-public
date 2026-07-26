@@ -1,14 +1,15 @@
 import { notifyIncoming, withBase } from './mobileShell';
 import { SHANGHAI_TZ_OFFSET } from './time';
+import type { ContactBackend, ContactConfig, ContactKind } from '@ai-hub/contact-config';
 
 export interface Contact {
   id: string;
   name: string;
   avatar: string;
   color: string;
-  backend: string;
-  kind: string;
-  config: Record<string, unknown>;
+  backend: ContactBackend;
+  kind: ContactKind;
+  config: ContactConfig;
   state: string;
   /** Busy room member display name from server statusOf (undefined for DM/idle). */
   member?: string;
@@ -331,7 +332,15 @@ export interface SseHandlers {
   onReconnect(): void;
 }
 
-export function connectEvents(handlers: SseHandlers): () => void {
+export interface EventConnection {
+  disconnect(): void;
+  refresh(): void;
+}
+
+export function connectEvents(
+  handlers: SseHandlers,
+  subscriptions: () => string[] = () => []
+): EventConnection {
   let es: EventSource | null = null;
   let closed = false;
   let hadError = false;
@@ -339,7 +348,8 @@ export function connectEvents(handlers: SseHandlers): () => void {
   const open = () => {
     if (closed) return;
     es?.close();
-    es = new EventSource(withBase('/api/events'));
+    const query = new URLSearchParams({ subscribe: subscriptions().join(',') });
+    es = new EventSource(withBase(`/api/events?${query}`));
     es.onopen = () => {
       if (hadError) {
         hadError = false;
@@ -374,9 +384,12 @@ export function connectEvents(handlers: SseHandlers): () => void {
   };
   document.addEventListener('visibilitychange', onVisible);
 
-  return () => {
-    closed = true;
-    document.removeEventListener('visibilitychange', onVisible);
-    es?.close();
+  return {
+    disconnect: () => {
+      closed = true;
+      document.removeEventListener('visibilitychange', onVisible);
+      es?.close();
+    },
+    refresh: open,
   };
 }

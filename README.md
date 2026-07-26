@@ -17,9 +17,19 @@
 - **版本化长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档；两仓只通过 MCP 契约连接
 - **语义化记忆捕捉**：廉价规则先筛选候选，再由 DeepSeek 以固定 JSON schema 精筛；高置信度内容进入 inbox、明确误报丢弃，低置信度或 API 故障标记为待审，不阻断聊天
 - **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
-  任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
+  任务以可折叠子会话挂回原消息；支持模型/推理档位、暂停/取消/重试、并行 workspace、
+  进程重连与可恢复的本地状态，完成后自动回执验收
+- **移动端优先 UI**：手机使用底部操作区、全屏设置/Worker 日志和 safe-area 适配，
+  横屏配置页也不会挤出屏幕
+- **可选主动 triage**：DeepSeek 严格 JSON 分流之外，还能按安静时段和独立配额做每日轻量问候，
+  或由主持人发起群聊 idea 讨论并在回合结束后汇总
+- **时间与群聊防串台**：历史消息/摘要带上海绝对时间锚；群成员与主持人发言包装为不可执行引用，
+  避免把旧话题当刚发生、把成员内容误认成用户指令
+- **API 成本优化**：按供应商拆分直连实现，支持 OpenAI-compatible / Anthropic prompt cache
+  用量观测与策略、Gemini 原生 usage，模型目录可热更新
 - **订阅额度可见**：Claude / Codex 标题栏实时显示 5h / 周窗口剩余
-- **桌面与 Android 壳**：Electron 支持本地/远程 Hub，Capacitor 伴侣 App 可由 Actions 生成 APK
+- **桌面与 Android 壳**：Electron 支持本地/远程 Hub；Capacitor 伴侣 App 可由 Actions 生成 APK，
+  并支持校验 SHA-256 后的 Web 热更新与新版 APK 兜底
 - **运维内建**：token 门控的一键部署端点（拉取/构建/重启/健康检查/失败自动回滚）、
   SQLite 在线定时备份（integrity 校验 + 保留窗口）、发布状态面板
 
@@ -77,6 +87,10 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
   `memory-vault-mcp --vault <数据目录> --http --host 127.0.0.1 --port 8900`，再在
   `server/config.json` 将 `memory.mcpUrl` 指向 `http://127.0.0.1:8900/mcp`
 - 联系人级配置存在 DB（UI 可改）：模型、人设、记忆三开关、委派权限等
+- 模型下拉的内置目录可由 `server/model-catalog.json` 覆盖（模板：
+  `server/model-catalog.example.json`）；保存后热加载，也可用 `HUB_MODEL_CATALOG` 指向别处
+- Android 应用内更新文件默认放在 `server/data/releases/`（Linux 默认
+  `/var/lib/ai-hub/releases`），可用 `HUB_RELEASES_DIR` 覆盖
 - Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是 Claude 配置模板；
   `mcp.gateway.json` 与 `.grok/config.toml` 是网关按需生成的 MCP 配置
 - 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`HUB_MCP_TOKEN`、`DEEPSEEK_API_KEY`
@@ -138,6 +152,10 @@ npm run smoke:memory-contract --prefix server
 
 - `desktop/`：Electron 壳；默认运行本地网关，也可在 `desktop.json` 中指向已有远程 Hub。
 - `mobile/`：Capacitor Android 伴侣壳；`.github/workflows/android.yml` 可生成签名 APK artifact。
+- `server/scripts/build-app-release.mjs`：把当前 `web/dist` 打成确定性 ZIP、计算 SHA-256，
+  并更新 `latest.json`；App 只接受 `/releases/` 下的同源文件。
+- `server/scripts/publish-apk-release.mjs`：校验下载 APK 的 SHA-256 后再写入发布目录，
+  作为 Web 热更新无法兼容时的原生版本兜底。
 - 两者都是同一套 Web UI 的消费端，不复制 Memory Vault 实现；远程模式仍应只连接受保护的私网 Hub。
 
 ## 安全模型与威胁边界

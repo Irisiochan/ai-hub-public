@@ -1,0 +1,110 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { buildRunnerSpec, supportsResume } from './runner.mjs';
+
+const baseJob = {
+  id: 'job-1',
+  workspace: 'C:/workspace',
+  prompt: 'do the work',
+  deliveryContract: 'SERVER DELIVERY CONTRACT',
+  permissions: { write: false, shell: false, ssh: false },
+  options: {},
+};
+
+test('server delivery contract is passed through to runner prompt', () => {
+  const spec = buildRunnerSpec({ ...baseJob, runner: 'claude' }, {}, { platform: 'win32' });
+  assert.match(spec.stdin, /SERVER DELIVERY CONTRACT/);
+  assert.match(spec.stdin, /do the work/);
+});
+
+test('claude permission table separates read, write and shell profiles', () => {
+  const read = buildRunnerSpec({ ...baseJob, runner: 'claude' }, {}, { platform: 'win32' });
+  assert.equal(read.args[read.args.indexOf('--allowedTools') + 1], 'Read,Grep,Glob');
+  assert.equal(read.args[read.args.indexOf('--disallowedTools') + 1], 'Bash');
+
+  const write = buildRunnerSpec({
+    ...baseJob,
+    runner: 'claude',
+    permissions: { write: true, shell: false },
+  }, {}, { platform: 'win32' });
+  assert.equal(write.args[write.args.indexOf('--allowedTools') + 1], 'Read,Grep,Glob,Write,Edit');
+  assert.equal(write.args[write.args.indexOf('--disallowedTools') + 1], 'Bash');
+
+  const shell = buildRunnerSpec({
+    ...baseJob,
+    runner: 'claude',
+    permissions: { write: true, shell: true },
+  }, {}, { platform: 'win32' });
+  assert.equal(shell.args[shell.args.indexOf('--allowedTools') + 1], 'Read,Grep,Glob,Write,Edit,Bash');
+  assert.equal(shell.args.includes('--disallowedTools'), false);
+});
+
+test('grok permission table and resume arguments are deterministic', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-runner-test-'));
+  try {
+    const spec = buildRunnerSpec({
+      ...baseJob,
+      runner: 'grok',
+      session_id: 'session_123',
+      permissions: { write: true, shell: false },
+    }, { grokModel: 'grok-code' }, { tmpdir: dir, platform: 'win32' });
+    assert.equal(spec.args[spec.args.indexOf('--disallowed-tools') + 1], 'run_terminal_command');
+    assert.equal(spec.args.includes('--always-approve'), true);
+    assert.deepEqual(spec.args.slice(spec.args.indexOf('-r'), spec.args.indexOf('-r') + 2), ['-r', 'session_123']);
+    assert.match(fs.readFileSync(spec.args[1], 'utf8'), /SERVER DELIVERY CONTRACT/);
+    spec.cleanup();
+    assert.equal(fs.existsSync(spec.args[1]), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('codex resume and fresh execution keep their distinct CLI forms', () => {
+  const fresh = buildRunnerSpec({
+    ...baseJob,
+    runner: 'codex',
+    permissions: { write: true, shell: true },
+  }, {}, { platform: 'win32' });
+  assert.deepEqual(fresh.args.slice(0, 2), ['exec', '--json']);
+  assert.equal(fresh.args.includes('--sandbox'), true);
+
+  const resumed = buildRunnerSpec({
+    ...baseJob,
+    runner: 'codex',
+    session_id: 'thread-123',
+    permissions: { write: true, shell: true },
+  }, {}, { platform: 'win32' });
+  assert.deepEqual(resumed.args.slice(0, 3), ['exec', 'resume', '--json']);
+  assert.equal(resumed.args.includes('thread-123'), true);
+});
+
+test('codex reasoning effort uses the supported config override for fresh and resumed runs', () => {
+  const fresh = buildRunnerSpec({
+    ...baseJob,
+    runner: 'codex',
+    options: { reasoning: 'high' },
+  }, {}, { platform: 'win32' });
+  assert.equal(fresh.args.includes('--reasoning-effort'), false);
+  const effortIndex = fresh.args.indexOf('model_reasoning_effort="high"');
+  assert.notEqual(effortIndex, -1);
+  assert.equal(fresh.args[effortIndex - 1], '--config');
+
+  const resumed = buildRunnerSpec({
+    ...baseJob,
+    runner: 'codex',
+    session_id: 'thread-123',
+    options: { reasoning: 'max' },
+  }, {}, { platform: 'win32' });
+  assert.equal(resumed.args.includes('--reasoning-effort'), false);
+  assert.equal(resumed.args.includes('model_reasoning_effort="max"'), true);
+});
+
+test('all configured runners advertise one-shot resume support', () => {
+  assert.equal(supportsResume('claude'), true);
+  assert.equal(supportsResume('codex'), true);
+  assert.equal(supportsResume('grok'), true);
+  assert.equal(supportsResume('other'), false);
+});

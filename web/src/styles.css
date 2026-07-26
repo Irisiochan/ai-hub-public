@@ -16,12 +16,34 @@
   --bubble-theirs: #26263a;
   --error: #e05e5e;
   --text-muted: #8a8aa0; /* worker 面板样式引用的别名，与 --text-dim 一致 */
+  /* viewport-fit=cover 下尊重刘海/状态栏/手势条；无 inset 的环境回退 0 */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
 }
 
-html,
-body,
-#root {
+html {
+  width: 100%;
   height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  width: 100%;
+  height: 100%;
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -29,13 +51,24 @@ body {
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
     'Microsoft YaHei', sans-serif;
-  overscroll-behavior: none;
 }
 
 .app {
+  position: absolute;
+  inset: 0;
   display: flex;
+  width: 100%;
   height: 100%;
-  height: 100dvh;
+  overflow: hidden;
+}
+
+/* iOS WebKit 会自动放大不足 16px 的表单控件，随后 visual viewport 可被拖动。 */
+@media (hover: none) and (pointer: coarse) {
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
 }
 
 /* ── contact list ─────────────────────────── */
@@ -45,15 +78,21 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--bg-panel);
+  min-height: 0;
+  overflow: hidden;
   border-right: 1px solid var(--border);
 }
 
 .contact-list-header {
   padding: 14px 16px;
+  padding-top: calc(14px + var(--safe-top));
+  padding-left: calc(16px + var(--safe-left));
+  padding-right: calc(16px + var(--safe-right));
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: space-between;
+  background: var(--bg-panel);
 }
 
 .add-btn {
@@ -185,7 +224,10 @@ body {
 
 .contact-scroll {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .contact-item {
@@ -280,6 +322,8 @@ body {
   flex-direction: column;
   min-width: 0;
   height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .chat-empty {
@@ -294,10 +338,26 @@ body {
 .chat-header {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px 10px;
   padding: 10px 14px;
+  padding-top: calc(10px + var(--safe-top));
+  padding-left: calc(14px + var(--safe-left));
+  padding-right: calc(14px + var(--safe-right));
   border-bottom: 1px solid var(--border);
   background: var(--bg-panel);
+}
+
+/* 控件组作为整体换行：标题挤不下时整组落到第二行，而不是把标题压没 */
+.chat-header-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-left: auto;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .chat-header .avatar {
@@ -319,12 +379,41 @@ body {
   flex: 1;
   display: flex;
   flex-direction: column;
-  min-width: 0;
+  /* 保底宽度参与换行计算：低于它时控件组整体换行，标题不再被压成几个字 */
+  min-width: 120px;
 }
 
-.chat-title span:first-child {
+.chat-title-name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+
+.chat-title-name > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 600;
   font-size: 16px;
+}
+
+.chat-title-caret {
+  display: none;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  font-size: 14px;
+  line-height: 1;
+  transform: translateY(-2px);
 }
 
 .chat-status {
@@ -515,7 +604,17 @@ body {
 .worker-panel > header small, .job-detail-head small { display: block; color: var(--text-muted); font-weight: normal; margin-top: 3px; }
 .worker-panel > header button { border: 0; background: none; color: var(--text); font-size: 26px; cursor: pointer; }
 .worker-strip { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid var(--border); }
-.worker-strip input { max-width: 130px; }
+.worker-strip input { max-width: 130px; min-width: 0; }
+.worker-strip > button, .pair-token button {
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 7px;
+  padding: 7px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
 .worker-chip { padding: 5px 9px; border-radius: 999px; background: var(--bg-hover); font-size: 12px; }
 .worker-chip.online, .worker-chip.busy { color: #51d88a; }
 .worker-chip.paused { color: #d6a84b; }
@@ -539,6 +638,7 @@ body {
 .job-list button.selected { background: var(--bg-hover); }
 .job-list button span, .job-list button small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
 .job-list button small { color: var(--text-muted); }
+.job-list-open { color: var(--accent); font-size: 12px; font-style: normal; }
 .job-detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .job-detail-head { padding: 12px; display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); }
 .job-detail-head button { margin-left: 6px; }
@@ -554,7 +654,9 @@ body {
 
 @media (max-width: 720px) {
   .worker-panel { width: 100%; height: 100%; border-radius: 10px; }
-  .job-compose { grid-template-columns: 1fr 1fr; padding: 10px; gap: 7px; }
+  /* minmax(0,1fr)：1fr 的隐式 min-width:auto 会被输入框固有宽度撑出屏幕 */
+  .job-compose { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); padding: 10px; gap: 7px; }
+  .job-compose input:not([type='checkbox']), .job-compose select { min-width: 0; width: 100%; }
   .job-compose textarea { grid-column: 1 / -1; }
   .job-compose button.primary-btn { grid-column: 1 / -1; }
   /* 手机上任务列表改为顶部横滑条，详情占满剩余空间 */
@@ -565,18 +667,22 @@ body {
 }
 
 @media (max-width: 520px) {
-  .chat-header { gap: 8px; padding: 8px 10px; }
+  .chat-header {
+    gap: 8px;
+    padding: 8px 10px;
+    padding-top: calc(8px + var(--safe-top));
+    padding-left: calc(10px + var(--safe-left));
+    padding-right: calc(10px + var(--safe-right));
+  }
   .chat-header .avatar { display: none; }
   .back-btn { padding: 4px 4px; }
   .gear-btn { padding: 4px 4px; }
   .interrupt-btn { padding: 6px 8px; font-size: 12px; white-space: nowrap; }
-  .bulk-tool-btn { padding: 6px 8px; font-size: 12px; white-space: nowrap; }
   .bulk-tool-bar { flex-wrap: wrap; padding: 7px 10px; }
   .bulk-tool-bar button { flex: 1 0 auto; }
-  .model-select { max-width: 96px; flex-shrink: 0; }
   .token-detail-popover {
     position: fixed;
-    top: calc(52px + env(safe-area-inset-top));
+    top: calc(52px + var(--safe-top));
     left: 10px;
     right: 10px;
     width: auto;
@@ -588,11 +694,15 @@ body {
 
 .message-scroll {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 14px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .load-earlier {
@@ -845,7 +955,9 @@ body {
   align-items: flex-end;
   gap: 8px;
   padding: 10px 12px;
-  padding-bottom: calc(10px + env(safe-area-inset-bottom));
+  padding-bottom: calc(10px + var(--safe-bottom));
+  padding-left: calc(12px + var(--safe-left));
+  padding-right: calc(12px + var(--safe-right));
   border-top: 1px solid var(--border);
   background: var(--bg-panel);
 }
@@ -977,12 +1089,16 @@ body {
 .modal-backdrop {
   position: fixed;
   inset: 0;
+  width: 100vw;
+  max-width: 100vw;
   background: rgba(0, 0, 0, 0.55);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 50;
-  padding: 12px;
+  overflow: hidden;
+  padding: max(12px, var(--safe-top)) max(12px, var(--safe-right))
+    max(12px, var(--safe-bottom)) max(12px, var(--safe-left));
 }
 
 .modal {
@@ -991,9 +1107,20 @@ body {
   border-radius: 14px;
   width: 100%;
   max-width: 520px;
+  /* flex 子项的 min-width:auto 会被内容最小宽度撑开、超出手机视口；显式归零 */
+  min-width: 0;
   max-height: 92dvh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header,
+.modal-body,
+.modal-footer {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .modal-header {
@@ -1019,10 +1146,52 @@ body {
 .modal-body {
   padding: 14px 18px;
   overflow-y: auto;
+  overflow-x: clip;
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
+
+.modal-body > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.user-config-modal { max-width: 520px; }
+.app-update-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+.app-update-head, .app-update-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ghost-btn.compact { padding: 6px 10px; font-size: 12px; }
+.app-version-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+}
+.app-version-grid dt { color: var(--text-dim); font-size: 11px; }
+.app-version-grid dd {
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 12px/1.4 Consolas, monospace;
+}
+.app-update-status { color: var(--text-dim); font-size: 13px; }
+.app-update-status.apk, .app-update-status.web { color: #f0b35d; }
+.app-update-status.current { color: #72d6a8; }
+.app-release-notes { margin: 0; color: var(--text-dim); font-size: 12px; line-height: 1.5; }
+.app-update-actions { justify-content: flex-start; }
 
 .publish-panel { max-width: 620px; }
 .publish-body { gap: 14px; }
@@ -1049,7 +1218,12 @@ body {
 
 .field-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: clip;
 }
 
 .field {
@@ -1059,6 +1233,19 @@ body {
   font-size: 13px;
   color: var(--text-dim);
   flex: 1;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* basis 决定换行阈值：窄屏放不下就折行，而不是把弹窗撑出屏幕 */
+.field-row > .field {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+
+.field-row > .field-wide {
+  flex: 2 1 180px;
 }
 
 .field input,
@@ -1071,6 +1258,14 @@ body {
   padding: 8px 10px;
   font-size: 14px;
   font-family: inherit;
+  /* 输入控件固有宽度约 180px，不归零会把整个弹窗的最小宽度撑爆 */
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+}
+
+.field select {
+  text-overflow: ellipsis;
 }
 
 .field input[type='color'] {
@@ -1084,6 +1279,70 @@ body {
 .field textarea:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+.contact-config-modal {
+  max-width: 720px;
+}
+
+.contact-config-basics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+}
+
+.contact-config-basics > .field {
+  flex: 1 1 130px;
+}
+
+.contact-config-basics > .field-wide {
+  flex-grow: 2;
+}
+
+.api-fields-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+}
+
+.config-section {
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 76%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.config-section h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.api-connection-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  min-width: 0;
+}
+
+.api-grid-wide {
+  grid-column: 1 / -1;
+}
+
+.compact-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
 }
 
 .field-hint {
@@ -1175,6 +1434,133 @@ body {
   cursor: pointer;
 }
 
+/* ── bottom sheet（手机端模型/会话选项面板，参考主流 app） ── */
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-end;
+}
+
+.sheet {
+  width: 100%;
+  max-height: 78dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  border-radius: 18px 18px 0 0;
+  padding: 8px 14px calc(16px + var(--safe-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: sheet-up 0.18s ease-out;
+}
+
+@keyframes sheet-up {
+  from { transform: translateY(24px); opacity: 0.6; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.sheet-handle {
+  width: 40px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  margin: 4px auto 0;
+  flex-shrink: 0;
+}
+
+.sheet-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sheet-section h3 {
+  font-size: 13px;
+  font-weight: normal;
+  color: var(--text-dim);
+  padding: 0 2px;
+}
+
+.sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  text-align: left;
+  padding: 12px 14px;
+  cursor: pointer;
+}
+
+.sheet-row.selected {
+  border-color: var(--accent);
+}
+
+.sheet-row:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.sheet-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.sheet-row-main small {
+  color: var(--text-dim);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.sheet-check {
+  color: var(--accent);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.sheet-segment {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sheet-seg-btn {
+  flex: 1 1 0;
+  min-width: 72px;
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  padding: 10px 8px;
+  cursor: pointer;
+}
+
+.sheet-seg-btn.selected {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.sheet-seg-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ── responsive: phone = single screen swap ── */
 
 @media (max-width: 767px) {
@@ -1184,6 +1570,51 @@ body {
 
   .app.chat-open .chat-pane {
     display: flex;
+  }
+
+  /* 顶栏只留 返回+名字/状态+打断+⚙，模型/强度/批量收进点名字弹出的面板 */
+  .chat-header-controls {
+    display: none;
+  }
+
+  .chat-title-name {
+    cursor: pointer;
+  }
+
+  .chat-title-caret {
+    display: inline;
+  }
+
+  /* 弹窗全屏化：手机上居中小窗一定会被宽内容顶爆，直接改成全屏页 */
+  .modal-backdrop {
+    padding: 0;
+    align-items: stretch;
+  }
+
+  .modal {
+    width: 100vw;
+    max-width: 100vw;
+    max-height: none;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .modal-header {
+    padding-top: calc(14px + var(--safe-top));
+  }
+
+  .modal-footer {
+    padding-bottom: calc(14px + var(--safe-bottom));
+  }
+
+  .worker-panel {
+    border: 0;
+    border-radius: 0;
+  }
+
+  .worker-panel > header {
+    padding-top: calc(14px + var(--safe-top));
   }
 }
 
@@ -1206,9 +1637,82 @@ body {
   }
 }
 
+@media (min-width: 1024px) {
+  .contact-config-modal-api {
+    width: min(1180px, calc(100vw - 24px));
+    max-width: min(1180px, calc(100vw - 24px));
+    max-height: calc(100dvh - 24px);
+  }
+
+  .contact-config-modal-api .modal-header {
+    padding: 10px 16px;
+  }
+
+  .contact-config-modal-api .contact-config-body {
+    gap: 8px;
+    padding: 9px 14px;
+    overflow: hidden;
+  }
+
+  .contact-config-modal-api .contact-config-basics {
+    display: grid;
+    grid-template-columns: 1.15fr 1.7fr 0.65fr 0.5fr;
+    gap: 9px;
+  }
+
+  .contact-config-modal-api .api-fields-grid {
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) minmax(220px, 0.78fr);
+    align-items: stretch;
+  }
+
+  .contact-config-modal-api .config-section {
+    padding: 9px 10px;
+    gap: 7px;
+  }
+
+  .contact-config-modal-api .field {
+    gap: 3px;
+    font-size: 12px;
+  }
+
+  .contact-config-modal-api .field input,
+  .contact-config-modal-api .field select,
+  .contact-config-modal-api .field textarea {
+    padding: 6px 8px;
+    font-size: 13px;
+  }
+
+  .contact-config-modal-api .field-hint {
+    font-size: 11px;
+    line-height: 1.35;
+  }
+
+  .contact-config-modal-api .field-row,
+  .contact-config-modal-api .api-connection-grid {
+    gap: 7px;
+  }
+
+  .contact-config-modal-api .mem-toggles {
+    gap: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+
+  .contact-config-modal-api .mem-toggles label,
+  .contact-config-modal-api .advanced-toggle,
+  .contact-config-modal-api .compact-check {
+    font-size: 12px;
+  }
+
+  .contact-config-modal-api .modal-footer {
+    padding: 9px 16px;
+  }
+}
+
 /* ── 委派任务 thread（挂在聊天消息下） ── */
 
 .job-thread {
+  flex-shrink: 0;
   margin: 2px 0 8px 44px;
   max-width: min(640px, calc(100% - 52px));
   border: 1px solid var(--border);
@@ -1257,7 +1761,11 @@ body {
 }
 
 .job-thread-head small { color: var(--text-dim); white-space: nowrap; }
-.job-thread-arrow { color: var(--text-dim); }
+.job-thread-open {
+  color: var(--accent);
+  font-size: 12px;
+  white-space: nowrap;
+}
 
 .job-thread-hide {
   flex-shrink: 0;
@@ -1293,7 +1801,7 @@ body {
   flex-shrink: 0;
   background: var(--text-dim);
 }
-.job-dot.running, .job-dot.claimed { background: var(--accent); animation: pulse 1.4s infinite; }
+.job-dot.running, .job-dot.claimed, .job-dot.recovering { background: var(--accent); animation: pulse 1.4s infinite; }
 .job-dot.pending, .job-dot.pause_requested, .job-dot.cancel_requested { background: #d6a84b; }
 .job-dot.done { background: #51d88a; }
 .job-dot.failed, .job-dot.interrupted { background: var(--error); }
@@ -1303,14 +1811,74 @@ body {
   50% { opacity: 0.35; }
 }
 
-.job-thread-body {
-  border-top: 1px solid var(--border);
-  padding: 10px 12px;
-  max-height: 420px;
-  overflow-y: auto;
+.job-execution-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  background: var(--bg);
+}
+
+.job-execution-modal {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.job-execution-header {
+  flex-shrink: 0;
+  min-height: 58px;
+  padding: max(10px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 10px max(14px, env(safe-area-inset-left));
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--bg-panel);
+}
+
+.job-execution-header > div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.job-execution-header small {
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.job-execution-close {
+  flex-shrink: 0;
+  width: 42px;
+  height: 42px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--bg-hover);
+  color: var(--text);
+  font-size: 25px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.job-execution-scroll {
+  flex: 1;
+  min-height: 0;
+  padding: 14px max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.job-execution-scroll > * {
+  width: min(100%, 1080px);
+  margin-inline: auto;
 }
 
 .job-thread-meta {
@@ -1337,9 +1905,12 @@ body {
 }
 .perm-chip.danger { border-color: var(--error); color: var(--error); }
 
-.job-thread .job-msg { margin-bottom: 0; }
-.job-thread .job-msg.prompt { border-left: 3px solid var(--bubble-mine); }
-.job-thread .job-msg pre { max-height: 240px; overflow-y: auto; }
+.job-thread .job-msg,
+.job-execution-modal .job-msg { margin-bottom: 0; }
+.job-thread .job-msg.prompt,
+.job-execution-modal .job-msg.prompt { border-left: 3px solid var(--bubble-mine); }
+.job-thread .job-msg pre,
+.job-execution-modal .job-msg pre { max-height: none; overflow: visible; }
 
 .job-diff .diff-add { color: #51d88a; }
 .job-diff .diff-del { color: #ef6a6a; }
@@ -1422,7 +1993,12 @@ body {
 
 @media (max-width: 520px) {
   .job-thread { margin-left: 0; max-width: 100%; }
-  .job-thread-body { max-height: 320px; }
+  .job-thread-head { gap: 6px; padding-left: 10px; }
+  .job-thread-brief,
+  .job-thread-head > small,
+  .job-execution-header small { display: none; }
+  .job-thread-open { margin-left: auto; }
+  .job-execution-header { gap: 8px; }
 }
 
 /* external link viewer */
@@ -1439,7 +2015,9 @@ body {
 .external-viewer-bar {
   min-height: 54px;
   padding: 8px 12px;
-  padding-top: calc(8px + env(safe-area-inset-top));
+  padding-top: calc(8px + var(--safe-top));
+  padding-left: calc(12px + var(--safe-left));
+  padding-right: calc(12px + var(--safe-right));
   border-bottom: 1px solid var(--border);
   background: var(--bg-panel);
   display: flex;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { codexAppServerArgs } from '../src/agents/codexAppServer.js';
-import { managedHubMcpConfig } from '../src/agents/manager.js';
+import { managedHubMcpConfig } from '../src/agents/backendFactory.js';
 
 const plain = codexAppServerArgs();
 assert.deepEqual(plain, ['app-server', '--stdio']);

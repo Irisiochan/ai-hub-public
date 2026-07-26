@@ -3,19 +3,24 @@
   "token": "WORKER_ID.PASTE_PAIRING_TOKEN_HERE",
   "name": "my-pc",
   "workspaces": [
-    "C:\\path\\to\\allowed\\workspace"
+    "C:/path/to/code-workspace",
+    {
+      "path": "C:/path/to/managed-vault-content",
+      "deliveryMode": "trust-cli"
+    }
   ],
   "runners": [
     "codex",
     "claude",
     "grok"
   ],
+  "maxConcurrent": 2,
   "codexCommand": "codex.cmd",
   "codexModel": "",
   "codexWindowsSandbox": "unelevated",
   "claudeCommand": "claude.cmd",
   "allowShell": false,
   "allowSsh": false,
-  "grokCommand": "C:\\Users\\YOUR-USER\\.grok\\bin\\grok.exe",
+  "grokCommand": "C:/Users/YOUR-USER/.grok/bin/grok.exe",
   "grokModel": ""
 }

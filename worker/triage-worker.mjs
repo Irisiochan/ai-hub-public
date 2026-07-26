@@ -10,10 +10,14 @@ import {
   dailyPolicyState,
   DEFAULT_CATEGORIES,
   DELIVERY_POOL_DAILY,
+  DELIVERY_POOL_IDEA,
   DELIVERY_POOL_TASK,
+  ideaPolicyState,
   isDailyMode,
+  isIdeaMode,
   isShanghaiSilentHour,
   nextTimerDelay,
+  normalizeIdeaConfig,
   normalizeProactiveConfig,
   shanghaiClock,
   summarizeTaskContext,
@@ -46,6 +50,7 @@ function loadConfig() {
     dailyCostCny: Math.max(0, Number(value.breakers?.dailyCostCny ?? 5)),
   };
   value.proactive = normalizeProactiveConfig(value.proactive ?? {});
+  value.idea = normalizeIdeaConfig(value.idea ?? {});
   return value;
 }
 
@@ -82,7 +87,7 @@ function dispatchPrompt(event, result, { daily = false } = {}) {
   if (daily) {
     return [
       '这是一次已经通过 daily triage 的主动陪伴机会。',
-      '请现在直接用你自己的自然语气对 Iris 说一条简短消息。',
+      '请现在直接用你自己的自然语气对当前 AI Hub 用户说一条简短消息。',
       '不要提及 triage、路由、系统事件、后台判断或 NO_OP；不要复述本指令。',
       '除非上下文里确有具体待办，否则不要登记任务或写长期记忆。',
       `分诊理由：${result.rationale}`,
@@ -159,12 +164,223 @@ class TriageWorker {
     return isDailyMode(event);
   }
 
+  isIdeaEvent(event) {
+    return isIdeaMode(event);
+  }
+
   dailyPolicy(now = Date.now()) {
     return dailyPolicyState(
       this.proactiveConfig(),
       this.store.poolUsage(DELIVERY_POOL_DAILY, now),
       now,
     );
+  }
+
+  ideaConfig() {
+    return this.config.idea ?? normalizeIdeaConfig({});
+  }
+
+  ideaPolicy(now = Date.now()) {
+    return ideaPolicyState(
+      this.ideaConfig(),
+      this.store.poolUsage(DELIVERY_POOL_IDEA, now),
+    );
+  }
+
+  async processIdea(event) {
+    let costCny = Number(event.cost_cny ?? 0);
+    let triageLatencyMs = event.triage_latency_ms === null
+      ? 0
+      : Number(event.triage_latency_ms);
+    let result = event.triageResult?.category === 'idea' ? event.triageResult : null;
+    const idea = this.ideaConfig();
+    const stateError = (error) => {
+      error.ideaState = { costCny, triageLatencyMs, triageResult: result };
+      return error;
+    };
+
+    try {
+      const now = Date.now();
+      if (isShanghaiSilentHour(
+        now,
+        this.proactiveConfig().silentStartHour,
+        this.proactiveConfig().silentEndHour,
+      )) {
+        result = {
+          actionable: false,
+          category: 'idea',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'Shanghai quiet hours',
+        };
+        this.store.finish(event.id, 'noop', { triageResult: result, costCny, triageLatencyMs });
+        log('info', 'idea event suppressed by silent hours', { eventId: event.id });
+        return;
+      }
+      if (this.ideaPolicy(now).poolFull) {
+        result = {
+          actionable: false,
+          category: 'idea',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'idea pool disabled, unconfigured, or exhausted for Shanghai day',
+        };
+        this.store.finish(event.id, 'noop', { triageResult: result, costCny, triageLatencyMs });
+        log('info', 'idea event suppressed by pool policy', { eventId: event.id });
+        return;
+      }
+
+      const contacts = await this.hub.contacts();
+      const room = contacts.find((contact) =>
+        contact.id === idea.roomId && contact.kind === 'room'
+      );
+      if (!room) throw new Error(`idea room is unavailable: ${idea.roomId}`);
+      const memberIds = Array.isArray(room.config?.members) ? room.config.members : [];
+      const memberSet = new Set(memberIds);
+      const members = contacts.filter((contact) =>
+        contact.kind === 'dm' && memberSet.has(contact.id)
+      );
+      if (members.length < 2) throw new Error('idea room needs at least two enabled members');
+
+      if (!result?.topic) {
+        const recentTopics = this.store.recentIdeaTopics(idea.recentTopicLimit);
+        const recentCategories = new Set(
+          recentTopics.slice(0, 2).map((item) => item.category.trim().toLowerCase())
+        );
+        const recentTopicKeys = new Set(
+          recentTopics.map((item) => hash(item.topic.replace(/\s+/g, '').toLowerCase()))
+        );
+        let generated = null;
+        let rejection = 'no valid topic generated';
+        for (let attempt = 1; attempt <= idea.maxTopicAttempts; attempt++) {
+          const response = await this.deepseek.ideaTopic({ room, members, recentTopics });
+          costCny += response.costCny;
+          triageLatencyMs += response.latencyMs;
+          const candidate = response.result;
+          const targetsValid = candidate.targetIds.length === 1 && candidate.targetIds[0] === 'all'
+            || candidate.targetIds.every((targetId) => memberSet.has(targetId));
+          const topicKey = hash(candidate.topic.replace(/\s+/g, '').toLowerCase());
+          if (!targetsValid) {
+            rejection = 'topic selected invalid room targets';
+            continue;
+          }
+          if (recentCategories.has(candidate.category)) {
+            rejection = `topic category repeats one of the previous two: ${candidate.category}`;
+            continue;
+          }
+          if (recentTopicKeys.has(topicKey)) {
+            rejection = 'topic repeats a recent prompt';
+            continue;
+          }
+          generated = candidate;
+          break;
+        }
+        if (!generated) throw new Error(rejection);
+        result = {
+          actionable: true,
+          category: 'idea',
+          priority: 1,
+          suggestedRecipient: room.id,
+          rationale: generated.rationale,
+          ideaCategory: generated.category,
+          topic: generated.topic,
+          targetIds: generated.targetIds,
+          stage: 'topic-generated',
+        };
+      }
+
+      if (!result.roundId) {
+        const mention = result.targetIds.includes('all')
+          ? '@all'
+          : result.targetIds.map((targetId) => {
+            const member = members.find((candidate) => candidate.id === targetId);
+            return `@${member?.name ?? targetId}`;
+          }).join(' ');
+        const opened = await this.hub.dispatchRoomHost(room.id, {
+          content: `${mention} ${result.topic}`,
+          hostName: idea.hostName,
+          targetIds: result.targetIds,
+          reactionRounds: idea.reactionRounds,
+          idempotencyKey: `idea:${event.id}:topic:${event.attempts}`,
+        });
+        result = {
+          ...result,
+          stage: 'round-dispatched',
+          roundId: opened.roundId,
+          topicMessageId: opened.messageId,
+        };
+      }
+
+      let round;
+      try {
+        round = await this.hub.waitRoomRound(room.id, result.roundId, {
+          pollMs: idea.roundPollMs,
+          timeoutMs: idea.roundTimeoutMs,
+        });
+      } catch (error) {
+        if (String(error.message).startsWith('room round failed:')) {
+          result = {
+            ...result,
+            stage: 'topic-generated',
+            roundId: undefined,
+            topicMessageId: undefined,
+          };
+        }
+        throw error;
+      }
+      const rows = await this.hub.messages(room.id, result.topicMessageId, 200);
+      const names = new Map(contacts.map((contact) => [contact.id, contact.name]));
+      const transcript = rows
+        .filter((row) => row.kind === 'text' && row.status === 'done' && row.sender !== 'room-host')
+        .map((row) => `${names.get(row.sender) ?? row.sender}: ${row.content}`)
+        .join('\n')
+        .slice(0, 30_000);
+      if (!transcript) throw new Error('idea room round finished without a visible transcript');
+
+      if (!result.summary) {
+        const summarized = await this.deepseek.ideaSummary({ topic: result.topic, transcript });
+        costCny += summarized.costCny;
+        triageLatencyMs += summarized.latencyMs;
+        result = {
+          ...result,
+          stage: 'summarized',
+          summary: summarized.result.summary,
+          outcome: round.outcome,
+        };
+      }
+
+      const closed = await this.hub.dispatchRoomHost(room.id, {
+        content: result.summary,
+        hostName: idea.hostName,
+        trigger: false,
+        idempotencyKey: `idea:${event.id}:summary`,
+      });
+      result = {
+        ...result,
+        stage: 'completed',
+        summaryMessageId: closed.messageId,
+      };
+      this.store.recordDelivery(event.id, room.id, Date.now(), DELIVERY_POOL_IDEA);
+      this.store.finish(event.id, 'dispatched', {
+        triageResult: result,
+        recipientId: room.id,
+        costCny,
+        triageLatencyMs,
+      });
+      log('info', 'idea discussion completed', {
+        eventId: event.id,
+        roomId: room.id,
+        topicCategory: result.ideaCategory,
+        topicMessageId: result.topicMessageId,
+        summaryMessageId: result.summaryMessageId,
+        outcome: result.outcome,
+        pool: DELIVERY_POOL_IDEA,
+        costCny,
+        triageLatencyMs,
+      });
+    } catch (error) {
+      throw stateError(error);
+    }
   }
 
   async proactiveContext(contacts, now = Date.now()) {
@@ -227,6 +443,11 @@ class TriageWorker {
       if (breaker) {
         this.store.retry(event.id, breaker, 60 * 60_000);
         log('warn', 'breaker deferred event', { eventId: event.id, breaker });
+        return true;
+      }
+
+      if (this.isIdeaEvent(event)) {
+        await this.processIdea(event);
         return true;
       }
 
@@ -420,6 +641,11 @@ class TriageWorker {
         triageLatencyMs,
       });
     } catch (error) {
+      if (error.ideaState) {
+        costCny = error.ideaState.costCny;
+        triageLatencyMs = error.ideaState.triageLatencyMs;
+        triageResult = error.ideaState.triageResult;
+      }
       if (event.attempts >= this.config.maxAttempts) {
         if (this.vault.enabled && triageResult) {
           await this.vault.park(event, triageResult, `dead after ${event.attempts} attempts: ${error.message}`)
@@ -504,18 +730,20 @@ class TriageWorker {
       if (source.type === 'timer') {
         const { intervalMs } = timerSchedule(source);
         const daily = isDailyMode(source);
+        const idea = isIdeaMode(source);
         const emit = () => {
           const now = Date.now();
-          if (daily) {
+          if (daily || idea) {
             const proactive = this.proactiveConfig();
-            if (!proactive.enabled) return;
+            if (daily && !proactive.enabled) return;
+            if (idea && !this.ideaConfig().enabled) return;
             if (isShanghaiSilentHour(now, proactive.silentStartHour, proactive.silentEndHour)) {
-              log('info', 'daily timer skipped: silent hours', { source: source.id });
+              log('info', `${idea ? 'idea' : 'daily'} timer skipped: silent hours`, { source: source.id });
               return;
             }
-            const policy = this.dailyPolicy(now);
+            const policy = idea ? this.ideaPolicy(now) : this.dailyPolicy(now);
             if (policy.poolFull || policy.gapBlocked) {
-              log('info', 'daily timer skipped by proactive policy', {
+              log('info', `${idea ? 'idea' : 'daily'} timer skipped by pool policy`, {
                 source: source.id,
                 reason: policy.poolFull ? 'pool-full' : 'minimum-gap',
               });
@@ -525,9 +753,11 @@ class TriageWorker {
           const policy = daily ? this.dailyPolicy(now) : null;
           this.enqueue({
             source: source.id,
-            categoryHint: source.category ?? (daily ? 'daily' : 'system'),
+            categoryHint: source.category ?? (idea ? 'idea' : daily ? 'daily' : 'system'),
             dedupeKey: `${source.id}:${Math.floor(now / intervalMs)}`,
-            summary: daily
+            summary: idea
+              ? (source.summary ?? 'Daily autonomous room idea discussion.')
+              : daily
               ? buildDailyCheckSummary({
                 ...source,
                 recipients: this.proactiveConfig().recipients,
@@ -538,7 +768,7 @@ class TriageWorker {
               : (source.summary ?? `Scheduled wake from ${source.id}`),
             payload: {
               ...(source.payload && typeof source.payload === 'object' ? source.payload : {}),
-              mode: daily ? 'daily' : 'task',
+              mode: idea ? 'idea' : daily ? 'daily' : 'task',
               emittedAt: now,
             },
           });

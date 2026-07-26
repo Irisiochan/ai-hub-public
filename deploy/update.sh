@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo="${AI_HUB_DIR:-/opt/ai-hub}"
 backup_dir="${AI_HUB_BACKUP_DIR:-/var/backups/ai-hub}"
+release_dir="${AI_HUB_RELEASE_DIR:-/var/lib/ai-hub/releases}"
 
 cd "$repo"
 
@@ -29,10 +30,13 @@ git pull --ff-only
 # lockfiles without rewriting them on a different npm version.
 # && 链式而非依赖 set -e：这个函数会在 if 条件里调用，set -e 在那种上下文不生效。
 build_and_restart() {
+  local web_version
+  web_version="$(git rev-parse --short=12 HEAD)" &&
   npm ci --prefix server --no-audit --no-fund &&
     npm ci --prefix web --no-audit --no-fund &&
     npm run build --prefix server &&
-    npm run build --prefix web &&
+    AI_HUB_WEB_VERSION="$web_version" npm run build --prefix web &&
+    HUB_RELEASES_DIR="$release_dir" AI_HUB_WEB_VERSION="$web_version" node server/scripts/build-app-release.mjs &&
     systemctl restart ai-hub
 }
 

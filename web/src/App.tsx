@@ -24,6 +24,7 @@ export default function App() {
   selectedRef.current = selectedId;
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  const eventsRef = useRef<{ refresh(): void } | null>(null);
 
   const upsertMessage = useCallback((msg: Message) => {
     setMessages((prev) => {
@@ -92,7 +93,7 @@ export default function App() {
 
   useEffect(() => {
     void resync();
-    const disconnect = connectEvents({
+    const connection = connectEvents({
       onMessage: upsertMessage,
       onDelta: ({ contactId, messageId, text }) => {
         setMessages((prev) => {
@@ -129,10 +130,15 @@ export default function App() {
             : [...prev, c];
         }),
       onReconnect: () => void resync(),
-    });
-    return disconnect;
+    }, () => selectedRef.current ? [selectedRef.current] : []);
+    eventsRef.current = connection;
+    return () => connection.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    eventsRef.current?.refresh();
+  }, [selectedId]);
 
   const select = useCallback(
     (id: string | null) => {

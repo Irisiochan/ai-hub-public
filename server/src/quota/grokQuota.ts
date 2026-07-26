@@ -116,7 +116,8 @@ export interface GrokCreditsParse {
 /**
  * GetGrokCreditsConfig 响应（gRPC-web framed 或裸 protobuf）→ 用量。
  * 端点未公开，字段号是从真机样本 + CLI 二进制字段名反推的，全部宽容解析：
- * - creditUsagePercent：顶层 config 消息里的 double（0% 时按 proto3 被省略）
+ * - creditUsagePercent：顶层 config 的 field 1；线上当前是 float，
+ *   兼容旧样本中的 double（0% 时按 proto3 被省略）
  * - 兜底：两个 {val} 包装（monthlyLimit/totalUsed）能除出百分比就用
  * - resetsAt：config 里能解出的最大 Timestamp（周期结束）
  */
@@ -150,7 +151,10 @@ export function parseGrokCredits(body: Buffer): GrokCreditsParse {
       const wrappers: { no: number; val: number }[] = [];
 
       for (const f of fields) {
-        if (f.wire === 1 && f.fixed64 && usedPercent === null) {
+        if (f.no === 1 && f.wire === 5 && f.fixed32 && usedPercent === null) {
+          const v = f.fixed32.readFloatLE(0);
+          if (Number.isFinite(v) && v >= 0 && v <= 100) usedPercent = v;
+        } else if (f.no === 1 && f.wire === 1 && f.fixed64 && usedPercent === null) {
           const v = f.fixed64.readDoubleLE(0);
           if (Number.isFinite(v) && v >= 0 && v <= 100) usedPercent = v;
         } else if (f.wire === 2 && f.bytes) {

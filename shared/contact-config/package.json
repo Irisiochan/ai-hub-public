@@ -1,0 +1,11 @@
+{
+  "name": "@ai-hub/contact-config",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "peerDependencies": {
+    "zod": "^3.25.0"
+  }
+}

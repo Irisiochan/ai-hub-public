@@ -1,24 +1,20 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
-  type ClaudeQuota,
-  type CodexQuota,
-  type GrokQuota,
   type Contact,
   type ContactStatus,
   type Message,
-  type ModelCatalog,
-  type Usage,
   type UserProfile,
   type WorkerJob,
 } from '../api';
-import { DISPLAY_TIME_ZONE } from '../time';
-import { statusText } from '../statusText';
-import { ImageAttachButton, ImagePreviewStrip, usePendingImages } from './ImageComposer';
+import { usePendingImages } from './ImageComposer';
 import { closeExternalLink, type ExternalLinkView, openExternalLink } from '../externalLinks';
 import ExternalLinkViewer from './ExternalLinkViewer';
-import JobThread, { JOB_ACTIVE } from './JobThread';
-import MessageBubble from './MessageBubble';
+import { JOB_ACTIVE } from './JobThread';
+import ChatHeader from './chat/ChatHeader';
+import Composer from './chat/Composer';
+import MessageList, { type MessageEdit } from './chat/MessageList';
+import { useModelCatalog, useUsagePoll } from './chat/useChatMetadata';
 
 interface Props {
   contact: Contact;
@@ -31,31 +27,8 @@ interface Props {
   onSettings(): void;
 }
 
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
-}
-
-function fmtFullTokens(n: number): string {
-  return new Intl.NumberFormat('zh-CN').format(n);
-}
-
-function fmtQuotaReset(resetsAt: string | null | undefined): string {
-  if (!resetsAt) return '重置时间未知';
-  return `${new Intl.DateTimeFormat('zh-CN', {
-    timeZone: DISPLAY_TIME_ZONE,
-    month: 'numeric',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  }).format(new Date(resetsAt))} 重置`;
-}
-
 export default function ChatPane({ contact, contacts, messages, status, user, onBack, onLoadEarlier, onSettings }: Props) {
   const isRoom = contact.kind === 'room';
-  const senderContactOf = (m: Message): Contact =>
-    m.sender === 'user' ? contact : contacts.find((c) => c.id === m.sender) ?? contact;
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -65,18 +38,10 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
   const [bulkMessageMode, setBulkMessageMode] = useState(false);
   const [bulkMessageIds, setBulkMessageIds] = useState<Set<number>>(() => new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
-  const [editing, setEditing] = useState<{ id: number; draft: string } | null>(null);
-  const [usage, setUsage] = useState<Usage | null>(null);
-  const [quota, setQuota] = useState<ClaudeQuota | null>(null);
-  const [codexQuota, setCodexQuota] = useState<CodexQuota | null>(null);
-  const [grokQuota, setGrokQuota] = useState<GrokQuota | null>(null);
-  const [modelCatalog, setModelCatalog] = useState<ModelCatalog | null>(null);
-  const [switchingModel, setSwitchingModel] = useState(false);
+  const [editing, setEditing] = useState<MessageEdit | null>(null);
   const [jobs, setJobs] = useState<WorkerJob[]>([]);
   const [externalLink, setExternalLink] = useState<ExternalLinkView | null>(null);
-  const [tokenDetailOpen, setTokenDetailOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const tokenDetailRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const jobsRef = useRef<WorkerJob[]>([]);
   jobsRef.current = jobs;
@@ -106,16 +71,8 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
     };
   }, [closeExternalView, externalLink]);
 
-  useEffect(() => {
-    if (!tokenDetailOpen) return;
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target;
-      if (target instanceof Node && tokenDetailRef.current?.contains(target)) return;
-      setTokenDetailOpen(false);
-    };
-    document.addEventListener('pointerdown', onPointerDown);
-    return () => document.removeEventListener('pointerdown', onPointerDown);
-  }, [tokenDetailOpen]);
+  const { usage, quota, codexQuota, grokQuota } = useUsagePoll(contact, status);
+  const { modelCatalog, switchingModel, switchModel, switchEffort } = useModelCatalog(contact, isRoom, setSendError);
 
   // 这个聊天里委派出去的任务（挂回原消息下）；旧的无锚点任务只在还活跃时显示
   const loadJobs = useCallback(() => {
@@ -194,49 +151,14 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
     if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
   }, [messages, contact.id]);
 
-  // usage/quota：切联系人时拉一次，回合结束（idle）再刷新
   useEffect(() => {
-    setUsage(null);
-    setQuota(null);
-    setCodexQuota(null);
-    setGrokQuota(null);
-    void api.usage(contact.id).then(setUsage).catch(() => {});
-    if (contact.backend === 'claude-cli') {
-      void api.claudeQuota().then(setQuota).catch(() => {});
-    } else if (contact.backend === 'codex') {
-      void api.codexQuota().then(setCodexQuota).catch(() => {});
-    } else if (contact.backend === 'grok-cli') {
-      void api.grokQuota().then(setGrokQuota).catch(() => {});
-    }
     setSelectedMsg(null);
     setBulkMessageMode(false);
     setBulkMessageIds(new Set());
     setEditing(null);
-    setTokenDetailOpen(false);
     clearImages();
     setDraft('');
-  }, [contact.id, contact.backend, clearImages]);
-
-  useEffect(() => {
-    setModelCatalog(null);
-    if (isRoom) return;
-    // During a rolling deploy the new frontend can briefly meet the old gateway.
-    // Hide the picker until the models endpoint is available instead of surfacing a noisy 404.
-    void api.models(contact.id).then(setModelCatalog).catch(() => {});
-  }, [contact.id, contact.backend, contact.config.model, contact.config.effort, isRoom]);
-
-  useEffect(() => {
-    if (status.state === 'idle') {
-      void api.usage(contact.id).then(setUsage).catch(() => {});
-      if (contact.backend === 'claude-cli') {
-        void api.claudeQuota().then(setQuota).catch(() => {});
-      } else if (contact.backend === 'codex') {
-        void api.codexQuota().then(setCodexQuota).catch(() => {});
-      } else if (contact.backend === 'grok-cli') {
-        void api.grokQuota().then(setGrokQuota).catch(() => {});
-      }
-    }
-  }, [status.state, contact.id, contact.backend]);
+  }, [contact.id, clearImages]);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -334,237 +256,26 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
     }
   };
 
-  const switchModel = async (model: string) => {
-    setSwitchingModel(true);
-    setSendError(null);
-    try {
-      await api.switchModel(contact.id, model);
-    } catch (e) {
-      setSendError((e as Error).message);
-    } finally {
-      setSwitchingModel(false);
-    }
-  };
-
-  const switchEffort = async (effort: string) => {
-    setSwitchingModel(true);
-    setSendError(null);
-    try {
-      await api.switchEffort(contact.id, effort);
-    } catch (e) {
-      setSendError((e as Error).message);
-    } finally {
-      setSwitchingModel(false);
-    }
-  };
-
-  const busy =
-    status.state === 'thinking' || status.state === 'streaming' || status.state.startsWith('tool:');
-  const st = statusText(status, { isRoom, contactName: contact.name });
-
-  const quotaBits: string[] = [];
-  if (contact.backend === 'claude-cli') {
-    if (quota?.available) {
-      if (quota.fiveHour) quotaBits.push(`5h剩${quota.fiveHour.remainingPct}%`);
-      if (quota.sevenDay) quotaBits.push(`周剩${quota.sevenDay.remainingPct}%`);
-    } else if (quota?.reason === 'setup-token') {
-      quotaBits.push('额度不可用：VPS 需完整 claude /login');
-    } else if (quota?.reason === 'login-expired') {
-      quotaBits.push('额度不可用：登录过期，需重新 /login');
-    }
-  }
-  if (contact.backend === 'codex' && codexQuota?.available) {
-    if (codexQuota.fiveHour) quotaBits.push(`5h剩${codexQuota.fiveHour.remainingPct}%`);
-    if (codexQuota.sevenDay) quotaBits.push(`周剩${codexQuota.sevenDay.remainingPct}%`);
-  }
-  if (contact.backend === 'grok-cli') {
-    if (grokQuota?.available && grokQuota.weekly) {
-      // 订阅是 Grok 全产品共享周池：Chat/Imagine/Build 都从这一份里扣
-      quotaBits.push(`周池剩${grokQuota.weekly.remainingPct}%`);
-      if (grokQuota.weekly.resetsAt) {
-        // 全站按上海时间显示，别跟着设备时区跑
-        const reset = new Intl.DateTimeFormat('zh-CN', {
-          timeZone: DISPLAY_TIME_ZONE,
-          month: 'numeric',
-          day: 'numeric',
-        }).format(new Date(grokQuota.weekly.resetsAt));
-        quotaBits.push(`${reset}重置`);
-      }
-    } else if (grokQuota?.reason === 'login-expired') {
-      quotaBits.push('额度不可用：grok 登录过期');
-    } else if (grokQuota?.reason === 'no-token') {
-      quotaBits.push('额度不可用：VPS 没有 grok 登录态');
-    }
-  }
-  if (usage && (usage.today.input > 0 || usage.today.output > 0)) {
-    quotaBits.push(`本轮 ${fmtTokens(usage.last.input)}↑ ${fmtTokens(usage.last.output)}↓`);
-    if (usage.last.cacheRead > 0 || usage.last.cacheCreation > 0) {
-      quotaBits.push(`缓存 ${fmtTokens(usage.last.cacheRead)}读 ${fmtTokens(usage.last.cacheCreation)}建`);
-    }
-    quotaBits.push(`今日 ${fmtTokens(usage.today.input)}↑ ${fmtTokens(usage.today.output)}↓`);
-  }
-  const tokenSummary = quotaBits.join(' · ');
-  const showTokenDetail = !st && tokenSummary.length > 0;
-  const quotaRows: { label: string; value: string; note?: string }[] = [];
-  if (contact.backend === 'claude-cli') {
-    if (quota?.available) {
-      if (quota.fiveHour) {
-        quotaRows.push({
-          label: 'Claude 5 小时窗口',
-          value: `剩余 ${quota.fiveHour.remainingPct}%`,
-          note: fmtQuotaReset(quota.fiveHour.resetsAt),
-        });
-      }
-      if (quota.sevenDay) {
-        quotaRows.push({
-          label: 'Claude 7 天窗口',
-          value: `剩余 ${quota.sevenDay.remainingPct}%`,
-          note: fmtQuotaReset(quota.sevenDay.resetsAt),
-        });
-      }
-    } else if (quota?.reason) {
-      quotaRows.push({ label: 'Claude 额度', value: quotaBits[0] ?? '额度不可用' });
-    }
-  }
-  if (contact.backend === 'codex' && codexQuota?.available) {
-    if (codexQuota.fiveHour) {
-      quotaRows.push({
-        label: 'Codex 5 小时窗口',
-        value: `剩余 ${codexQuota.fiveHour.remainingPct}%`,
-        note: fmtQuotaReset(codexQuota.fiveHour.resetsAt),
-      });
-    }
-    if (codexQuota.sevenDay) {
-      quotaRows.push({
-        label: 'Codex 7 天窗口',
-        value: `剩余 ${codexQuota.sevenDay.remainingPct}%`,
-        note: fmtQuotaReset(codexQuota.sevenDay.resetsAt),
-      });
-    }
-  }
-  if (contact.backend === 'grok-cli') {
-    if (grokQuota?.available && grokQuota.weekly) {
-      quotaRows.push({
-        label: 'Grok 周池',
-        value: `剩余 ${grokQuota.weekly.remainingPct}%`,
-        note: fmtQuotaReset(grokQuota.weekly.resetsAt),
-      });
-    } else if (grokQuota?.reason) {
-      quotaRows.push({ label: 'Grok 额度', value: quotaBits[0] ?? '额度不可用' });
-    }
-  }
   return (
     <main className="chat-pane">
-      <header className="chat-header">
-        <button className="back-btn" onClick={onBack}>
-          ←
-        </button>
-        <span className="avatar" style={{ background: contact.color + '33' }}>
-          {contact.avatar}
-        </span>
-        <div className="chat-title">
-          <span style={{ color: contact.color }}>{contact.name}</span>
-          <div className="token-detail-wrap" ref={tokenDetailRef}>
-            {showTokenDetail ? (
-              <button
-                type="button"
-                className="chat-status token-status-btn"
-                aria-expanded={tokenDetailOpen}
-                onClick={() => setTokenDetailOpen((open) => !open)}
-              >
-                {tokenSummary}
-              </button>
-            ) : (
-              <span className="chat-status">{st}</span>
-            )}
-            {showTokenDetail && tokenDetailOpen && (
-              <div className="token-detail-popover" role="dialog" aria-label="Token 消耗详情">
-                <div className="token-detail-head">
-                  <b>Token 详情</b>
-                  <button type="button" className="modal-close" onClick={() => setTokenDetailOpen(false)}>
-                    关闭
-                  </button>
-                </div>
-                <div className="token-detail-body">
-                  {usage && (
-                    <>
-                      <div className="token-detail-section">
-                        <b>本轮</b>
-                        <span>{fmtFullTokens(usage.last.input)} 输入 · {fmtFullTokens(usage.last.output)} 输出</span>
-                        <small>{fmtFullTokens(usage.last.cacheRead)} 缓存读 · {fmtFullTokens(usage.last.cacheCreation)} 缓存建</small>
-                      </div>
-                      <div className="token-detail-section">
-                        <b>今日</b>
-                        <span>{fmtFullTokens(usage.today.input)} 输入 · {fmtFullTokens(usage.today.output)} 输出</span>
-                        <small>{fmtFullTokens(usage.today.cacheRead)} 缓存读 · {fmtFullTokens(usage.today.cacheCreation)} 缓存建</small>
-                      </div>
-                    </>
-                  )}
-                  {quotaRows.length > 0 && (
-                    <div className="token-detail-section">
-                      <b>额度窗口</b>
-                      {quotaRows.map((row) => (
-                        <span key={row.label}>
-                          {row.label}：{row.value}
-                          {row.note ? <small>{row.note}</small> : null}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-        {busy && (
-          <button className="interrupt-btn" onClick={() => void api.interrupt(contact.id)}>
-            ⏹ 打断
-          </button>
-        )}
-        {!isRoom && modelCatalog && modelCatalog.models.length > 0 && (
-          <select
-            className="model-select"
-            title={modelCatalog.warning ?? '切换模型会开启新的底层会话，并自动衔接近期聊天'}
-            aria-label="切换模型"
-            value={modelCatalog.current}
-            disabled={busy || switchingModel}
-            onChange={(e) => void switchModel(e.target.value)}
-          >
-            {modelCatalog.models.map((model) => (
-              <option key={model.id || '__default'} value={model.id} title={model.description}>
-                {model.label}
-              </option>
-            ))}
-          </select>
-        )}
-        {!isRoom && modelCatalog?.efforts && modelCatalog.efforts.length > 0 && (
-          <select
-            className="model-select"
-            title="推理强度：切换会开启新的底层会话，并自动衔接近期聊天"
-            aria-label="切换推理强度"
-            value={modelCatalog.currentEffort ?? ''}
-            disabled={busy || switchingModel}
-            onChange={(e) => void switchEffort(e.target.value)}
-          >
-            {modelCatalog.efforts.map((effort) => (
-              <option key={effort.id || '__default'} value={effort.id}>
-                {effort.label}
-              </option>
-            ))}
-          </select>
-        )}
-        <button
-          className={'bulk-tool-btn' + (bulkMessageMode ? ' active' : '')}
-          title="批量选择消息气泡"
-          onClick={toggleBulkMessageMode}
-          disabled={bulkMessages.length === 0 || bulkDeleting}
-        >
-          批量消息
-        </button>
-        <button className="gear-btn" title="联系人设置" onClick={onSettings}>
-          ⚙
-        </button>
-      </header>
+      <ChatHeader
+        contact={contact}
+        status={status}
+        usage={usage}
+        quota={quota}
+        codexQuota={codexQuota}
+        grokQuota={grokQuota}
+        modelCatalog={modelCatalog}
+        switchingModel={switchingModel}
+        bulkMode={bulkMessageMode}
+        bulkDeleting={bulkDeleting}
+        bulkCount={bulkMessages.length}
+        onBack={onBack}
+        onSettings={onSettings}
+        onToggleBulk={toggleBulkMessageMode}
+        onSwitchModel={(value) => void switchModel(value)}
+        onSwitchEffort={(value) => void switchEffort(value)}
+      />
 
       {bulkMessageMode && (
         <div className="bulk-tool-bar">
@@ -581,104 +292,45 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
         </div>
       )}
 
-      <div className="message-scroll" ref={scrollRef} onScroll={onScroll}>
-        {messages.length >= 50 && (
-          <button className="load-earlier" onClick={onLoadEarlier}>
-            加载更早的
-          </button>
-        )}
-        {messages.map((m) => (
-          <Fragment key={m.id}>
-            {editing && editing.id === m.id ? (
-              <div className="edit-box">
-                <textarea
-                  autoFocus
-                  rows={3}
-                  value={editing.draft}
-                  onChange={(e) => setEditing({ ...editing, draft: e.target.value })}
-                />
-                <div className="edit-actions">
-                  <button className="ghost-btn" onClick={() => setEditing(null)}>
-                    取消
-                  </button>
-                  <button className="primary-btn" onClick={() => void saveEdit()}>
-                    保存并重新生成
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <MessageBubble
-                message={m}
-                contact={senderContactOf(m)}
-                showName={isRoom && m.sender !== 'user' ? senderContactOf(m).name : undefined}
-                allowRegen={!isRoom}
-                user={user}
-                selected={selectedMsg === m.id}
-                bulkMessageMode={bulkMessageMode}
-                bulkSelected={bulkMessageIds.has(m.id)}
-                onSelect={setSelectedMsg}
-                onBulkMessageToggle={toggleBulkMessage}
-                onEdit={(msg) => {
-                  setEditing({ id: msg.id, draft: msg.content });
-                  setSelectedMsg(null);
-                }}
-                onResend={(msg) => void resend(msg)}
-                onDelete={(msg) => void remove(msg)}
-                onOpenExternalLink={openExternalView}
-              />
-            )}
-            {(jobAnchors.byMessage.get(m.id) ?? []).map((job) => (
-              <JobThread key={job.id} job={job} onChanged={loadJobs} />
-            ))}
-          </Fragment>
-        ))}
-        {jobAnchors.loose.map((job) => (
-          <JobThread key={job.id} job={job} onChanged={loadJobs} />
-        ))}
-        {status.state === 'thinking' && (
-          <div className="typing-hint">
-            {statusText(status, { isRoom, contactName: contact.name })}
-          </div>
-        )}
-      </div>
+      <MessageList
+        contact={contact}
+        contacts={contacts}
+        messages={messages}
+        status={status}
+        user={user}
+        scrollRef={scrollRef}
+        selectedMessage={selectedMsg}
+        editing={editing}
+        bulkMode={bulkMessageMode}
+        bulkIds={bulkMessageIds}
+        jobsByMessage={jobAnchors.byMessage}
+        looseJobs={jobAnchors.loose}
+        onLoadEarlier={onLoadEarlier}
+        onScroll={onScroll}
+        onSelect={setSelectedMsg}
+        onEditing={setEditing}
+        onSaveEdit={() => void saveEdit()}
+        onBulkToggle={toggleBulkMessage}
+        onResend={(message) => void resend(message)}
+        onDelete={(message) => void remove(message)}
+        onJobsChanged={loadJobs}
+        onOpenExternalLink={openExternalView}
+      />
 
       {sendError && <div className="send-error">操作失败：{sendError}</div>}
 
-      <ImagePreviewStrip images={pendingImages} onRemove={removeImage} />
-
-      <footer className="composer">
-        {canSendImages && (
-          <ImageAttachButton
-            disabled={sending || pendingImages.length >= maxImages}
-            onAdd={addComposerImages}
-          />
-        )}
-        <textarea
-          value={draft}
-          placeholder={`发给 ${contact.name}…`}
-          rows={1}
-          onChange={(e) => setDraft(e.target.value)}
-          onPaste={(e) => {
-            if (!canSendImages) return;
-            const images = Array.from(e.clipboardData.files).filter((file) => file.type.startsWith('image/'));
-            if (images.length > 0) {
-              e.preventDefault();
-              addComposerImages(images);
-            }
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-              if (window.matchMedia('(min-width: 768px)').matches) {
-                e.preventDefault();
-                void send();
-              }
-            }
-          }}
-        />
-        <button className="send-btn" onClick={() => void send()} disabled={sending || (!draft.trim() && pendingImages.length === 0)}>
-          {sending ? '…' : '➤'}
-        </button>
-      </footer>
+      <Composer
+        contactName={contact.name}
+        draft={draft}
+        sending={sending}
+        canSendImages={canSendImages}
+        pendingImages={pendingImages}
+        maxImages={maxImages}
+        onDraft={setDraft}
+        onAddImages={addComposerImages}
+        onRemoveImage={removeImage}
+        onSend={() => void send()}
+      />
       {externalLink && <ExternalLinkViewer view={externalLink} onClose={closeExternalView} />}
     </main>
   );

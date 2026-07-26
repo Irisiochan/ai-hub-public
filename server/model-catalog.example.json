@@ -1,0 +1,22 @@
+{
+  "_comment": "复制成 server/model-catalog.json 即可覆盖内置模型目录。改完存盘直接生效，不用重启、不用重新构建。整段删掉某个 backend 就回落到内置列表。HUB_MODEL_CATALOG 可以把文件指到别处。",
+
+  "claude-cli": {
+    "models": [
+      { "id": "", "label": "默认（Claude CLI 自动选择）", "isDefault": true },
+      { "id": "opus", "label": "Opus（最新）" },
+      { "id": "sonnet", "label": "Sonnet（最新）" },
+      { "id": "claude-opus-5", "label": "Opus 5" },
+      { "id": "claude-opus-4-8", "label": "Opus 4.8" }
+    ],
+    "efforts": [
+      { "id": "", "label": "默认强度", "isDefault": true },
+      { "id": "high", "label": "high" },
+      { "id": "xhigh", "label": "xhigh" },
+      { "id": "max", "label": "max" }
+    ]
+  },
+
+  "_shorthand": "只想加模型、强度沿用内置时，可以直接写成数组：",
+  "grok-cli": ["grok-code-fast-1"]
+}

@@ -1,4 +1,5 @@
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { scheduleWebUpdateConfirmation } from '../appUpdate';
 import {
   getServerBase,
   initNativeShell,
@@ -33,7 +34,9 @@ const wrap: CSSProperties = {
   alignItems: 'center',
   justifyContent: 'center',
   gap: 12,
-  padding: 24,
+  // 与 styles.css 的 safe-area 一致，避免壳内连接页顶进状态栏
+  padding:
+    'max(24px, env(safe-area-inset-top, 0px)) max(24px, env(safe-area-inset-right, 0px)) max(24px, env(safe-area-inset-bottom, 0px)) max(24px, env(safe-area-inset-left, 0px))',
   background: '#16161e',
   color: '#c8c8d8',
   fontSize: 15,
@@ -51,6 +54,7 @@ export default function MobileGate({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!native) return;
     initNativeShell();
+    scheduleWebUpdateConfirmation();
     if (phase !== 'checking') return;
     let alive = true;
     void pingHealth(getServerBase()).then((ok) => {

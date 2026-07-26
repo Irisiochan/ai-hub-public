@@ -1,5 +1,7 @@
-import type { ConversationSummaryRow, Db, MessageRow } from '../db.js';
+import type { Db, MessageRow } from '../db.js';
+import { timestampedMessage } from '../memory/inject.js';
 import { estimateTokens } from './tokenEstimate.js';
+import { ConversationSummaryRepo } from './conversationSummaryRepo.js';
 
 export type SummaryMutationResult =
   | { action: 'none' }
@@ -14,6 +16,12 @@ export interface SummaryBudgetOpts {
   nameOf?: (sender: string) => string;
 }
 
+export const SUMMARY_FORMAT_MARKER = '[摘要格式 time-anchor-v1]';
+
+export function summaryNeedsTimeAnchorUpgrade(summary: string | null | undefined): boolean {
+  return !!summary?.trim() && !summary.trimStart().startsWith(SUMMARY_FORMAT_MARKER);
+}
+
 function summaryLine(row: MessageRow, nameOf?: (sender: string) => string): string {
   const who = nameOf
     ? nameOf(row.sender)
@@ -21,7 +29,8 @@ function summaryLine(row: MessageRow, nameOf?: (sender: string) => string): stri
       ? '助手'
       : 'User';
   const compact = row.content.replace(/\s+/g, ' ').trim().slice(0, 240);
-  return `- ${who}：${compact}`;
+  // 摘要行同样是历史，不带时间锚点会被读成"刚刚"
+  return `- ${timestampedMessage(`${who}：${compact}`, row.created_at, '历史摘要')}`;
 }
 
 /** 本地 extractive 摘要：拼接后按 token 预算保留尾部。 */
@@ -31,31 +40,33 @@ export function compactSummaryText(
   opts: SummaryBudgetOpts
 ): string {
   const lines = rows.map((r) => summaryLine(r, opts.nameOf));
-  const appended = [existing.trim(), ...lines].filter(Boolean).join('\n');
+  const existingBody = existing.trim().startsWith(SUMMARY_FORMAT_MARKER)
+    ? existing.trim().slice(SUMMARY_FORMAT_MARKER.length).trimStart()
+    : existing.trim();
+  const body = [existingBody, ...lines].filter(Boolean).join('\n');
+  const appended = [SUMMARY_FORMAT_MARKER, body].filter(Boolean).join('\n');
   const maxTokens = Math.max(
     Math.min(opts.summaryMaxTokens, opts.historyTokenBudget - 512),
     256
   );
   if (estimateTokens(appended) <= maxTokens) return appended;
-  const prefix = '[更早的摘要已按预算淘汰]\n';
+  const prefix = `${SUMMARY_FORMAT_MARKER}\n[更早的摘要已按预算淘汰]\n`;
   let low = 0;
-  let high = appended.length;
+  let high = body.length;
   while (low < high) {
     const mid = Math.floor((low + high) / 2);
-    if (estimateTokens(prefix + appended.slice(mid)) <= maxTokens) high = mid;
+    if (estimateTokens(prefix + body.slice(mid)) <= maxTokens) high = mid;
     else low = mid + 1;
   }
-  return prefix + appended.slice(low);
+  return prefix + body.slice(low);
 }
 
-function listMemberIds(db: Db, contactId: string, memberId?: string): string[] {
+function listMemberIds(repo: ConversationSummaryRepo, contactId: string, memberId?: string): string[] {
   if (memberId !== undefined) return [memberId];
-  const rows = db
-    .prepare('SELECT member_id FROM conversation_summaries WHERE contact_id = ?')
-    .all(contactId) as { member_id: string }[];
+  const rows = repo.memberIds(contactId);
   // 无摘要行时也覆盖 DM 默认 ''，避免漏清
   if (rows.length === 0) return [''];
-  return rows.map((r) => r.member_id);
+  return rows;
 }
 
 /**
@@ -72,23 +83,17 @@ export function touchConversationSummary(
   affectedFromId: number,
   opts: SummaryBudgetOpts
 ): SummaryMutationResult {
+  const repo = new ConversationSummaryRepo(db);
   if (!Number.isFinite(affectedFromId) || affectedFromId <= 0) {
-    if (memberId === undefined) {
-      db.prepare('DELETE FROM conversation_summaries WHERE contact_id = ?').run(contactId);
-    } else {
-      db.prepare('DELETE FROM conversation_summaries WHERE contact_id = ? AND member_id = ?').run(
-        contactId,
-        memberId
-      );
-    }
+    repo.delete(contactId, memberId);
     return { action: 'cleared' };
   }
 
-  const members = listMemberIds(db, contactId, memberId);
+  const members = listMemberIds(repo, contactId, memberId);
   let worst: SummaryMutationResult = { action: 'none' };
 
   for (const mid of members) {
-    const result = touchOneMember(db, contactId, mid, affectedFromId, opts);
+    const result = touchOneMember(repo, contactId, mid, affectedFromId, opts);
     if (result.action === 'rebuilt' || result.action === 'cleared') worst = result;
     else if (worst.action === 'none') worst = result;
   }
@@ -96,15 +101,13 @@ export function touchConversationSummary(
 }
 
 function touchOneMember(
-  db: Db,
+  repo: ConversationSummaryRepo,
   contactId: string,
   memberId: string,
   affectedFromId: number,
   opts: SummaryBudgetOpts
 ): SummaryMutationResult {
-  const saved = db
-    .prepare('SELECT * FROM conversation_summaries WHERE contact_id = ? AND member_id = ?')
-    .get(contactId, memberId) as ConversationSummaryRow | undefined;
+  const saved = repo.get(contactId, memberId);
 
   if (!saved || !saved.summary) return { action: 'none' };
 
@@ -113,31 +116,16 @@ function touchOneMember(
   }
 
   // 只重读「原摘要覆盖窗」内仍存活的消息，不回放更新近原文
-  const rows = db
-    .prepare(
-      `SELECT * FROM messages
-       WHERE contact_id = ? AND kind = 'text' AND status = 'done' AND deleted = 0
-         AND role IN ('user','assistant')
-         AND id <= ?
-       ORDER BY id ASC`
-    )
-    .all(contactId, saved.through_message_id) as MessageRow[];
+  const rows = repo.rowsThrough(contactId, saved.through_message_id);
 
   if (rows.length === 0) {
-    db.prepare('DELETE FROM conversation_summaries WHERE contact_id = ? AND member_id = ?').run(
-      contactId,
-      memberId
-    );
+    repo.delete(contactId, memberId);
     return { action: 'cleared' };
   }
 
   const summary = compactSummaryText('', rows, opts);
   const through = rows[rows.length - 1].id;
-  db.prepare(
-    `UPDATE conversation_summaries
-     SET summary = ?, through_message_id = ?, version = version + 1, updated_at = datetime('now')
-     WHERE contact_id = ? AND member_id = ?`
-  ).run(summary, through, contactId, memberId);
+  repo.update(contactId, memberId, summary, through);
 
   return {
     action: 'rebuilt',

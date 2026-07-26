@@ -44,7 +44,14 @@ try {
     method: 'POST', body: JSON.stringify({ id: 'my-pc', name: 'My PC' }),
   });
   const auth = { Authorization: `Bearer ${paired.token}` };
-  const capabilities = { runners: ['codex'], workspaces: [dir], shell: true, ssh: false };
+  const capabilities = {
+    runners: ['codex'],
+    workspaces: [dir],
+    shell: true,
+    ssh: false,
+    maxConcurrent: 2,
+    protocolVersion: 2,
+  };
 
   let connected = await call('/worker/connect', {
     method: 'POST', headers: auth,
@@ -80,6 +87,12 @@ try {
 
   const resumedClaim = await call('/worker/claim?wait=0', { headers: auth });
   check('恢复后可以认领原任务', resumedClaim.job?.id === created.job.id && resumedClaim.acceptingJobs === true);
+  check(
+    'claim 下发 protocol v2 与服务端交付契约',
+    resumedClaim.protocolVersion === 2
+      && typeof resumedClaim.deliveryContract === 'string'
+      && resumedClaim.deliveryContract.includes('standalone JSON line')
+  );
 
   await call(`/worker/jobs/${created.job.id}/start`, {
     method: 'POST', headers: auth, body: '{}',
@@ -148,6 +161,161 @@ try {
     '自动回写留下审计消息',
     jobs.messages(created.job.id).some((message) => message.content.includes('外部续接已自动确认完成'))
   );
+
+  const staleCreated = jobs.create({
+    requestedBy: 'user', runner: 'codex', workspace: dir, prompt: 'stale fallback smoke',
+    permissions: { write: true, shell: true },
+  });
+  if ('error' in staleCreated) throw new Error(staleCreated.error);
+  const staleClaim = await call('/worker/claim?wait=0', { headers: auth });
+  check('自愈测试任务已认领', staleClaim.job?.id === staleCreated.job.id);
+  await call(`/worker/jobs/${staleCreated.job.id}/start`, {
+    method: 'POST', headers: auth, body: '{}',
+  });
+  await call(`/worker/jobs/${staleCreated.job.id}/complete`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({
+      status: 'blocked',
+      result: '本地变化等待托管同步',
+      delivery: { state: 'blocked_local_changes', head: 'aaa1234', ahead: 0, dirtyFiles: ['session.json'] },
+    }),
+  });
+
+  let freshFallbackRejected = false;
+  try {
+    await call(`/worker/jobs/${staleCreated.job.id}/reconcile`, {
+      method: 'POST', headers: auth,
+      body: JSON.stringify({
+        head: 'bbb5678',
+        evidence: {
+          dirty: false,
+          ahead: 0,
+          ancestorIncluded: false,
+          staleFallback: true,
+          blockedHead: 'aaa1234',
+        },
+      }),
+    });
+  } catch {
+    freshFallbackRejected = true;
+  }
+  check('未满 10 分钟不能走 clean timeout 自愈', freshFallbackRejected);
+
+  db.prepare("UPDATE jobs SET updated_at = datetime('now', '-11 minutes') WHERE id = ?")
+    .run(staleCreated.job.id);
+  const staleReconciled = await call(`/worker/jobs/${staleCreated.job.id}/reconcile`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({
+      head: 'bbb5678',
+      evidence: {
+        dirty: false,
+        ahead: 0,
+        ancestorIncluded: false,
+        staleFallback: true,
+        blockedHead: 'aaa1234',
+      },
+    }),
+  });
+  const staleDelivery = JSON.parse(jobs.get(staleCreated.job.id)?.delivery_meta ?? '{}');
+  check(
+    '满 10 分钟后 clean + ahead=0 可自愈',
+    staleReconciled.status === 'done'
+      && jobs.get(staleCreated.job.id)?.status === 'done'
+      && staleDelivery.reconciliation?.mode === 'clean-timeout-fallback'
+  );
+
+  const workspaceA = path.join(dir, 'workspace-a');
+  const workspaceB = path.join(dir, 'workspace-b');
+  fs.mkdirSync(workspaceA);
+  fs.mkdirSync(workspaceB);
+  const parallelA = jobs.create({
+    requestedBy: 'user', runner: 'codex', workspace: workspaceA, prompt: 'parallel a',
+    priority: 10, permissions: { write: true, shell: true, ssh: false },
+  });
+  const sameWorkspace = jobs.create({
+    requestedBy: 'user', runner: 'codex', workspace: workspaceA, prompt: 'parallel same workspace',
+    priority: 9, permissions: { write: true, shell: true, ssh: false },
+  });
+  const parallelB = jobs.create({
+    requestedBy: 'user', runner: 'codex', workspace: workspaceB, prompt: 'parallel b',
+    priority: 8, permissions: { write: true, shell: true, ssh: false },
+  });
+  if ('error' in parallelA || 'error' in sameWorkspace || 'error' in parallelB) {
+    throw new Error('parallel smoke setup failed');
+  }
+  const claimA = await call('/worker/claim?wait=0', { headers: auth });
+  const claimB = await call('/worker/claim?wait=0', { headers: auth });
+  const claimAtCapacity = await call('/worker/claim?wait=0', { headers: auth });
+  check('并发第一单按优先级认领', claimA.job?.id === parallelA.job.id);
+  check('同 workspace 被锁时可认领另一 workspace', claimB.job?.id === parallelB.job.id);
+  check('达到 maxConcurrent 后不再认领', claimAtCapacity.job === null);
+  check('同 workspace 第二单保持 pending', jobs.get(sameWorkspace.job.id)?.status === 'pending');
+
+  for (const activeJob of [parallelA.job, parallelB.job]) {
+    await call(`/worker/jobs/${activeJob.id}/start`, {
+      method: 'POST', headers: auth, body: '{}',
+    });
+  }
+  await call(`/worker/jobs/${parallelA.job.id}/complete`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ status: 'done', result: 'a done' }),
+  });
+  const workerWhileBusy = (await call('/workers')).workers.find((item: any) => item.id === 'my-pc');
+  check('一单完成但另一单运行时 worker 仍为 busy', workerWhileBusy?.status === 'busy');
+  await call(`/worker/jobs/${parallelB.job.id}/complete`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ status: 'done', result: 'b done' }),
+  });
+  const sameWorkspaceClaim = await call('/worker/claim?wait=0', { headers: auth });
+  check('workspace 锁释放后第二单可认领', sameWorkspaceClaim.job?.id === sameWorkspace.job.id);
+  await call(`/worker/jobs/${sameWorkspace.job.id}/start`, {
+    method: 'POST', headers: auth, body: '{}',
+  });
+  await call(`/worker/jobs/${sameWorkspace.job.id}/complete`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ status: 'done', result: 'same done' }),
+  });
+
+  const recoveryCreated = jobs.create({
+    requestedBy: 'user', runner: 'codex', workspace: workspaceA, prompt: 'recover me',
+    permissions: { write: true, shell: true, ssh: false },
+  });
+  if ('error' in recoveryCreated) throw new Error(recoveryCreated.error);
+  await call('/worker/claim?wait=0', { headers: auth });
+  await call(`/worker/jobs/${recoveryCreated.job.id}/start`, {
+    method: 'POST', headers: auth, body: '{}',
+  });
+  db.prepare("UPDATE jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?")
+    .run(recoveryCreated.job.id);
+  jobs.reap();
+  check('租约失联先进入 recovering 而非立即 interrupted', jobs.get(recoveryCreated.job.id)?.status === 'recovering');
+  const recovered = await call(`/worker/jobs/${recoveryCreated.job.id}/recover`, {
+    method: 'POST', headers: auth,
+    body: JSON.stringify({ mode: 'resume', sessionId: 'thread_123' }),
+  });
+  check(
+    '显式恢复握手重置 running 与 session',
+    recovered.status === 'running'
+      && jobs.get(recoveryCreated.job.id)?.status === 'running'
+      && jobs.get(recoveryCreated.job.id)?.session_id === 'thread_123'
+  );
+  await call(`/worker/jobs/${recoveryCreated.job.id}/complete`, {
+    method: 'POST', headers: auth, body: JSON.stringify({ status: 'done', result: 'recovered' }),
+  });
+
+  const expiryCreated = jobs.create({
+    requestedBy: 'user', runner: 'codex', workspace: workspaceB, prompt: 'expire recovery',
+    permissions: { write: true, shell: true, ssh: false },
+  });
+  if ('error' in expiryCreated) throw new Error(expiryCreated.error);
+  await call('/worker/claim?wait=0', { headers: auth });
+  await call(`/worker/jobs/${expiryCreated.job.id}/start`, {
+    method: 'POST', headers: auth, body: '{}',
+  });
+  db.prepare("UPDATE jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?")
+    .run(expiryCreated.job.id);
+  jobs.reap();
+  db.prepare("UPDATE jobs SET lease_until = datetime('now', '-1 second') WHERE id = ?")
+    .run(expiryCreated.job.id);
+  jobs.reap();
+  check('恢复窗口耗尽后才进入 interrupted', jobs.get(expiryCreated.job.id)?.status === 'interrupted');
 } finally {
   await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
   db.close();

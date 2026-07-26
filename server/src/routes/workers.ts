@@ -2,7 +2,13 @@ import crypto from 'node:crypto';
 import { Router, type Request } from 'express';
 import type { Db, JobRow, WorkerRow } from '../db.js';
 import type { SseHub } from '../sse.js';
-import { ACTIVE_STATUSES, JobStore, LEASE_SECONDS, workspaceAllowed } from '../workers/jobStore.js';
+import {
+  ACTIVE_STATUSES,
+  JobStore,
+  LEASE_SECONDS,
+  normalizeWorkspace,
+  workspaceAllowed,
+} from '../workers/jobStore.js';
 
 // jobs.deleted = 1 is presentation soft-delete; claim/list hide those rows.
 
@@ -11,10 +17,33 @@ type Capabilities = {
   workspaces?: string[];
   shell?: boolean;
   ssh?: boolean;
+  maxConcurrent?: number;
+  protocolVersion?: number;
 };
+
+const BLOCKED_RECONCILE_GRACE_MS = 10 * 60_000;
+const WORKER_PROTOCOL_VERSION = 2;
+const DELIVERY_CONTRACT = [
+  'Delivery is not complete merely because the agent process exits successfully.',
+  'For write tasks, run the requested validation and commit/push only when it passes.',
+  'When validation passes you are pre-authorized to commit, push, deploy, restart, and run post-deploy verification in one pass. Do not stop to ask for confirmation, and do not file a deploy-tail task instead of deploying.',
+  'Still require explicit owner approval for: skipped or failing validation, irreversible data actions (data deletion, destructive migrations, production rollback, history rewrite, force push), creating or switching branches, credential or access expansion, product-scope decisions, and outbound messages to third parties.',
+  'Never restart the process hosting this job (the PC worker service or the ai-hub gateway this job depends on) before the outcome is reported; file a deploy-tail for that instead.',
+  'If your host has its own safety policy that asks you to confirm an exact push or deploy target, that is not a failure and not a blocker: list the full target (repo URL, branch, deploy host) in one request, and finish the chain once confirmed. Do not report the task as blocked or file a tail for it.',
+  'If validation, commit, push, or deploy is blocked, leave a precise handoff: changed files, checks passed/failed, blocker, and next step.',
+  'For a write task, finish with one standalone JSON line: {"delivery":{"committed":true|false,"pushed":true|false}}.',
+  'Use false/false only when requested changes remain uncommitted; omit this line for read-only tasks.',
+].join(' ');
 
 function json<T>(raw: string, fallback: T): T {
   try { return JSON.parse(raw) as T; } catch { return fallback; }
+}
+
+function sqliteUtcMillis(value: string): number {
+  const normalized = /(?:z|[+-]\d\d:\d\d)$/i.test(value.trim())
+    ? value.trim()
+    : `${value.trim().replace(' ', 'T')}Z`;
+  return Date.parse(normalized);
 }
 
 function hash(value: string): string {
@@ -23,6 +52,11 @@ function hash(value: string): string {
 
 function slug(value: unknown): string {
   return String(value ?? '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
+}
+
+function workspaceKey(value: string): string {
+  const normalized = normalizeWorkspace(value);
+  return /^[a-z]:\\/i.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 function publicWorker(row: WorkerRow) {
@@ -62,6 +96,19 @@ function workerFrom(req: Request, db: Db): WorkerRow | null {
 
 export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
   const r = Router();
+  const activeRows = (workerId: string): JobRow[] => db.prepare(
+    `SELECT * FROM jobs
+     WHERE worker_id = ? AND status IN ('claimed','running','recovering','pause_requested','cancel_requested')`
+  ).all(workerId) as JobRow[];
+  const updateWorkerRuntimeStatus = (workerId: string, touch = true): void => {
+    const worker = db.prepare('SELECT * FROM workers WHERE id = ?').get(workerId) as WorkerRow;
+    const status = activeRows(workerId).length > 0
+      ? 'busy'
+      : worker.accepting_jobs === 1 ? 'online' : 'paused';
+    db.prepare(
+      `UPDATE workers SET status = ?${touch ? ", last_seen_at = datetime('now')" : ''} WHERE id = ?`
+    ).run(status, workerId);
+  };
 
   r.get('/workers', (_req, res) => {
     jobs.reap();
@@ -106,9 +153,9 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       return res.status(400).json({ error: 'enabled boolean required' });
     }
     const enabled = req.body.enabled === true;
-    const nextStatus = worker.status === 'busy' ? 'busy' : enabled ? 'online' : 'paused';
-    db.prepare('UPDATE workers SET accepting_jobs = ?, status = ? WHERE id = ?')
-      .run(enabled ? 1 : 0, nextStatus, worker.id);
+    db.prepare('UPDATE workers SET accepting_jobs = ? WHERE id = ?')
+      .run(enabled ? 1 : 0, worker.id);
+    updateWorkerRuntimeStatus(worker.id, false);
     const updated = db.prepare('SELECT * FROM workers WHERE id = ?').get(worker.id) as WorkerRow;
     const payload = publicWorker(updated);
     sse.broadcast('worker', payload);
@@ -197,9 +244,10 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     const newBoot = !!bootId && bootId !== worker.boot_id;
     const acceptingJobs = newBoot ? 1 : worker.accepting_jobs;
     db.prepare(
-      `UPDATE workers SET capabilities = ?, status = ?, accepting_jobs = ?,
+      `UPDATE workers SET capabilities = ?, accepting_jobs = ?,
        boot_id = CASE WHEN ? <> '' THEN ? ELSE boot_id END, last_seen_at = datetime('now') WHERE id = ?`
-    ).run(JSON.stringify(caps), acceptingJobs ? 'online' : 'paused', acceptingJobs, bootId, bootId, worker.id);
+    ).run(JSON.stringify(caps), acceptingJobs, bootId, bootId, worker.id);
+    updateWorkerRuntimeStatus(worker.id);
     const updated = db.prepare('SELECT * FROM workers WHERE id = ?').get(worker.id) as WorkerRow;
     sse.broadcast('worker', publicWorker(updated));
     res.json({ worker: publicWorker(updated), leaseSeconds: LEASE_SECONDS });
@@ -212,6 +260,10 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     const caps = json<Capabilities>(fresh.capabilities, {});
     const runners = Array.isArray(caps.runners) ? caps.runners : [];
     const roots = Array.isArray(caps.workspaces) ? caps.workspaces : [];
+    const maxConcurrent = Math.min(Math.max(Number(caps.maxConcurrent) || 1, 1), 8);
+    const active = activeRows(worker.id);
+    if (active.length >= maxConcurrent) return null;
+    const lockedWorkspaces = new Set(active.map((job) => workspaceKey(job.workspace)));
     const candidates = db.prepare(
       `SELECT * FROM jobs WHERE deleted = 0 AND status = 'pending' AND (worker_id IS NULL OR worker_id = ?)
        ORDER BY priority DESC, created_at ASC LIMIT 50`
@@ -220,6 +272,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       const perms = json<{ shell?: boolean; ssh?: boolean }>(job.permissions, {});
       if (!runners.includes(job.runner) || !workspaceAllowed(job.workspace, roots)) continue;
       if (perms.shell && !caps.shell || perms.ssh && !caps.ssh) continue;
+      if (lockedWorkspaces.has(workspaceKey(job.workspace))) continue;
       const result = db.prepare(
         `UPDATE jobs SET worker_id = ?, status = 'claimed', lease_until = datetime('now', ?),
          updated_at = datetime('now') WHERE id = ? AND status = 'pending'`
@@ -227,6 +280,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       if (result.changes) {
         jobs.addMessage(job.id, worker.id, 'state', 'Worker 已认领任务');
         jobs.emitJob(job.id);
+        updateWorkerRuntimeStatus(worker.id);
         return jobs.get(job.id)!;
       }
     }
@@ -242,12 +296,20 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     while (!closed) {
       const current = db.prepare('SELECT * FROM workers WHERE id = ?').get(worker.id) as WorkerRow;
       if (current.accepting_jobs !== 1) {
-        db.prepare("UPDATE workers SET status = 'paused', last_seen_at = datetime('now') WHERE id = ?").run(worker.id);
+        updateWorkerRuntimeStatus(worker.id);
         return res.json({ job: null, acceptingJobs: false });
       }
-      db.prepare("UPDATE workers SET status = 'online', last_seen_at = datetime('now') WHERE id = ?").run(worker.id);
+      updateWorkerRuntimeStatus(worker.id);
       const job = tryClaim(worker);
-      if (job) return res.json({ job: publicJob(job), acceptingJobs: true, leaseSeconds: LEASE_SECONDS });
+      if (job) {
+        return res.json({
+          job: publicJob(job),
+          acceptingJobs: true,
+          leaseSeconds: LEASE_SECONDS,
+          protocolVersion: WORKER_PROTOCOL_VERSION,
+          deliveryContract: DELIVERY_CONTRACT,
+        });
+      }
       if (Date.now() >= deadline) return res.json({ job: null, acceptingJobs: true });
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
@@ -275,11 +337,18 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     const evidence = req.body?.evidence && typeof req.body.evidence === 'object'
       ? req.body.evidence as Record<string, unknown>
       : null;
+    const blockedAtMs = sqliteUtcMillis(job.updated_at);
+    const serverBlockedForMs = Number.isFinite(blockedAtMs)
+      ? Math.max(Date.now() - blockedAtMs, 0)
+      : 0;
+    const historyEvidence = evidence?.ancestorIncluded === true;
+    const staleFallback = evidence?.staleFallback === true
+      && serverBlockedForMs >= BLOCKED_RECONCILE_GRACE_MS;
     if (
       !/^[0-9a-f]{7,64}$/i.test(head)
       || evidence?.dirty !== false
       || evidence?.ahead !== 0
-      || evidence?.ancestorIncluded !== true
+      || (!historyEvidence && !staleFallback)
     ) {
       return res.status(400).json({ error: 'clean synchronized git evidence required' });
     }
@@ -295,12 +364,58 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       ...previous,
       state: 'delivered',
       reconciledAt: new Date().toISOString(),
-      reconciliation: { ...evidence, head },
+      reconciliation: {
+        ...evidence,
+        head,
+        serverBlockedForMs,
+        mode: staleFallback ? 'clean-timeout-fallback' : 'git-history',
+      },
     }).slice(0, 100_000);
     const outcome = jobs.reconcileBlocked(job, worker.id, deliveryMeta, head);
     if ('error' in outcome) return res.status(409).json({ error: outcome.error });
     db.prepare("UPDATE workers SET last_seen_at = datetime('now') WHERE id = ?").run(worker.id);
     res.json({ ok: true, status: outcome.status });
+  });
+
+  r.post('/worker/jobs/:id/recover', (req, res) => {
+    const worker = workerFrom(req, db);
+    if (!worker) return res.status(401).json({ error: 'invalid worker token' });
+    const job = db.prepare('SELECT * FROM jobs WHERE id = ? AND worker_id = ?')
+      .get(req.params.id, worker.id) as JobRow | undefined;
+    if (!job) return res.status(404).json({ error: 'job not found' });
+    const action = job.status === 'cancel_requested'
+      ? 'cancel'
+      : job.status === 'pause_requested' ? 'pause' : 'continue';
+    if (action !== 'continue') return res.json({ ok: true, action, status: job.status });
+    if (!['claimed', 'running', 'recovering'].includes(job.status)) {
+      return res.status(409).json({ error: `cannot recover from ${job.status}` });
+    }
+    const mode = req.body?.mode === 'reattach'
+      ? 'reattach'
+      : req.body?.mode === 'restart' ? 'restart' : 'resume';
+    const sessionId = typeof req.body?.sessionId === 'string'
+      && /^[a-zA-Z0-9_-]{1,128}$/.test(req.body.sessionId)
+      ? req.body.sessionId
+      : null;
+    const result = db.prepare(
+      `UPDATE jobs SET status = 'running', lease_until = datetime('now', ?),
+       session_id = COALESCE(?, session_id), error = NULL, updated_at = datetime('now')
+       WHERE id = ? AND worker_id = ? AND status IN ('claimed','running','recovering')`
+    ).run(`+${LEASE_SECONDS} seconds`, sessionId, job.id, worker.id);
+    if (!result.changes) return res.status(409).json({ error: 'job changed before recovery' });
+    jobs.addMessage(
+      job.id,
+      worker.id,
+      'state',
+      mode === 'reattach'
+        ? `Worker 重启恢复：重新接管仍存活的 runner PID ${Number(req.body?.childPid) || 'unknown'}`
+        : mode === 'restart'
+          ? 'Worker 重启恢复：任务尚未启动，重新开始 runner'
+          : `Worker 重启恢复：续接 CLI session ${sessionId ?? job.session_id ?? 'unknown'}`
+    );
+    jobs.emitJob(job.id);
+    updateWorkerRuntimeStatus(worker.id);
+    res.json({ ok: true, action: 'continue', status: 'running' });
   });
 
   r.post('/worker/jobs/:id/start', (req, res) => {
@@ -313,6 +428,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     if (!result.changes) return res.status(409).json({ error: 'job is not claimed by this worker' });
     jobs.addMessage(req.params.id, worker.id, 'state', '开始执行');
     jobs.emitJob(req.params.id);
+    updateWorkerRuntimeStatus(worker.id);
     res.json({ ok: true });
   });
 
@@ -321,8 +437,14 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     if (!worker) return res.status(401).json({ error: 'invalid worker token' });
     const job = db.prepare('SELECT * FROM jobs WHERE id = ? AND worker_id = ?').get(req.params.id, worker.id) as JobRow | undefined;
     if (!job) return res.status(404).json({ error: 'job not found' });
-    db.prepare("UPDATE workers SET status = 'busy', last_seen_at = datetime('now') WHERE id = ?").run(worker.id);
-    if (ACTIVE_STATUSES.has(job.status)) {
+    updateWorkerRuntimeStatus(worker.id);
+    if (job.status === 'recovering') {
+      db.prepare(
+        `UPDATE jobs SET status = 'running', error = NULL, lease_until = datetime('now', ?),
+         updated_at = datetime('now') WHERE id = ?`
+      ).run(`+${LEASE_SECONDS} seconds`, job.id);
+      jobs.emitJob(job.id);
+    } else if (ACTIVE_STATUSES.has(job.status)) {
       db.prepare("UPDATE jobs SET lease_until = datetime('now', ?), updated_at = datetime('now') WHERE id = ?")
         .run(`+${LEASE_SECONDS} seconds`, job.id);
     }
@@ -367,9 +489,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       : null;
     const deliveryMeta = delivery ? JSON.stringify(delivery).slice(0, 100_000) : null;
     const status = jobs.complete(job, req.body?.status, result, error, deliveryState, deliveryMeta);
-    const fresh = db.prepare('SELECT accepting_jobs FROM workers WHERE id = ?').get(worker.id) as { accepting_jobs: number };
-    db.prepare("UPDATE workers SET status = ?, last_seen_at = datetime('now') WHERE id = ?")
-      .run(fresh.accepting_jobs === 1 ? 'online' : 'paused', worker.id);
+    updateWorkerRuntimeStatus(worker.id);
     res.json({ ok: true, status });
   });
 

@@ -10,11 +10,14 @@ import {
   chooseRecipient,
   dailyPolicyState,
   DELIVERY_POOL_DAILY,
+  DELIVERY_POOL_IDEA,
   DELIVERY_POOL_TASK,
   estimateCostCny,
   isShanghaiSilentHour,
+  ideaPolicyState,
   nextTimerDelay,
   normalizeEvent,
+  normalizeIdeaConfig,
   normalizeProactiveConfig,
   parseTriageJson,
   shanghaiClock,
@@ -30,10 +33,10 @@ test('strict triage JSON accepts the contract and rejects invalid priority/categ
     actionable: true,
     category: 'calendar',
     priority: 2,
-    suggestedRecipient: 'cove',
+    suggestedRecipient: 'beta',
     rationale: 'deadline is near',
   }));
-  assert.equal(parsed.suggestedRecipient, 'cove');
+  assert.equal(parsed.suggestedRecipient, 'beta');
   assert.throws(() => parseTriageJson(JSON.stringify({
     ...parsed,
     priority: 4,
@@ -90,6 +93,23 @@ test('cost estimate uses separately configurable input and output prices', () =>
   ), 0.002);
 });
 
+test('idea config uses an independent one-per-day room pool', () => {
+  const config = normalizeIdeaConfig({
+    enabled: true,
+    roomId: 'room',
+    reactionRounds: 3,
+    dailyDispatchLimit: 1,
+  });
+  assert.equal(config.hostName, 'DS 主持');
+  assert.equal(config.reactionRounds, 3);
+  assert.equal(ideaPolicyState(config, { count: 0 }).poolFull, false);
+  assert.equal(ideaPolicyState(config, { count: 1 }).poolFull, true);
+  assert.throws(
+    () => normalizeIdeaConfig({ enabled: true, roomId: 'room', reactionRounds: 4 }),
+    /reactionRounds/,
+  );
+});
+
 test('SQLite queue deduplicates, recovers leases, retries, and reports metrics', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-triage-'));
   const store = new TriageStore(path.join(dir, 'triage.db'));
@@ -117,19 +137,22 @@ test('SQLite queue deduplicates, recovers leases, retries, and reports metrics',
     assert.equal(final.triageResult.rationale, 'cached');
     assert.equal(final.cost_cny, 0.0002);
     assert.equal(final.triage_latency_ms, 123);
-    store.recordDelivery(final.id, 'cove', 3000);
+    store.recordDelivery(final.id, 'beta', 3000);
+    store.recordDelivery(final.id, 'room', 3000, DELIVERY_POOL_IDEA);
     store.finish(final.id, 'dispatched', {
-      recipientId: 'cove',
+      recipientId: 'beta',
       triageResult: { fallbackUsed: false },
       costCny: 0.0005,
       triageLatencyMs: 123,
     }, 3000);
-    assert.equal(store.recipientUsage('cove', 3000).count, 1);
+    assert.equal(store.recipientUsage('beta', 3000).count, 1);
     const summary = store.dailySummary(3000);
     assert.equal(summary.total, 1);
-    assert.equal(summary.deliveries[0].recipient_id, 'cove');
+    assert.equal(summary.deliveries[0].recipient_id, 'beta');
     assert.equal(summary.triagedCount, 1);
     assert.equal(summary.avgTriageLatencyMs, 123);
+    assert.equal(summary.ideaPoolDispatched, 1);
+    assert.ok(summary.lastIdeaDeliveryAt);
     // A signal-driven shutdown and the run() finally block both close the
     // store; the second call must not throw ERR_INVALID_STATE.
     store.close();
@@ -143,8 +166,8 @@ test('SQLite queue deduplicates, recovers leases, retries, and reports metrics',
 test('router prefers explicit idle target then applies daily and cooldown limits', () => {
   const contacts = [
     {
-      id: 'cheng',
-      name: 'Cheng',
+      id: 'alpha',
+      name: 'Agent Alpha',
       state: 'active',
       config: {
         routing: {
@@ -157,8 +180,8 @@ test('router prefers explicit idle target then applies daily and cooldown limits
       },
     },
     {
-      id: 'cove',
-      name: 'Cove',
+      id: 'beta',
+      name: 'Agent Beta',
       state: 'idle',
       config: {
         routing: {
@@ -185,7 +208,7 @@ test('router prefers explicit idle target then applies daily and cooldown limits
     usageOf: () => ({ count: 0, lastAt: null }),
     now: 100_000,
   });
-  assert.equal(routed.contact.id, 'cove');
+  assert.equal(routed.contact.id, 'beta');
 
   const limited = chooseRecipient({
     contacts: contacts.map((contact) => ({ ...contact, state: 'idle' })),
@@ -199,37 +222,37 @@ test('router prefers explicit idle target then applies daily and cooldown limits
 
 test('daily model routing ignores rules and task recipient quotas', () => {
   const contacts = [
-    { id: 'cheng', name: '橙', state: 'idle', config: { routing: { enabled: true, recipientKey: 'cheng', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
-    { id: 'cove', name: 'Cove', state: 'idle', config: { routing: { enabled: true, recipientKey: 'cove', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
-    { id: 'aye', name: '阿野', state: 'idle', config: { routing: { enabled: true, recipientKey: 'aye', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
+    { id: 'alpha', name: 'Agent Alpha', state: 'idle', config: { routing: { enabled: true, recipientKey: 'alpha', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
+    { id: 'beta', name: 'Agent Beta', state: 'idle', config: { routing: { enabled: true, recipientKey: 'beta', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
+    { id: 'gamma', name: 'Agent Gamma', state: 'idle', config: { routing: { enabled: true, recipientKey: 'gamma', categories: ['system'], dailyLimit: 1, cooldownMinutes: 60 } } },
     { id: 'gem', name: 'Gemini', state: 'idle', config: { routing: { enabled: true, recipientKey: 'gem', categories: ['daily'], dailyLimit: 100, cooldownMinutes: 0 } } },
   ];
   const result = {
     actionable: true,
     category: 'daily',
     priority: 1,
-    suggestedRecipient: 'aye',
+    suggestedRecipient: 'gamma',
     rationale: 'light check-in fits Grok',
   };
   const routed = chooseRecipient({
     contacts,
     result,
-    rules: { daily: 'cheng' },
+    rules: { daily: 'alpha' },
     // Task quota already exhausted must not block the daily pool.
     usageOf: () => ({ count: 99, lastAt: 1 }),
-    allowedRecipientKeys: ['cheng', 'cove', 'aye'],
+    allowedRecipientKeys: ['alpha', 'beta', 'gamma'],
     ignoreRecipientLimits: true,
     modelOnly: true,
     now: 100_000,
   });
-  assert.equal(routed.contact.id, 'aye');
+  assert.equal(routed.contact.id, 'gamma');
   assert.equal(routed.reason, 'model-suggestion');
 
   const missing = chooseRecipient({
     contacts,
     result: { ...result, suggestedRecipient: null },
-    rules: { daily: 'cheng' },
-    allowedRecipientKeys: ['cheng', 'cove', 'aye'],
+    rules: { daily: 'alpha' },
+    allowedRecipientKeys: ['alpha', 'beta', 'gamma'],
     ignoreRecipientLimits: true,
     modelOnly: true,
   });
@@ -242,7 +265,7 @@ test('daily mode is source-owned and proactive safety config fails closed', () =
     actionable: true,
     category: 'daily',
     priority: 1,
-    suggestedRecipient: 'aye',
+    suggestedRecipient: 'gamma',
     rationale: 'natural check-in',
   };
   assert.throws(
@@ -251,12 +274,12 @@ test('daily mode is source-owned and proactive safety config fails closed', () =
   );
   assert.equal(validateTriageMode(dailyResult, {
     mode: 'daily',
-    dailyRecipients: ['cheng', 'cove', 'aye'],
+    dailyRecipients: ['alpha', 'beta', 'gamma'],
   }), dailyResult);
   assert.throws(
     () => validateTriageMode({ ...dailyResult, suggestedRecipient: 'gem' }, {
       mode: 'daily',
-      dailyRecipients: ['cheng', 'cove', 'aye'],
+      dailyRecipients: ['alpha', 'beta', 'gamma'],
     }),
     /allowed recipient/,
   );
@@ -344,7 +367,7 @@ test('legacy SQLite deliveries without pool column migrate on open', () => {
   try {
     store.enqueue({ source: 'legacy', summary: 'after migrate', dedupeKey: 'legacy-1' });
     const claimed = store.claim();
-    store.recordDelivery(claimed.id, 'cove', Date.now(), DELIVERY_POOL_DAILY);
+    store.recordDelivery(claimed.id, 'beta', Date.now(), DELIVERY_POOL_DAILY);
     assert.equal(store.poolUsage(DELIVERY_POOL_DAILY).count, 1);
   } finally {
     store.close();
@@ -375,34 +398,34 @@ test('Shanghai silent window and daily delivery pools stay separate from task qu
     store.enqueue({ source: 'task', summary: 'work item', dedupeKey: 't1' });
     store.enqueue({ source: 'daily', summary: 'care item', dedupeKey: 'd1' });
     const task = store.claim(now);
-    store.recordDelivery(task.id, 'cheng', now, DELIVERY_POOL_TASK);
+    store.recordDelivery(task.id, 'alpha', now, DELIVERY_POOL_TASK);
     store.finish(task.id, 'dispatched', {
-      recipientId: 'cheng',
+      recipientId: 'alpha',
       triageResult: {
         actionable: true,
         category: 'system',
         priority: 1,
-        suggestedRecipient: 'cheng',
+        suggestedRecipient: 'alpha',
         rationale: 'task',
       },
     }, now);
     const daily = store.claim(now + 1);
-    store.recordDelivery(daily.id, 'cheng', now + 1, DELIVERY_POOL_DAILY);
+    store.recordDelivery(daily.id, 'alpha', now + 1, DELIVERY_POOL_DAILY);
     store.finish(daily.id, 'dispatched', {
-      recipientId: 'cheng',
+      recipientId: 'alpha',
       triageResult: {
         actionable: true,
         category: 'daily',
         priority: 1,
-        suggestedRecipient: 'cheng',
+        suggestedRecipient: 'alpha',
         rationale: 'care',
       },
     }, now + 1);
 
-    assert.equal(store.recipientUsage('cheng', now + 1, DELIVERY_POOL_TASK).count, 1);
-    assert.equal(store.recipientUsage('cheng', now + 1, DELIVERY_POOL_DAILY).count, 1);
+    assert.equal(store.recipientUsage('alpha', now + 1, DELIVERY_POOL_TASK).count, 1);
+    assert.equal(store.recipientUsage('alpha', now + 1, DELIVERY_POOL_DAILY).count, 1);
     // Task quota path only sees the task pool.
-    assert.equal(store.recipientUsage('cheng', now + 1).count, 1);
+    assert.equal(store.recipientUsage('alpha', now + 1).count, 1);
     assert.deepEqual(store.poolUsage(DELIVERY_POOL_DAILY, now + 1), {
       count: 1,
       lastAt: now + 1,

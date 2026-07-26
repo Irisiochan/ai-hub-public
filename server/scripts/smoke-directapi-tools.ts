@@ -6,6 +6,9 @@
  */
 import http from 'node:http';
 import { DirectApiBackend } from '../src/agents/directApi.js';
+import { AnthropicProvider } from '../src/agents/directApi/anthropic.js';
+import { GeminiProvider } from '../src/agents/directApi/gemini.js';
+import { OpenAiProvider } from '../src/agents/directApi/openai.js';
 
 function sse(res: http.ServerResponse, events: unknown[], done = true) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -93,7 +96,13 @@ const openaiSrv = http.createServer((req, res) => {
             { delta: { tool_calls: [{ index: 0, function: { arguments: 'ries/user-profile.md"}' } }] }, finish_reason: 'tool_calls' },
           ],
         },
-        { usage: { prompt_tokens: 100, completion_tokens: 20 } },
+        {
+          usage: {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            prompt_tokens_details: { cached_tokens: 11 },
+          },
+        },
       ]);
     } else {
       const toolMsg = parsed.messages.find((m: any) => m.role === 'tool');
@@ -118,6 +127,14 @@ const anthropicSrv = http.createServer((req, res) => {
   req.on('end', () => {
     const parsed = JSON.parse(body);
     anthropicHits++;
+    const breakpointCount = (JSON.stringify(parsed).match(/"cache_control"/g) ?? []).length;
+    const expectedBreakpoints = anthropicHits === 1 ? 1 : 2;
+    if (breakpointCount !== expectedBreakpoints) {
+      throw new Error(`expected ${expectedBreakpoints} Anthropic cache breakpoints, got ${breakpointCount}`);
+    }
+    if ((JSON.stringify(parsed).match(/"ttl":"1h"/g) ?? []).length !== expectedBreakpoints) {
+      throw new Error('every Anthropic cache breakpoint must use 1h TTL');
+    }
     if (anthropicHits === 1) {
       if (!parsed.tools?.length) throw new Error('tools not declared');
       sse(
@@ -237,6 +254,7 @@ const [oPort, aPort, gPort] = await Promise.all(
   )
 );
 
+const smokeLogs: string[] = [];
 const common = {
   apiKey: 'test-key',
   model: 'mock-model',
@@ -250,7 +268,10 @@ const common = {
   db: fakeDb,
   uploadsDir: process.cwd(),
   contactId: 'c1',
-  log: (m: string) => console.log(`  log: ${m}`),
+  log: (m: string) => {
+    smokeLogs.push(m);
+    console.log(`  log: ${m}`);
+  },
   vault: fakeVault,
 };
 
@@ -261,7 +282,11 @@ const openaiBackend = new DirectApiBackend({
 });
 await openaiBackend.start(null);
 await runTurn(openaiBackend, 'openai-compat', 'read_file', (usage) => {
-  if (usage?.cacheRead !== 15) throw new Error(`expected cacheRead=15 from prompt_cache_hit_tokens, got ${usage?.cacheRead}`);
+  if (usage?.cacheRead !== 26) {
+    throw new Error(
+      `expected cacheRead=26 from standard cached_tokens + prompt_cache_hit_tokens, got ${usage?.cacheRead}`
+    );
+  }
 });
 
 const anthropicBackend = new DirectApiBackend({
@@ -286,6 +311,30 @@ await runTurn(geminiBackend, 'gemini', 'read_file', (usage) => {
   if (usage?.cacheRead !== 7) throw new Error(`expected final-round cacheRead=7, got ${usage?.cacheRead}`);
   if (usage?.providerRounds !== 2) throw new Error(`expected providerRounds=2, got ${usage?.providerRounds}`);
 });
+if (!smokeLogs.some((line) => line.includes(
+  'gemini usageMetadata={"promptTokenCount":180,"candidatesTokenCount":20,"thoughtsTokenCount":5,"cachedContentTokenCount":7}'
+))) {
+  throw new Error('expected complete Gemini usageMetadata diagnostic log');
+}
+
+const disabledConfig = {
+  baseUrl: 'https://example.invalid',
+  apiKey: 'unused',
+  model: 'unused',
+  maxTokens: 1,
+  promptCache: 'off' as const,
+};
+for (const provider of [
+  new OpenAiProvider(disabledConfig),
+  new GeminiProvider(disabledConfig),
+  new AnthropicProvider(disabledConfig),
+]) {
+  const usage = provider.createUsage();
+  provider.mergeUsage(usage, { input: 1, output: 1, cacheRead: 9, cacheCreation: 3 });
+  if ('cacheRead' in usage || 'cacheCreation' in usage) {
+    throw new Error(`${provider.constructor.name} must hide cache usage when promptCache=off`);
+  }
+}
 
 console.log(`vault calls: ${JSON.stringify(fakeVault.calls)}`);
 openaiSrv.close();

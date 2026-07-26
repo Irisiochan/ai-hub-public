@@ -2,9 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { HubConfig } from './config.js';
 import type { Db } from './db.js';
+import type { HubLogger } from './logger.js';
 
 /** First-boot public seed: neutral product identities, never private personas. */
-export function seedIfEmpty(db: Db, config: HubConfig): void {
+export function seedIfEmpty(db: Db, config: HubConfig, logger?: HubLogger): void {
   const count = db.prepare('SELECT COUNT(*) AS c FROM contacts').get() as { c: number };
   if (count.c > 0) return;
 
@@ -22,6 +23,7 @@ export function seedIfEmpty(db: Db, config: HubConfig): void {
         '',
         '- Reply like a natural chat message; stay concise unless detail is useful.',
         '- Do not infer the user\'s identity or your persona from memory metadata.',
+        '- When WORKFLOW_PRELOADED is present, do not reread global workflow files.',
         '- Use only the tools and workspaces explicitly enabled for this contact.',
         '',
       ].join('\n'),
@@ -66,5 +68,12 @@ export function seedIfEmpty(db: Db, config: HubConfig): void {
     2
   );
 
-  console.log('  seeded contacts: Claude Code, Codex, Grok Build');
+  if (logger) {
+    logger.info(
+      { component: 'seed', contacts: ['claude-code', 'codex', 'grok-build'] },
+      'seeded neutral first-boot contacts'
+    );
+  } else {
+    console.log('  seeded contacts: Claude Code, Codex, Grok Build');
+  }
 }

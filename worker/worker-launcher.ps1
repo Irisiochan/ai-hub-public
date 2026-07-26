@@ -9,12 +9,24 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $Config) { $Config = Join-Path $PSScriptRoot 'config.json' }
 $Config = [IO.Path]::GetFullPath($Config)
-$script:LauncherVersion = 1
+$script:LauncherVersion = 2
 $script:WorkerDir = $PSScriptRoot
 $script:LauncherPath = $MyInvocation.MyCommand.Path
 $script:WorkerPath = Join-Path $script:WorkerDir 'worker.mjs'
-$script:StatePath = Join-Path $script:WorkerDir 'launcher-state.json'
-$script:StateTmpPath = "$script:StatePath.tmp"
+$script:StateStorePath = Join-Path $script:WorkerDir 'state-store.mjs'
+$script:LegacyStatePath = Join-Path $script:WorkerDir 'launcher-state.json'
+$stateFile = 'worker-state.json'
+if (Test-Path -LiteralPath $Config) {
+  try {
+    $stateConfig = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
+    if ($stateConfig.stateFile) { $stateFile = [string]$stateConfig.stateFile }
+  } catch {}
+}
+$script:StatePath = if ([IO.Path]::IsPathRooted($stateFile)) {
+  [IO.Path]::GetFullPath($stateFile)
+} else {
+  [IO.Path]::GetFullPath((Join-Path (Split-Path $Config -Parent) $stateFile))
+}
 $script:StopPath = Join-Path $script:WorkerDir 'launcher.stop'
 $script:LogPath = Join-Path $script:WorkerDir 'worker.log'
 $script:RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -57,13 +69,23 @@ function Save-State(
     serverUrl = if ($script:Status) { $script:Status.serverUrl } else { $null }
   }
   $json = $script:Status | ConvertTo-Json -Depth 5
-  [IO.File]::WriteAllText($script:StateTmpPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-  Move-Item -LiteralPath $script:StateTmpPath -Destination $script:StatePath -Force
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+  $node = (Get-Command node -ErrorAction Stop).Source
+  & $node $script:StateStorePath patch-launcher $script:StatePath $encoded
+  if ($LASTEXITCODE -ne 0) { throw "state-store exited with code $LASTEXITCODE" }
 }
 
 function Read-State {
-  if (-not (Test-Path -LiteralPath $script:StatePath)) { return $null }
-  try { return Get-Content -LiteralPath $script:StatePath -Raw | ConvertFrom-Json } catch { return $null }
+  if (Test-Path -LiteralPath $script:StatePath) {
+    try {
+      $shared = Get-Content -LiteralPath $script:StatePath -Raw | ConvertFrom-Json
+      if ($shared.launcher) { return $shared.launcher }
+    } catch {}
+  }
+  if (Test-Path -LiteralPath $script:LegacyStatePath) {
+    try { return Get-Content -LiteralPath $script:LegacyStatePath -Raw | ConvertFrom-Json } catch {}
+  }
+  return $null
 }
 
 function Test-ProcessAlive([int]$TargetPid) {
@@ -200,6 +222,7 @@ function Invoke-LauncherRun {
     Remove-Item -LiteralPath $script:StopPath -Force -ErrorAction SilentlyContinue
     if (-not (Test-Path -LiteralPath $Config)) { throw "missing config: $Config" }
     if (-not (Test-Path -LiteralPath $script:WorkerPath)) { throw "missing worker: $script:WorkerPath" }
+    if (-not (Test-Path -LiteralPath $script:StateStorePath)) { throw "missing state store: $script:StateStorePath" }
     $node = (Get-Command node -ErrorAction Stop).Source
     $cfg = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
     $serverUrl = [string]$cfg.serverUrl
@@ -227,7 +250,6 @@ function Invoke-LauncherRun {
         if (-not (Wait-Controlled 10)) { break }
       }
       if (Test-StopRequested) { break }
-
       try {
         $script:Child = Start-WorkerProcess $node
         Save-State 'starting' 'worker process started' $script:Child.Id

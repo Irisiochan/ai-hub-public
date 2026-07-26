@@ -47,6 +47,8 @@ export interface TurnHandle {
 export interface TurnInput {
   text: string;
   userMessageId?: number;
+  /** 群聊本轮实际投递的消息 ID。API 历史据此区分“本轮新消息”和旧记录。 */
+  roomMessageIds?: number[];
   /** Trusted absolute paths resolved by the gateway from persisted attachments. */
   imagePaths?: string[];
 }
@@ -59,6 +61,8 @@ export interface AgentBackend {
   /** One turn. Caller guarantees serialization — never called concurrently. */
   sendTurn(input: TurnInput): TurnHandle;
   alive(): boolean;
+  /** Optional cache invalidation for DB-backed history implementations. */
+  invalidateHistory?(affectedFromId?: number): void;
   stop(): Promise<void>;
 }
 

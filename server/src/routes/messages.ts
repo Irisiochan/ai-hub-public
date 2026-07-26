@@ -1,4 +1,5 @@
 import { Router, type RequestHandler } from 'express';
+import crypto from 'node:crypto';
 import multer from 'multer';
 import type { AgentManager } from '../agents/manager.js';
 import {
@@ -12,9 +13,25 @@ import {
 } from '../attachments.js';
 import type { ContactRow, Db, MessageRow } from '../db.js';
 import type { SseHub } from '../sse.js';
+import { UsageRepo } from '../agents/usageRepo.js';
 
 export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploadsDir: string): Router {
   const r = Router();
+  const usageRepo = new UsageRepo(db);
+  // Room execution is in-memory, but its observable status is durable. Any
+  // round still marked running when the gateway constructs a fresh router was
+  // interrupted by the previous process and must fail closed instead of
+  // leaving the worker polling forever.
+  db.prepare(
+    `UPDATE messages
+     SET meta = json_set(
+       COALESCE(meta, '{}'),
+       '$.roomHost.status', 'error',
+       '$.roomHost.error', 'gateway restarted before room round completion'
+     )
+     WHERE sender = 'room-host'
+       AND json_extract(meta, '$.roomHost.status') = 'running'`
+  ).run();
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: MAX_IMAGE_BYTES, files: MAX_IMAGES_PER_MESSAGE },
@@ -39,6 +56,27 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     db.prepare('SELECT * FROM contacts WHERE id = ? AND enabled = 1').get(id) as
       | ContactRow
       | undefined;
+
+  const parseMeta = (row: MessageRow): Record<string, any> => {
+    try {
+      return JSON.parse(row.meta || '{}') as Record<string, any>;
+    } catch {
+      return {};
+    }
+  };
+
+  const roomHostResponse = (row: MessageRow) => {
+    const roomHost = parseMeta(row).roomHost ?? {};
+    return {
+      messageId: row.id,
+      roundId: roomHost.roundId ?? null,
+      status: roomHost.status ?? 'done',
+      targets: roomHost.targets ?? [],
+      lastMessageId: roomHost.lastMessageId ?? row.id,
+      outcome: roomHost.outcome ?? null,
+      error: roomHost.error ?? null,
+    };
+  };
 
   r.get('/:id/messages', (req, res) => {
     const contact = getContact(req.params.id);
@@ -73,6 +111,136 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
       ).reverse();
     }
     res.json({ messages: withAttachmentsMany(db, rows) });
+  });
+
+  r.get('/:id/room-rounds/:roundId', (req, res) => {
+    const contact = getContact(req.params.id);
+    if (!contact) return res.status(404).json({ error: 'contact not found' });
+    if (contact.kind !== 'room') return res.status(400).json({ error: 'contact is not a room' });
+    const row = db.prepare(
+      `SELECT * FROM messages
+       WHERE contact_id = ? AND sender = 'room-host'
+         AND json_extract(meta, '$.roomHost.roundId') = ?
+       ORDER BY id DESC LIMIT 1`
+    ).get(contact.id, req.params.roundId) as MessageRow | undefined;
+    if (!row) return res.status(404).json({ error: 'room round not found' });
+    res.json(roomHostResponse(row));
+  });
+
+  /** 非用户发起的群主持消息。该入口永不触发 memory capture。 */
+  r.post('/:id/room-host/messages', (req, res) => {
+    const contact = getContact(req.params.id);
+    if (!contact) return res.status(404).json({ error: 'contact not found' });
+    if (contact.kind !== 'room') return res.status(400).json({ error: 'contact is not a room' });
+
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    if (!content) return res.status(400).json({ error: 'content is required' });
+    const hostName = typeof req.body?.hostName === 'string' && req.body.hostName.trim()
+      ? req.body.hostName.trim().slice(0, 80)
+      : 'DS 主持';
+    const trigger = req.body?.trigger !== false;
+    const idempotencyKey = typeof req.body?.idempotencyKey === 'string'
+      ? req.body.idempotencyKey.trim().slice(0, 200)
+      : '';
+
+    if (idempotencyKey) {
+      const existing = db.prepare(
+        `SELECT * FROM messages
+         WHERE contact_id = ? AND sender = 'room-host'
+           AND json_extract(meta, '$.roomHost.idempotencyKey') = ?
+         ORDER BY id DESC LIMIT 1`
+      ).get(contact.id, idempotencyKey) as MessageRow | undefined;
+      if (existing) return res.status(200).json(roomHostResponse(existing));
+    }
+
+    const members = manager.imageRoomMembers(contact);
+    const requested: string[] = Array.isArray(req.body?.targetIds)
+      ? [...new Set<string>(
+        req.body.targetIds
+          .map((value: unknown) => String(value).trim())
+          .filter((value: string) => Boolean(value))
+      )]
+      : [];
+    const targetOverride = requested.some((value: string) => value.toLowerCase() === 'all')
+      ? members
+      : requested.length > 0
+        ? members.filter((member) => requested.includes(member.id))
+        : manager.parseTargets(contact, content);
+    if (trigger && targetOverride.length === 0) {
+      return res.status(400).json({ error: 'room host message must target at least one room member' });
+    }
+
+    const roundId = crypto.randomUUID();
+    const initialMeta = {
+      roomHost: {
+        name: hostName,
+        roundId,
+        idempotencyKey: idempotencyKey || undefined,
+        status: trigger ? 'running' : 'done',
+        targets: targetOverride.map((member) => member.id),
+        reactionRounds: trigger
+          ? Math.min(Math.max(Number(req.body?.reactionRounds ?? 3), 0), 3)
+          : 0,
+      },
+    };
+    const result = db.prepare(
+      `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta)
+       VALUES (?, 'room-host', 'user', 'text', ?, 'done', ?)`
+    ).run(contact.id, content, JSON.stringify(initialMeta));
+    const row = db.prepare('SELECT * FROM messages WHERE id = ?')
+      .get(Number(result.lastInsertRowid)) as MessageRow;
+    sse.broadcast('message', withAttachments(db, row));
+
+    if (!trigger) {
+      const doneMeta = {
+        ...initialMeta,
+        roomHost: { ...initialMeta.roomHost, lastMessageId: row.id },
+      };
+      db.prepare('UPDATE messages SET meta = ? WHERE id = ?').run(JSON.stringify(doneMeta), row.id);
+      const doneRow = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow;
+      sse.broadcast('message', withAttachments(db, doneRow));
+      return res.status(201).json(roomHostResponse(doneRow));
+    }
+
+    const tracked = manager.dispatchRoomMessageTracked(contact, content, {
+      targetOverride,
+      capture: false,
+      reactionRounds: initialMeta.roomHost.reactionRounds,
+    });
+    void tracked.completion.then((outcome) => {
+      const lastMessageId = Number(
+        (db.prepare('SELECT COALESCE(MAX(id), ?) AS id FROM messages WHERE contact_id = ?')
+          .get(row.id, contact.id) as { id: number }).id
+      );
+      const doneMeta = {
+        ...initialMeta,
+        roomHost: {
+          ...initialMeta.roomHost,
+          status: 'done',
+          lastMessageId,
+          completedAt: new Date().toISOString(),
+          outcome,
+        },
+      };
+      db.prepare('UPDATE messages SET meta = ? WHERE id = ?').run(JSON.stringify(doneMeta), row.id);
+      const doneRow = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow;
+      sse.broadcast('message', withAttachments(db, doneRow));
+    }).catch((error: Error) => {
+      const failedMeta = {
+        ...initialMeta,
+        roomHost: {
+          ...initialMeta.roomHost,
+          status: 'error',
+          completedAt: new Date().toISOString(),
+          error: error.message.slice(0, 500),
+        },
+      };
+      db.prepare('UPDATE messages SET meta = ? WHERE id = ?').run(JSON.stringify(failedMeta), row.id);
+      const failedRow = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow;
+      sse.broadcast('message', withAttachments(db, failedRow));
+    });
+
+    res.status(202).json(roomHostResponse(row));
   });
 
   /** 编辑提示词并重新生成：内容可选更新，其后的消息全部软删，CLI 上下文重置回放。 */
@@ -120,43 +288,11 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     res.json({ ok: true });
   });
 
-  /** token 消耗聚合（api/订阅通用，来自 done 消息的 meta.usage）。 */
+  /** token 消耗聚合（api/订阅通用，由 migration trigger 维护索引表）。 */
   r.get('/:id/usage', (req, res) => {
     const contact = getContact(req.params.id);
     if (!contact) return res.status(404).json({ error: 'contact not found' });
-    const rows = db
-      .prepare(
-        `SELECT meta, created_at FROM messages
-         WHERE contact_id = ? AND deleted = 0 AND role = 'assistant' AND meta LIKE '%usage%'
-         ORDER BY id ASC`
-      )
-      .all(contact.id) as { meta: string; created_at: string }[];
-    const rawOffset = Number(req.query.tzOffset ?? 0);
-    const tzOffset = Number.isFinite(rawOffset) ? Math.max(-840, Math.min(840, rawOffset)) : 0;
-    const localDateKey = (date: Date) =>
-      new Date(date.getTime() - tzOffset * 60_000).toISOString().slice(0, 10);
-    const today = localDateKey(new Date());
-    const empty = () => ({ input: 0, output: 0, cacheCreation: 0, cacheRead: 0 });
-    const sum = { today: empty(), total: empty(), last: empty() };
-    for (const r2 of rows) {
-      try {
-        const u = JSON.parse(r2.meta)?.usage;
-        if (!u) continue;
-        sum.total.input += u.input ?? 0;
-        sum.total.output += u.output ?? 0;
-        sum.total.cacheCreation += u.cacheCreation ?? 0;
-        sum.total.cacheRead += u.cacheRead ?? 0;
-        const stamp = new Date(`${r2.created_at.replace(' ', 'T')}Z`);
-        if (!Number.isNaN(stamp.getTime()) && localDateKey(stamp) === today) {
-          sum.today.input += u.input ?? 0;
-          sum.today.output += u.output ?? 0;
-          sum.today.cacheCreation += u.cacheCreation ?? 0;
-          sum.today.cacheRead += u.cacheRead ?? 0;
-        }
-        sum.last = { ...empty(), ...u };
-      } catch {}
-    }
-    res.json(sum);
+    res.json(usageRepo.summary(contact.id, Number(req.query.tzOffset ?? -480)));
   });
 
   r.post('/:id/messages', receiveImages, (req, res) => {

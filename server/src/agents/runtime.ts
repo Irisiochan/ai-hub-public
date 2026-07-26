@@ -1,0 +1,692 @@
+import crypto from 'node:crypto';
+import type { HubConfig, MemoryConfig } from '../config.js';
+import { attachmentPathsForMessages, hardDeleteMessages } from '../attachments.js';
+import type { ContactRow, Db, MessageRow } from '../db.js';
+import { maybeCapture } from '../memory/capture.js';
+import { timestampedMessage } from '../memory/inject.js';
+import type { VaultClient } from '../memory/vaultClient.js';
+import { getUserProfile } from '../routes/user.js';
+import type { SseHub } from '../sse.js';
+import type { JobStore } from '../workers/jobStore.js';
+import type { HubLogger } from '../logger.js';
+import { BackendFactory } from './backendFactory.js';
+import { touchConversationSummary } from './conversationSummary.js';
+import { contactConfig, openContact } from './configSchemas.js';
+import { MessageRepo, type RoomDeliveryRow } from './messageRepo.js';
+import { PromptComposer, type PromptContext } from './promptComposer.js';
+import {
+  quotedRoomMessage,
+  roomTurnNotice,
+  type RoomTurnSender,
+} from './roomPrompt.js';
+import { SessionRepo } from './sessionRepo.js';
+import type { AgentBackend, TurnHandle } from './types.js';
+
+export type RoomTurnOutcome = 'spoke' | 'passed' | 'silent' | 'error';
+
+interface RoomDelivery {
+  text: string;
+  promptText: string;
+  upToId: number;
+  messageIds: number[];
+  senders: RoomTurnSender[];
+  imagePaths: string[];
+}
+
+type QueueItem =
+  | { kind: 'dm'; userMessageId: number; text: string; enqueuedAt: number }
+  // 群聊回合：出队时才构建增量 transcript；reaction = 接话轮（可 [PASS] 沉默）
+  | { kind: 'room-turn'; mode: 'normal' | 'reaction'; enqueuedAt: number; resolve: (r: RoomTurnOutcome) => void };
+
+const PASS_RE = /^[\s（(【\[]*(pass|不接话|沉默|skip)[\s）)】\]。.!～~]*$/i;
+
+function stableFinalText(streamedText: string, finalText: string): string {
+  if (!streamedText) return finalText;
+  if (!finalText || streamedText.startsWith(finalText)) return streamedText;
+  if (finalText.startsWith(streamedText)) return finalText;
+  return streamedText;
+}
+
+const QUEUE_CAP = 5;
+const CRASH_LOCKOUT = 3;
+const CRASH_WINDOW_MS = 5 * 60_000;
+
+export interface AgentDeps {
+  db: Db;
+  sse: SseHub;
+  config: HubConfig;
+  vault: VaultClient | null;
+  jobStore: JobStore | null;
+  logger?: HubLogger;
+}
+
+/**
+ * 一个"某成员在某会话里"的运行时。DM 时 convo === agent；
+ * 群聊时 convo 是 room 行、agent 是成员联系人（各成员独立会话互不拖累）。
+ */
+export class AgentRuntime {
+  private queue: QueueItem[] = [];
+  private running = false;
+  private backend: AgentBackend | null = null;
+  private backendStartedAt = 0;
+  private sessionInputTokens = 0;
+  private rolloverAfterTurn = false;
+  private currentHandle: TurnHandle | null = null;
+  private crashes: number[] = [];
+  private seenMemoryPaths = new Set<string>();
+  state = 'idle';
+
+  private readonly messages: MessageRepo;
+  private readonly sessions: SessionRepo;
+  private readonly prompts: PromptComposer;
+  private readonly backendFactory: BackendFactory;
+
+  constructor(private convo: ContactRow, private agent: ContactRow, private deps: AgentDeps) {
+    this.messages = new MessageRepo(deps.db);
+    this.sessions = new SessionRepo(deps.db);
+    this.prompts = new PromptComposer(deps.vault, this.messages);
+    this.backendFactory = new BackendFactory({
+      db: deps.db,
+      config: deps.config,
+      vault: deps.vault,
+      jobStore: deps.jobStore,
+      prompts: this.prompts,
+    });
+  }
+
+  private get isRoom(): boolean {
+    return this.convo.id !== this.agent.id;
+  }
+
+  private get memberId(): string {
+    return this.isRoom ? this.agent.id : '';
+  }
+
+  /** 记忆配置：全局 < 成员自己的 < 群覆盖 */
+  private memCfg(): MemoryConfig {
+    const agentCfg = contactConfig(this.agent);
+    const convoCfg = contactConfig(this.convo);
+    return {
+      ...this.deps.config.memory,
+      ...(agentCfg.memory ?? {}),
+      ...(this.isRoom ? convoCfg.memory ?? {} : {}),
+    };
+  }
+
+  async updateAgent(row: ContactRow): Promise<void> {
+    this.agent = openContact(row);
+    if (!this.isRoom) this.convo = this.agent;
+    if (this.backend) {
+      await this.backend.stop();
+      this.backend = null;
+    }
+  }
+
+  updateConvo(row: ContactRow): void {
+    if (this.isRoom) this.convo = openContact(row);
+  }
+
+  enqueue(item: { userMessageId: number; text: string }): 'queued' | 'full' {
+    if (this.queue.length >= QUEUE_CAP) return 'full';
+    this.queue.push({ kind: 'dm', ...item, enqueuedAt: Date.now() });
+    void this.run();
+    return 'queued';
+  }
+
+  /** 群聊回合：编排器 await 结果（spoke/silent/error），实现顺序发言与接话轮。 */
+  runRoomTurn(mode: 'normal' | 'reaction'): Promise<RoomTurnOutcome> {
+    return new Promise((resolve) => {
+      this.queue.push({ kind: 'room-turn', mode, enqueuedAt: Date.now(), resolve });
+      void this.run();
+    });
+  }
+
+  interrupt(): void {
+    void this.currentHandle?.interrupt();
+  }
+
+  async reset(): Promise<void> {
+    this.queue = [];
+    await this.backend?.stop();
+    this.backend = null;
+    this.crashes = [];
+    this.sessions.deactivate(this.convo.id, this.isRoom ? this.memberId : undefined);
+    this.setState('idle');
+  }
+
+  async stop(): Promise<void> {
+    await this.backend?.stop();
+    this.backend = null;
+  }
+
+  private log(msg: string, fields: Record<string, unknown> = {}): void {
+    const tag = this.isRoom ? `${this.convo.name}·${this.agent.name}` : this.agent.name;
+    this.deps.logger?.info({ component: 'agent', contactId: this.convo.id, agentId: this.agent.id, tag, ...fields }, msg);
+  }
+
+  /** Display name of the speaking agent (room member or DM contact). */
+  get agentName(): string {
+    return this.agent.name;
+  }
+
+  private setState(state: string, detail?: string): void {
+    this.state = state;
+    this.deps.sse.broadcast('status', {
+      contactId: this.convo.id,
+      state,
+      detail,
+      // Room turns must always carry the member display name — UI must never
+      // fall back to the room title (e.g. 「会议室 思考中」).
+      member: this.isRoom ? this.agent.name : undefined,
+    });
+  }
+
+  /** 发言人显示名：user → 当前用户资料名，其余查联系人表。 */
+  private nameOf(sender: string): string {
+    if (sender === 'user') return getUserProfile(this.deps.db).name;
+    if (sender === 'room-host') return 'DS 主持';
+    if (sender === this.agent.id) return this.agent.name;
+    return this.messages.contactName(sender) ?? sender;
+  }
+
+  private insertMessage(fields: {
+    role: string;
+    kind: string;
+    content: string;
+    status: string;
+    turnId: string | null;
+    meta?: unknown;
+  }): MessageRow {
+    return this.messages.insert(this.convo.id, this.agent.id, fields);
+  }
+
+  private updateMessage(id: number, content: string, status: string, meta?: unknown): MessageRow {
+    return this.messages.update(id, content, status, meta);
+  }
+
+  private async run(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+    try {
+      while (this.queue.length > 0) {
+        const item = this.queue.shift()!;
+        await this.processTurn(item);
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+
+  private lockedOut(): boolean {
+    const now = Date.now();
+    this.crashes = this.crashes.filter((t) => now - t < CRASH_WINDOW_MS);
+    return this.crashes.length >= CRASH_LOCKOUT;
+  }
+
+  private recordCrash(): void {
+    this.crashes.push(Date.now());
+  }
+
+  private promptContext(): PromptContext {
+    return {
+      agent: this.agent,
+      convo: this.convo,
+      isRoom: this.isRoom,
+      memory: this.memCfg(),
+      userName: getUserProfile(this.deps.db).name,
+      nameOf: (sender) => this.nameOf(sender),
+      log: (message) => this.log(message),
+    };
+  }
+
+  private async ensureStarted(): Promise<void> {
+    if (this.backend?.alive()) return;
+    const resumeToken = this.sessions.active(this.convo.id, this.memberId);
+    this.seenMemoryPaths.clear();
+    this.backend = await this.backendFactory.build({
+      ...this.promptContext(),
+      memberId: this.memberId,
+      resumeToken,
+    });
+    this.log(`starting backend${resumeToken ? ` (resume ${resumeToken.slice(0, 8)}…)` : ''}`);
+    await this.backend.start(resumeToken);
+    this.backendStartedAt = Date.now();
+  }
+
+  /**
+   * 编辑/删除触及上下文：
+   * - API：摘要覆盖区局部重建；仅改近期原文则保留摘要
+   * - CLI：重置会话，下次 spawn 用存档回放
+   * @param affectedFromId 变更起始 message id；省略/0 表示整份摘要作废（会话重置等）
+   */
+  async invalidateCliContext(affectedFromId?: number): Promise<void> {
+    if (this.agent.backend === 'api') {
+      const cfg = contactConfig(this.agent);
+      const result = touchConversationSummary(
+        this.deps.db,
+        this.convo.id,
+        this.isRoom ? this.memberId : undefined,
+        affectedFromId ?? 0,
+        {
+          summaryMaxTokens: Math.max(Number(cfg.summaryMaxTokens ?? 3000), 256),
+          historyTokenBudget: Math.max(Number(cfg.historyTokenBudget ?? 8000), 2048),
+          nameOf: this.isRoom ? (s) => this.nameOf(s) : undefined,
+        }
+      );
+      this.log(
+        `API rolling summary touch action=${result.action}` +
+          (result.action === 'rebuilt'
+            ? ` through=${result.through} rows=${result.rows} tokens=${result.tokens}`
+            : result.action === 'kept'
+              ? ` through=${result.through}`
+              : '')
+      );
+      this.backend?.invalidateHistory?.(affectedFromId);
+      return;
+    }
+    this.sessions.deactivate(this.convo.id, this.isRoom ? this.memberId : undefined);
+    if (this.isRoom) {
+      // 存档回放会覆盖历史，跳过重复的增量投递
+      const maxId = this.messages.maxId(this.convo.id);
+      this.sessions.setLastSeen(this.convo.id, this.agent.id, maxId);
+    }
+    if (this.backend) {
+      await this.backend.stop();
+      this.backend = null;
+    }
+    this.log('CLI context invalidated (edit/delete) — will replay archive on next spawn');
+  }
+
+  /** 从某条 user 消息重新生成（仅 DM）。 */
+  async regenerateFrom(userMessageId: number, text: string): Promise<'queued' | 'full'> {
+    this.messages.softDeleteAfter(this.convo.id, userMessageId);
+    this.deps.sse.broadcast('prune', { contactId: this.convo.id, afterId: userMessageId });
+    // 该条可能被改写，且其后消息已删 → 从本条起触及摘要覆盖区
+    await this.invalidateCliContext(userMessageId);
+    return this.enqueue({ userMessageId, text });
+  }
+
+  private async maybeRecycleStale(): Promise<void> {
+    const mem = this.memCfg();
+    if (!this.deps.vault || !mem.injectOnSpawn) return;
+    const maxAgeMs = mem.sessionMaxAgeHours * 3_600_000;
+    if (this.backend?.alive() && maxAgeMs > 0 && Date.now() - this.backendStartedAt > maxAgeMs) {
+      this.log(`backend older than ${mem.sessionMaxAgeHours}h — recycling for fresh memory context`);
+      await this.backend.stop();
+      this.backend = null;
+    }
+  }
+
+  /**
+   * 群聊增量投递：未读文本 → 带名字 transcript。
+   * 错误/工具消息永不进入。超长时保留更近的消息，丢掉较早未读（仍推进 last_seen 到 upToId，
+   * 避免卡死；被丢掉的早期未读可走成员自己的滚动摘要/历史预算）。
+   */
+  private buildRoomDelivery(): RoomDelivery | null {
+    const lastSeen = this.sessions.lastSeen(this.convo.id, this.agent.id);
+    const cfg = contactConfig(this.agent);
+    const maxChars = Math.max(Number(cfg.roomDeliveryMaxChars ?? 12_000), 2_000);
+    const maxRows = Math.min(Math.max(Number(cfg.roomDeliveryMaxMessages ?? 40), 4), 80);
+    const rows = this.messages.unreadRoomText(
+      this.convo.id,
+      lastSeen,
+      this.agent.id,
+      maxRows
+    );
+    if (rows.length === 0) return null;
+    const upToId = rows[rows.length - 1].id;
+    // 未读可能是几小时前甚至隔天的：带上绝对时间，别让离线后上线的成员当成"刚说的"
+    const render = (row: RoomDeliveryRow) =>
+      timestampedMessage(
+        `${this.nameOf(row.sender)}：${row.content}`,
+        row.created_at,
+        '本轮新消息'
+      );
+    const renderPrompt = (row: RoomDeliveryRow) =>
+      quotedRoomMessage({
+        senderId: row.sender,
+        senderName: this.nameOf(row.sender),
+        content: row.content,
+        createdAt: row.created_at,
+        temporal: '本轮新消息',
+      });
+    // 从最新往回装，保证接话轮看到最近上下文
+    const kept: typeof rows = [];
+    let used = 0;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const cost = Math.max(render(rows[i]).length, renderPrompt(rows[i]).length)
+        + (kept.length ? 1 : 0);
+      if (kept.length > 0 && used + cost > maxChars) break;
+      kept.push(rows[i]);
+      used += cost;
+    }
+    kept.reverse();
+    if (kept.length < rows.length) {
+      this.log(
+        `room delivery trimmed ${rows.length - kept.length}/${rows.length} older unread (maxChars=${maxChars})`
+      );
+    }
+    const lines = kept.map(render);
+    return {
+      text: lines.join('\n'),
+      promptText: kept.map(renderPrompt).join('\n'),
+      upToId,
+      messageIds: kept.map((row) => row.id),
+      senders: [...new Map(
+        kept.map((row) => [
+          row.sender,
+          { id: row.sender, name: this.nameOf(row.sender) },
+        ])
+      ).values()],
+      imagePaths: attachmentPathsForMessages(
+        this.deps.db,
+        this.deps.config.uploadsDir,
+        kept.map((row) => row.id)
+      ),
+    };
+  }
+
+  private async processTurn(item: QueueItem): Promise<void> {
+    const { sse } = this.deps;
+    const convoId = this.convo.id;
+    const turnStartedAt = Date.now();
+    const queueWaitMs = Math.max(turnStartedAt - item.enqueuedAt, 0);
+    const modeLabel = item.kind === 'room-turn' ? `room-${item.mode}` : 'dm';
+    let prepMs = 0;
+    let firstEventAt = 0;
+    let firstTextAt = 0;
+    let timingLogged = false;
+    const markEvent = () => {
+      if (!firstEventAt) firstEventAt = Date.now();
+    };
+    const markText = () => {
+      markEvent();
+      if (!firstTextAt) firstTextAt = Date.now();
+    };
+    const logTiming = (outcome: RoomTurnOutcome | 'done' | 'error' | 'silent', inputChars = 0, outputChars = 0) => {
+      if (timingLogged) return;
+      timingLogged = true;
+      const totalMs = Date.now() - turnStartedAt;
+      const firstEventMs = firstEventAt ? firstEventAt - turnStartedAt : -1;
+      const firstTextMs = firstTextAt ? firstTextAt - turnStartedAt : -1;
+      this.log('turn completed', {
+        event: 'turn_timing', mode: modeLabel, outcome, queueWaitMs, prepMs,
+        firstEventMs, firstTextMs, totalMs, inputChars, outputChars,
+      });
+    };
+
+    // 群回合结果只回传一次
+    let settled = false;
+    const settle = (r: RoomTurnOutcome) => {
+      if (item.kind === 'room-turn' && !settled) {
+        settled = true;
+        item.resolve(r);
+      }
+    };
+
+    if (this.lockedOut()) {
+      const row = this.insertMessage({
+        role: 'system',
+        kind: 'error',
+        content: `${this.isRoom ? `${this.agent.name} ` : ''}连续崩了好几次，先歇了。用会话重置（session/reset）再叫我。`,
+        status: 'done',
+        turnId: null,
+      });
+      sse.broadcast('message', row);
+      this.setState('error', 'crash lockout');
+      this.queue = [];
+      settle('error');
+      return;
+    }
+
+    // 群聊：出队时构建增量投递（合批天然完成）
+    let delivery: RoomDelivery | null = null;
+    if (item.kind === 'room-turn') {
+      delivery = this.buildRoomDelivery();
+      if (!delivery) {
+        settle('silent'); // 没有新东西可回
+        return;
+      }
+    }
+
+    // Mark thinking as soon as we commit to a turn — before vault/backend prep —
+    // so room member name is on the wire during slow ensureStarted (not blank/room title).
+    const turnId = crypto.randomUUID();
+    this.setState('thinking');
+
+    try {
+      const prepStartedAt = Date.now();
+      await this.maybeRecycleStale();
+      await this.ensureStarted();
+      prepMs = Date.now() - prepStartedAt;
+    } catch (e: any) {
+      this.recordCrash();
+      this.backend = null;
+      const row = this.insertMessage({
+        role: 'system',
+        kind: 'error',
+        content: `${this.isRoom ? `${this.agent.name} ` : ''}后端启动失败：${e.message}`,
+        status: 'done',
+        turnId: null,
+      });
+      sse.broadcast('message', row);
+      this.setState('error', e.message);
+      logTiming('error');
+      settle('error');
+      return;
+    }
+
+    let textRow: MessageRow | null = null;
+    let thinkingRow: MessageRow | null = null;
+    let textBuf = '';
+    let thinkingBuf = '';
+
+    // 本轮实际投喂的文本
+    const sourceText = item.kind === 'dm' ? item.text : delivery!.text;
+    const reactionSuffix =
+      '（接话机会：看完上面新发言，想接就简短接一句；没什么可补充就只回 [PASS]。）';
+    const normalSuffix = '（轮到你了。实在没话说也可以只回 [PASS]。）';
+    let turnText: string;
+    if (item.kind === 'dm') {
+      turnText = item.text;
+    } else if (this.agent.backend === 'api') {
+      // API 群历史含最新消息；精确 ID 会在 history 中标出本轮窗口，无需重复正文。
+      turnText = [
+        roomTurnNotice(item.mode, delivery!.senders),
+        item.mode === 'reaction' ? reactionSuffix : normalSuffix,
+      ].join('\n');
+    } else {
+      turnText = [
+        roomTurnNotice(item.mode, delivery!.senders),
+        delivery!.promptText,
+        item.mode === 'reaction' ? reactionSuffix : normalSuffix,
+      ].join('\n');
+    }
+
+    const mem = this.memCfg();
+    turnText = await this.prompts.composeTurn(
+      this.promptContext(),
+      turnText,
+      sourceText,
+      this.seenMemoryPaths
+    );
+
+    const handle = this.backend!.sendTurn({
+      text: turnText,
+      ...(item.kind === 'dm' ? { userMessageId: item.userMessageId } : {}),
+      ...(item.kind === 'room-turn' ? { roomMessageIds: delivery!.messageIds } : {}),
+      imagePaths: item.kind === 'dm'
+        ? attachmentPathsForMessages(this.deps.db, this.deps.config.uploadsDir, [item.userMessageId])
+        : delivery!.imagePaths,
+    });
+    this.currentHandle = handle;
+
+    try {
+      for await (const ev of handle.events) {
+        switch (ev.type) {
+          case 'session':
+            this.sessions.save(convoId, ev.sessionId, this.memberId);
+            break;
+
+          case 'delta':
+            markText();
+            if (!textRow) {
+              textRow = this.insertMessage({
+                role: 'assistant',
+                kind: 'text',
+                content: '',
+                status: 'streaming',
+                turnId,
+              });
+              sse.broadcast('message', textRow);
+              this.setState('streaming');
+            }
+            textBuf += ev.text;
+            sse.broadcast('delta', { contactId: convoId, messageId: textRow.id, text: ev.text });
+            break;
+
+          case 'thinking':
+            markEvent();
+            if (!thinkingRow) {
+              thinkingRow = this.insertMessage({
+                role: 'assistant',
+                kind: 'thinking',
+                content: '',
+                status: 'streaming',
+                turnId,
+              });
+              sse.broadcast('message', thinkingRow);
+            }
+            thinkingBuf += ev.text;
+            sse.broadcast('delta', { contactId: convoId, messageId: thinkingRow.id, text: ev.text });
+            break;
+
+          case 'tool_use': {
+            markEvent();
+            const row = this.insertMessage({
+              role: 'assistant',
+              kind: 'tool_use',
+              content: ev.name,
+              status: 'done',
+              turnId,
+              meta: { name: ev.name, input: ev.inputSummary },
+            });
+            sse.broadcast('message', row);
+            this.setState(`tool:${ev.name}`);
+            break;
+          }
+
+          case 'tool_result':
+            this.setState('thinking', `${ev.name}: ${ev.ok ? 'ok' : 'denied/failed'}`);
+            break;
+
+          case 'done': {
+            if (thinkingRow) {
+              sse.broadcast('message', this.updateMessage(thinkingRow.id, thinkingBuf, 'done'));
+            }
+            const finalText = stableFinalText(textBuf, ev.finalText);
+            const passed = this.isRoom && PASS_RE.test(finalText.trim());
+
+            if (passed) {
+              // 成员选择沉默：内部气泡无审计价值 → 物理删除 + prune（不走 soft-delete）
+              const retractIds = [textRow?.id, thinkingRow?.id].filter(
+                (id): id is number => typeof id === 'number'
+              );
+              if (retractIds.length > 0) {
+                hardDeleteMessages(this.deps.db, this.deps.config.uploadsDir, retractIds);
+                sse.broadcast('prune', { contactId: convoId, ids: retractIds });
+              }
+              this.log('passed (silent, hard-deleted bubbles)');
+            } else if (textRow) {
+              sse.broadcast(
+                'message',
+                this.updateMessage(textRow.id, finalText, 'done', { usage: ev.usage })
+              );
+            } else if (finalText) {
+              const row = this.insertMessage({
+                role: 'assistant',
+                kind: 'text',
+                content: finalText,
+                status: 'done',
+                turnId,
+                meta: { usage: ev.usage },
+              });
+              sse.broadcast('message', row);
+            }
+            if (item.kind === 'room-turn' && delivery) {
+              this.sessions.setLastSeen(convoId, this.agent.id, delivery.upToId);
+            }
+            this.crashes = [];
+            this.setState('idle');
+            if (!this.isRoom || item.kind === 'room-turn') {
+              const u = ev.usage;
+              this.sessionInputTokens +=
+                (u?.input ?? 0) + (u?.cacheCreation ?? 0) + (u?.cacheRead ?? 0);
+              const cfg = contactConfig(this.agent);
+              const threshold = Math.max(Number(cfg.maxSessionInputTokens ?? 120000), 0);
+              if (this.agent.backend !== 'api' && threshold > 0 && this.sessionInputTokens >= threshold) {
+                this.rolloverAfterTurn = true;
+                this.log(`session token threshold reached (${this.sessionInputTokens}/${threshold}) — rolling over`);
+              }
+            }
+            // 自动捕捉只在 DM 里跑：群消息由派发层按“用户原话、群级一次”捕捉，
+            // 成员发言（带名字前缀的 transcript）永不参与——防记忆污染
+            if (!this.isRoom && this.deps.vault && mem.capture) {
+              void maybeCapture(
+                this.deps.vault,
+                { id: this.agent.id, name: this.agent.name },
+                sourceText,
+                finalText,
+                (m) => this.log(m)
+              ).catch(() => {});
+            }
+            logTiming(passed ? 'passed' : 'spoke', sourceText.length, finalText.length);
+            settle(passed ? 'passed' : 'spoke');
+            break;
+          }
+
+          case 'error': {
+            markEvent();
+            if (thinkingRow) {
+              sse.broadcast('message', this.updateMessage(thinkingRow.id, thinkingBuf, 'interrupted'));
+            }
+            if (textRow) {
+              sse.broadcast('message', this.updateMessage(textRow.id, textBuf, 'interrupted'));
+            }
+            const row = this.insertMessage({
+              role: 'system',
+              kind: 'error',
+              content: this.isRoom ? `${this.agent.name}：${ev.message}` : ev.message,
+              status: 'done',
+              turnId,
+            });
+            sse.broadcast('message', row);
+            if (ev.fatal) {
+              this.recordCrash();
+              this.backend = null;
+            }
+            this.setState('error', ev.message);
+            logTiming('error', sourceText.length, textBuf.length);
+            settle('error');
+            break;
+          }
+        }
+      }
+    } finally {
+      this.currentHandle = null;
+      settle('error'); // 流意外结束的兜底
+      if (this.rolloverAfterTurn) {
+        this.rolloverAfterTurn = false;
+        this.sessionInputTokens = 0;
+        this.sessions.deactivate(this.convo.id, this.isRoom ? this.memberId : undefined);
+        await this.backend?.stop();
+        this.backend = null;
+        this.seenMemoryPaths.clear();
+      }
+      if (this.state === 'streaming' || this.state === 'thinking' || this.state.startsWith('tool:')) {
+        this.setState('idle');
+      }
+      if (!timingLogged) logTiming('error');
+    }
+  }
+}

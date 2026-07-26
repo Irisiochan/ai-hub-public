@@ -30,7 +30,7 @@ export interface DelegationCfg {
   maxOpenJobs?: number;
 }
 
-const OPEN_STATUSES = "('pending','claimed','running','pause_requested','cancel_requested')";
+const OPEN_STATUSES = "('pending','claimed','running','recovering','pause_requested','cancel_requested')";
 
 /**
  * Accept human-readable Claude versions without letting a pinned version fall

@@ -4,6 +4,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { buildDelegateTools, type DelegationCfg } from '../agents/gatewayTools.js';
 import { bearerMatches } from '../auth.js';
+import { contactConfig } from '../agents/configSchemas.js';
 import type { ContactRow, Db } from '../db.js';
 import type { JobStore } from '../workers/jobStore.js';
 
@@ -56,7 +57,7 @@ export function hubMcpRouter(
       .prepare("SELECT * FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'dm'")
       .get(req.params.contactId) as ContactRow | undefined;
     const delegation: DelegationCfg = contact
-      ? JSON.parse(contact.config || '{}').delegation ?? {}
+      ? contactConfig(contact).delegation
       : {};
     if (!contact || delegation.enabled !== true) {
       return res.status(403).json({

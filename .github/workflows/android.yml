@@ -115,8 +115,25 @@ jobs:
             sha256sum "$GITHUB_WORKSPACE/ai-hub.apk"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Package web OTA bundle
+        run: |
+          WEB_VERSION="${GITHUB_SHA::12}"
+          (
+            cd web/dist
+            zip -qr "$GITHUB_WORKSPACE/web-$WEB_VERSION.zip" .
+          )
+          sha256sum "$GITHUB_WORKSPACE/web-$WEB_VERSION.zip" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload APK
         uses: actions/upload-artifact@v7
         with:
           name: ai-hub-apk
           path: ai-hub.apk
+          retention-days: 14
+
+       - name: Upload embedded web bundle
+         uses: actions/upload-artifact@v7
+         with:
+           name: ai-hub-web-bundle
+           path: web-*.zip
+           retention-days: 14

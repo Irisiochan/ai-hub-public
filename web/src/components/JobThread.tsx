@@ -1,14 +1,22 @@
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { api, type JobMessage, type WorkerJob } from '../api';
 import { formatLocalTime, parseUtcTimestamp } from '../time';
 
 /**
- * 委派任务子会话：挂在原聊天消息下的可折叠 thread。
- * 折叠时一行状态摘要；展开后是任务详情 + 结构化日志/tool/diff/结果 + 操作按钮。
+ * 委派任务子会话：挂在原聊天消息下的紧凑状态条。
+ * 执行过程默认隐藏，点击后在全屏层显示任务详情 + 结构化日志/tool/diff/结果 + 操作按钮。
  * 删除只软隐藏任务窗口，不碰原聊天消息。
  */
 
-export const JOB_ACTIVE = new Set(['pending', 'claimed', 'running', 'pause_requested', 'cancel_requested']);
+export const JOB_ACTIVE = new Set([
+  'pending',
+  'claimed',
+  'running',
+  'recovering',
+  'pause_requested',
+  'cancel_requested',
+]);
 
 /** Confirm + soft-hide a job window. Shared by chat thread and Worker panel. */
 export async function hideJobWindow(job: WorkerJob): Promise<boolean> {
@@ -33,7 +41,8 @@ export async function hideJobWindow(job: WorkerJob): Promise<boolean> {
 
 export function jobStatusLabel(status: string): string {
   const labels: Record<string, string> = {
-    pending: '等待本机上线', claimed: '已认领', running: '执行中', pause_requested: '正在暂停',
+    pending: '等待本机上线', claimed: '已认领', running: '执行中', recovering: '正在恢复',
+    pause_requested: '正在暂停',
     cancel_requested: '正在取消', paused: '已暂停', interrupted: '连接中断', done: '已完成',
     blocked: '待续接', failed: '失败', cancelled: '已取消', expired: '已过期',
   };
@@ -91,21 +100,35 @@ interface Props {
 }
 
 export default function JobThread({ job, onChanged }: Props) {
-  const [open, setOpen] = useState(false);
+  const [showExecution, setShowExecution] = useState(false);
   const [messages, setMessages] = useState<JobMessage[]>([]);
   const [error, setError] = useState('');
   const [hiding, setHiding] = useState(false);
   const active = JOB_ACTIVE.has(job.status);
 
   useEffect(() => {
-    if (!open) return;
+    if (!showExecution) return;
     const load = () =>
       void api.job(job.id).then(({ messages: rows }) => setMessages(rows)).catch(() => {});
     load();
     if (!active) return;
     const timer = setInterval(load, 2500);
     return () => clearInterval(timer);
-  }, [open, job.id, job.status, active]);
+  }, [showExecution, job.id, job.status, active]);
+
+  useEffect(() => {
+    if (!showExecution) return;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowExecution(false);
+    };
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [showExecution]);
 
   const action = async (value: 'cancel' | 'pause' | 'resume') => {
     setError('');
@@ -134,12 +157,12 @@ export default function JobThread({ job, onChanged }: Props) {
   return (
     <div className={`job-thread ${active ? 'active' : ''} ${job.status}`}>
       <div className="job-thread-head-row">
-        <button type="button" className="job-thread-head" onClick={() => setOpen(!open)}>
+        <button type="button" className="job-thread-head" onClick={() => setShowExecution(true)}>
           <span className={`job-dot ${job.status}`} />
           <b>🖥 {jobStatusLabel(job.status)}</b>
           <span className="job-thread-brief">{job.runner} · {job.prompt.slice(0, 60)}</span>
           <small>{elapsedText(job)}</small>
-          <span className="job-thread-arrow">{open ? '▾' : '▸'}</span>
+          <span className="job-thread-open">查看执行过程</span>
         </button>
         <button
           type="button"
@@ -155,60 +178,85 @@ export default function JobThread({ job, onChanged }: Props) {
           ×
         </button>
       </div>
-      {open && (
-        <div className="job-thread-body">
-          <div className="job-thread-meta">
-            <span>workspace <code>{job.workspace}</code></span>
-            <span>worker {job.worker_id ?? '待认领'}</span>
-            {job.permissions.shell && <span className="perm-chip">Shell</span>}
-            {job.permissions.ssh && <span className="perm-chip danger">SSH</span>}
-            <span>耗时 {elapsedText(job)}</span>
-          </div>
-          <div className="job-msg prompt">
-            <small>任务</small>
-            <pre>{job.prompt}</pre>
-          </div>
-          {messages
-            .filter((m) => m.kind !== 'prompt')
-            .map((m) => {
-              const usage = metaUsage(m.meta);
-              return (
-                <article key={m.id} className={`job-msg ${m.kind}`}>
-                  <small>
-                    {m.sender} · {m.kind}{usage ? ` · ${usage}` : ''} · {formatLocalTime(m.created_at)}
-                  </small>
-                  <LogContent content={m.content} />
-                </article>
-              );
-            })}
-          {job.result && (
-            <div className="job-msg result">
-              <small>结果</small>
-              <LogContent content={job.result} />
-            </div>
-          )}
-          {job.error && (
-            <div className="job-msg stderr">
-              <small>错误</small>
-              <pre>{job.error}</pre>
-            </div>
-          )}
-          {error && <div className="modal-error">⚠ {error}</div>}
-          <div className="job-thread-actions">
-            {active && job.status !== 'pending' && (
-              <button type="button" onClick={() => void action('pause')}>暂停</button>
-            )}
-            {active && <button type="button" onClick={() => void action('cancel')}>取消</button>}
-            {['paused', 'interrupted', 'blocked', 'failed'].includes(job.status) && (
-              <button type="button" onClick={() => void action('resume')}>
-                {['failed', 'blocked'].includes(job.status) ? '重试' : '继续'}
+      {showExecution && createPortal(
+        <div
+          className="job-execution-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="PC Worker 执行过程"
+        >
+          <section className="job-execution-modal">
+            <header className="job-execution-header">
+              <div>
+                <span className={`job-dot ${job.status}`} />
+                <b>PC Worker · {jobStatusLabel(job.status)}</b>
+                <small>{job.runner} · {elapsedText(job)}</small>
+              </div>
+              <button
+                type="button"
+                className="job-execution-close"
+                aria-label="关闭执行过程"
+                onClick={() => setShowExecution(false)}
+              >
+                ×
               </button>
-            )}
-            <button type="button" className="del" disabled={hiding} onClick={() => void hideWindow()}>
-              {hiding ? '删除中…' : '删除窗口'}
-            </button>
-          </div>
-        </div>
+            </header>
+            <div className="job-execution-scroll">
+              <div className="job-thread-meta">
+                <span>workspace <code>{job.workspace}</code></span>
+                <span>worker {job.worker_id ?? '待认领'}</span>
+                {job.permissions.shell && <span className="perm-chip">Shell</span>}
+                {job.permissions.ssh && <span className="perm-chip danger">SSH</span>}
+                <span>耗时 {elapsedText(job)}</span>
+              </div>
+              <div className="job-msg prompt">
+                <small>任务</small>
+                <pre>{job.prompt}</pre>
+              </div>
+              {messages
+                .filter((m) => m.kind !== 'prompt')
+                .map((m) => {
+                  const usage = metaUsage(m.meta);
+                  return (
+                    <article key={m.id} className={`job-msg ${m.kind}`}>
+                      <small>
+                        {m.sender} · {m.kind}{usage ? ` · ${usage}` : ''} · {formatLocalTime(m.created_at)}
+                      </small>
+                      <LogContent content={m.content} />
+                    </article>
+                  );
+                })}
+              {job.result && (
+                <div className="job-msg result">
+                  <small>结果</small>
+                  <LogContent content={job.result} />
+                </div>
+              )}
+              {job.error && (
+                <div className="job-msg stderr">
+                  <small>错误</small>
+                  <pre>{job.error}</pre>
+                </div>
+              )}
+              {error && <div className="modal-error">⚠ {error}</div>}
+              <div className="job-thread-actions">
+                {active && job.status !== 'pending' && (
+                  <button type="button" onClick={() => void action('pause')}>暂停</button>
+                )}
+                {active && <button type="button" onClick={() => void action('cancel')}>取消</button>}
+                {['paused', 'interrupted', 'blocked', 'failed'].includes(job.status) && (
+                  <button type="button" onClick={() => void action('resume')}>
+                    {['failed', 'blocked'].includes(job.status) ? '重试' : '继续'}
+                  </button>
+                )}
+                <button type="button" className="del" disabled={hiding} onClick={() => void hideWindow()}>
+                  {hiding ? '删除中…' : '删除窗口'}
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>,
+        document.body,
       )}
     </div>
   );

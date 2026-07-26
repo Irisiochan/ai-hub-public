@@ -9,6 +9,6 @@
   "scripts": {
     "start": "node worker.mjs",
     "start:triage": "node triage-worker.mjs",
-    "test": "node --test delivery.test.mjs triage.test.mjs triage.integration.test.mjs"
+    "test": "node --test delivery.test.mjs runner.test.mjs state-store.test.mjs worker.integration.test.mjs triage.test.mjs triage.integration.test.mjs"
   }
 }

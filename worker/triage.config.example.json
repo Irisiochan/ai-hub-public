@@ -11,6 +11,7 @@
     "message",
     "system",
     "daily",
+    "idea",
     "other"
   ],
   "deepseek": {
@@ -59,7 +60,18 @@
     "minimumGapMinutes": 180,
     "silentStartHour": 0,
     "silentEndHour": 9,
-    "recipients": ["cheng", "cove", "aye"]
+    "recipients": ["claude-code", "codex", "grok-build"]
+  },
+  "idea": {
+    "enabled": false,
+    "roomId": "room-contact-id",
+    "hostName": "DS 主持",
+    "dailyDispatchLimit": 1,
+    "reactionRounds": 3,
+    "recentTopicLimit": 12,
+    "maxTopicAttempts": 3,
+    "roundPollMs": 2000,
+    "roundTimeoutMs": 1200000
   },
   "breakers": {
     "dailyEvents": 2000,
@@ -87,7 +99,16 @@
       "intervalMinutes": 45,
       "jitterSeconds": 900,
       "category": "daily",
-      "summary": "Proactive daily companion check for Iris. Prefer natural care, reminders, or light openers over empty noise."
+      "summary": "Proactive daily companion check for the AI Hub user. Prefer natural care, reminders, or light openers over empty noise."
+    },
+    {
+      "id": "daily-idea-room",
+      "type": "timer",
+      "mode": "idea",
+      "intervalMinutes": 1440,
+      "jitterSeconds": 3600,
+      "category": "idea",
+      "summary": "Choose one novel free-form topic and host a room discussion."
     },
     {
       "id": "vault-backlog",
