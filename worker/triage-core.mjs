@@ -32,6 +32,14 @@ function boundedText(value, max = 20_000) {
   return text.trim().slice(0, max);
 }
 
+function integerConfig(value, fallback, name, min, max) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}`);
+  }
+  return parsed;
+}
+
 export function shanghaiDayStart(now = Date.now()) {
   const shifted = new Date(now + SHANGHAI_OFFSET_MS);
   shifted.setUTCHours(0, 0, 0, 0);
@@ -86,20 +94,98 @@ export function isDailyMode(sourceOrResult) {
 }
 
 export function normalizeProactiveConfig(raw = {}) {
-  const recipients = Array.isArray(raw.recipients) && raw.recipients.length
-    ? raw.recipients.map((item) => String(item).trim()).filter(Boolean)
-    : [...DEFAULT_DAILY_RECIPIENTS];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('proactive must be an object');
+  }
+  const recipients = raw.recipients === undefined
+    ? [...DEFAULT_DAILY_RECIPIENTS]
+    : [...new Set(
+      (Array.isArray(raw.recipients) ? raw.recipients : [])
+        .map((item) => String(item).trim().toLowerCase())
+        .filter(Boolean),
+    )];
+  if (!recipients.length) throw new Error('proactive.recipients must contain at least one recipient');
+  const dailyDispatchLimit = integerConfig(
+    raw.dailyDispatchLimit,
+    10,
+    'proactive.dailyDispatchLimit',
+    0,
+    1000,
+  );
+  const minDailyDispatches = integerConfig(
+    raw.minDailyDispatches,
+    1,
+    'proactive.minDailyDispatches',
+    0,
+    1000,
+  );
+  if (minDailyDispatches > dailyDispatchLimit) {
+    throw new Error('proactive.minDailyDispatches cannot exceed proactive.dailyDispatchLimit');
+  }
   return {
     enabled: raw.enabled !== false,
-    dailyDispatchLimit: Math.max(0, Number(raw.dailyDispatchLimit ?? 10)),
-    silentStartHour: Number.isFinite(Number(raw.silentStartHour)) ? Number(raw.silentStartHour) : 0,
-    silentEndHour: Number.isFinite(Number(raw.silentEndHour)) ? Number(raw.silentEndHour) : 9,
+    dailyDispatchLimit,
+    minDailyDispatches,
+    forceAfterHour: integerConfig(raw.forceAfterHour, 18, 'proactive.forceAfterHour', 0, 23),
+    minimumGapMinutes: integerConfig(
+      raw.minimumGapMinutes,
+      180,
+      'proactive.minimumGapMinutes',
+      0,
+      24 * 60,
+    ),
+    silentStartHour: integerConfig(raw.silentStartHour, 0, 'proactive.silentStartHour', 0, 23),
+    silentEndHour: integerConfig(raw.silentEndHour, 9, 'proactive.silentEndHour', 0, 24),
     recipients,
   };
 }
 
-export function buildDailyCheckSummary(source = {}, now = Date.now()) {
+export function dailyPolicyState(proactive, usage = {}, now = Date.now()) {
+  const config = normalizeProactiveConfig(proactive);
+  const count = Math.max(0, Number(usage.count ?? 0));
+  const lastAt = usage.lastAt === null || usage.lastAt === undefined
+    ? null
+    : Number.isFinite(Number(usage.lastAt)) ? Number(usage.lastAt) : null;
+  const gapMs = config.minimumGapMinutes * 60_000;
+  return {
+    poolFull: !config.enabled || config.dailyDispatchLimit <= 0 || count >= config.dailyDispatchLimit,
+    gapBlocked: lastAt !== null && gapMs > 0 && now - lastAt < gapMs,
+    forceActionable: config.enabled
+      && count < config.minDailyDispatches
+      && shanghaiClock(now).hour >= config.forceAfterHour,
+  };
+}
+
+export function validateTriageMode(result, {
+  mode = 'task',
+  dailyRecipients = DEFAULT_DAILY_RECIPIENTS,
+  forceActionable = false,
+} = {}) {
+  if (mode !== 'daily') {
+    if (result.category === 'daily') {
+      throw new Error('task triage cannot return category daily');
+    }
+    return result;
+  }
+  if (result.category !== 'daily') throw new Error('daily triage must return category daily');
+  const allowed = new Set(dailyRecipients.map((item) => String(item).trim().toLowerCase()));
+  if (result.actionable) {
+    const recipient = String(result.suggestedRecipient ?? '').trim().toLowerCase();
+    if (!recipient || !allowed.has(recipient)) {
+      throw new Error('actionable daily triage must choose an allowed recipient');
+    }
+  } else if (result.suggestedRecipient !== null) {
+    throw new Error('NO_OP daily triage must not choose a recipient');
+  }
+  if (forceActionable && !result.actionable) {
+    throw new Error('guaranteed daily slot must be actionable');
+  }
+  return result;
+}
+
+export function buildDailyCheckSummary(source = {}, now = Date.now(), options = {}) {
   const clock = shanghaiClock(now);
+  const proactive = normalizeProactiveConfig(options.proactive ?? {});
   const base = typeof source.summary === 'string' && source.summary.trim()
     ? source.summary.trim()
     : 'Proactive daily companion check for Iris.';
@@ -109,10 +195,13 @@ export function buildDailyCheckSummary(source = {}, now = Date.now()) {
   return [
     base,
     `Current local time: ${clock.label}.`,
-    'Quiet hours are 00:00–09:00 Asia/Shanghai; this wake should only fire outside that window.',
+    `Quiet hours are ${String(proactive.silentStartHour).padStart(2, '0')}:00–`
+      + `${String(proactive.silentEndHour).padStart(2, '0')}:00 Asia/Shanghai; this wake should only fire outside that window.`,
     'Decide whether a proactive message to Iris is worthwhile right now.',
     'Allowed intents: care/health/routine nudges, practical reminders, light chat openers, or small affectionate check-ins.',
-    'Be selective — not every wake needs a message. Prefer NO_OP when nothing natural fits.',
+    options.forceActionable
+      ? 'This is the guaranteed daily slot: choose one natural, low-pressure message instead of NO_OP.'
+      : 'Be selective — not every wake needs a message. Prefer NO_OP when nothing natural fits.',
     `If actionable, set category to "daily" and choose exactly one suggestedRecipient among: ${recipients}.`,
     'Route by tone and relationship fit; do not invent other recipients.',
   ].join('\n');
@@ -487,11 +576,15 @@ export class TriageStore {
   poolUsage(pool = DELIVERY_POOL_DAILY, now = Date.now()) {
     const start = shanghaiDayStart(now);
     const row = this.db.prepare(`
-      SELECT COUNT(*) AS count
+      SELECT COUNT(*) AS count, MAX(delivered_at) AS last_at
       FROM triage_deliveries
       WHERE delivered_at >= ? AND COALESCE(pool, 'task') = ?
     `).get(start, pool);
-    return { count: Number(row.count), since: start };
+    return {
+      count: Number(row.count),
+      lastAt: row.last_at === null ? null : Number(row.last_at),
+      since: start,
+    };
   }
 
   dailySummary(now = Date.now()) {
@@ -520,9 +613,16 @@ export class TriageStore {
       FROM triage_events
       WHERE created_at >= ? AND triage_latency_ms IS NOT NULL
     `).get(start);
+    const dailyChecks = this.db.prepare(`
+      SELECT COUNT(*) AS count,
+             SUM(CASE WHEN status = 'noop' THEN 1 ELSE 0 END) AS noop_count
+      FROM triage_events
+      WHERE created_at >= ? AND triage_result LIKE '%"category":"daily"%'
+    `).get(start);
     const total = statuses.reduce((sum, row) => sum + Number(row.count), 0);
     const noop = statuses.find((row) => row.status === 'noop');
     const pools = Object.fromEntries(poolRows.map((row) => [row.pool, Number(row.count)]));
+    const dailyUsage = this.poolUsage(DELIVERY_POOL_DAILY, now);
     return {
       since: new Date(start).toISOString(),
       total,
@@ -535,6 +635,11 @@ export class TriageStore {
       deliveries,
       pools,
       dailyPoolDispatched: pools[DELIVERY_POOL_DAILY] ?? 0,
+      dailyChecks: Number(dailyChecks.count),
+      dailyNoops: Number(dailyChecks.noop_count ?? 0),
+      lastDailyDeliveryAt: dailyUsage.lastAt === null
+        ? null
+        : new Date(dailyUsage.lastAt).toISOString(),
     };
   }
 

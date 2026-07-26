@@ -8,16 +8,19 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   buildDailyCheckSummary,
   chooseRecipient,
+  dailyPolicyState,
   DELIVERY_POOL_DAILY,
   DELIVERY_POOL_TASK,
   estimateCostCny,
   isShanghaiSilentHour,
   nextTimerDelay,
   normalizeEvent,
+  normalizeProactiveConfig,
   parseTriageJson,
   shanghaiClock,
   timerSchedule,
   TriageStore,
+  validateTriageMode,
 } from './triage-core.mjs';
 import { VaultClient } from './triage-clients.mjs';
 
@@ -233,6 +236,61 @@ test('daily model routing ignores rules and task recipient quotas', () => {
   assert.equal(missing.reason, 'no-route');
 });
 
+test('daily mode is source-owned and proactive safety config fails closed', () => {
+  const dailyResult = {
+    actionable: true,
+    category: 'daily',
+    priority: 1,
+    suggestedRecipient: 'aye',
+    rationale: 'natural check-in',
+  };
+  assert.throws(
+    () => validateTriageMode(dailyResult, { mode: 'task' }),
+    /task triage cannot return category daily/,
+  );
+  assert.equal(validateTriageMode(dailyResult, {
+    mode: 'daily',
+    dailyRecipients: ['cheng', 'cove', 'aye'],
+  }), dailyResult);
+  assert.throws(
+    () => validateTriageMode({ ...dailyResult, suggestedRecipient: 'gem' }, {
+      mode: 'daily',
+      dailyRecipients: ['cheng', 'cove', 'aye'],
+    }),
+    /allowed recipient/,
+  );
+  assert.throws(
+    () => validateTriageMode({ ...dailyResult, actionable: false, suggestedRecipient: null }, {
+      mode: 'daily',
+      forceActionable: true,
+    }),
+    /guaranteed daily slot/,
+  );
+  assert.throws(
+    () => normalizeProactiveConfig({ dailyDispatchLimit: 'not-a-number' }),
+    /dailyDispatchLimit/,
+  );
+  assert.throws(
+    () => normalizeProactiveConfig({ dailyDispatchLimit: 1, minDailyDispatches: 2 }),
+    /cannot exceed/,
+  );
+
+  const beforeFloor = Date.parse('2026-07-26T09:59:00Z'); // 17:59 Shanghai
+  const afterFloor = Date.parse('2026-07-26T10:01:00Z'); // 18:01 Shanghai
+  const proactive = normalizeProactiveConfig({
+    dailyDispatchLimit: 10,
+    minDailyDispatches: 1,
+    forceAfterHour: 18,
+    minimumGapMinutes: 180,
+  });
+  assert.equal(dailyPolicyState(proactive, { count: 0, lastAt: null }, beforeFloor).forceActionable, false);
+  assert.equal(dailyPolicyState(proactive, { count: 0, lastAt: null }, afterFloor).forceActionable, true);
+  assert.equal(dailyPolicyState(proactive, {
+    count: 1,
+    lastAt: afterFloor - 60 * 60_000,
+  }, afterFloor).gapBlocked, true);
+});
+
 test('legacy SQLite deliveries without pool column migrate on open', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-triage-legacy-'));
   const file = path.join(dir, 'triage.db');
@@ -289,6 +347,14 @@ test('Shanghai silent window and daily delivery pools stay separate from task qu
   // 2026-07-26 01:15 UTC = 09:15 Asia/Shanghai → open
   assert.equal(isShanghaiSilentHour(Date.parse('2026-07-26T01:15:00Z'), 0, 9), false);
   assert.match(buildDailyCheckSummary({ summary: 'hello' }, Date.parse('2026-07-26T01:15:00Z')), /Asia\/Shanghai/);
+  assert.match(buildDailyCheckSummary(
+    { summary: 'hello' },
+    Date.parse('2026-07-26T10:15:00Z'),
+    {
+      proactive: { silentStartHour: 1, silentEndHour: 8 },
+      forceActionable: true,
+    },
+  ), /guaranteed daily slot/);
   assert.equal(shanghaiClock(Date.parse('2026-07-26T01:15:00Z')).hour, 9);
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-triage-pool-'));
@@ -299,18 +365,43 @@ test('Shanghai silent window and daily delivery pools stay separate from task qu
     store.enqueue({ source: 'daily', summary: 'care item', dedupeKey: 'd1' });
     const task = store.claim(now);
     store.recordDelivery(task.id, 'cheng', now, DELIVERY_POOL_TASK);
-    store.finish(task.id, 'dispatched', { recipientId: 'cheng' }, now);
+    store.finish(task.id, 'dispatched', {
+      recipientId: 'cheng',
+      triageResult: {
+        actionable: true,
+        category: 'system',
+        priority: 1,
+        suggestedRecipient: 'cheng',
+        rationale: 'task',
+      },
+    }, now);
     const daily = store.claim(now + 1);
     store.recordDelivery(daily.id, 'cheng', now + 1, DELIVERY_POOL_DAILY);
-    store.finish(daily.id, 'dispatched', { recipientId: 'cheng' }, now + 1);
+    store.finish(daily.id, 'dispatched', {
+      recipientId: 'cheng',
+      triageResult: {
+        actionable: true,
+        category: 'daily',
+        priority: 1,
+        suggestedRecipient: 'cheng',
+        rationale: 'care',
+      },
+    }, now + 1);
 
     assert.equal(store.recipientUsage('cheng', now + 1, DELIVERY_POOL_TASK).count, 1);
     assert.equal(store.recipientUsage('cheng', now + 1, DELIVERY_POOL_DAILY).count, 1);
     // Task quota path only sees the task pool.
     assert.equal(store.recipientUsage('cheng', now + 1).count, 1);
-    assert.equal(store.poolUsage(DELIVERY_POOL_DAILY, now + 1).count, 1);
+    assert.deepEqual(store.poolUsage(DELIVERY_POOL_DAILY, now + 1), {
+      count: 1,
+      lastAt: now + 1,
+      since: Date.parse('2026-07-25T16:00:00Z'),
+    });
     const summary = store.dailySummary(now + 1);
     assert.equal(summary.dailyPoolDispatched, 1);
+    assert.equal(summary.dailyChecks, 1);
+    assert.equal(summary.dailyNoops, 0);
+    assert.equal(summary.lastDailyDeliveryAt, new Date(now + 1).toISOString());
     assert.equal(summary.pools.task, 1);
     assert.equal(summary.pools.daily, 1);
   } finally {
@@ -355,9 +446,11 @@ test('minimal streamable HTTP MCP client initializes a session and calls a vault
   const client = new VaultClient({ url: `http://127.0.0.1:${address.port}/mcp` });
   try {
     assert.equal(await client.call('search_vault', { query: 'triage-backlog' }), 'vault result');
+    assert.equal(await client.taskContext(), 'vault result');
     assert.equal(seen[0].message.method, 'initialize');
     assert.equal(seen[1].session, 'session-1');
     assert.equal(seen[2].message.method, 'tools/call');
+    assert.equal(seen[3].message.params.name, 'get_task_context');
   } finally {
     await client.close();
     await new Promise((resolve) => server.close(resolve));

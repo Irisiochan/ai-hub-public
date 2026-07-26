@@ -54,6 +54,9 @@
   "proactive": {
     "enabled": true,
     "dailyDispatchLimit": 10,
+    "minDailyDispatches": 1,
+    "forceAfterHour": 18,
+    "minimumGapMinutes": 180,
     "silentStartHour": 0,
     "silentEndHour": 9,
     "recipients": ["cheng", "cove", "aye"]

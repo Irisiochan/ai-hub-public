@@ -112,6 +112,14 @@ the task/backlog gate:
   Shanghai-calendar-day dispatches in delivery pool `daily`. Task per-recipient
   `dailyLimit` / cooldown only count pool `task`, so companion outreach does not
   burn work quotas.
+- **Natural minimum cadence**: `minDailyDispatches` defaults to 1. If no daily
+  message has been delivered by `forceAfterHour` (default 18:00 Shanghai), the
+  next wake must choose one low-pressure message. `minimumGapMinutes` defaults
+  to 180 so later checks cannot spam.
+- **Real context**: L1 receives the current task snapshot, the three most recent
+  contact interaction timestamps, and the last daily delivery timestamp. Daily delivery
+  mode is trusted from the event source only; a normal task cannot enter the
+  daily pool by returning category `daily`.
 - Timer summary is rebuilt each wake with the current Asia/Shanghai clock.
 
 ```json
@@ -119,6 +127,9 @@ the task/backlog gate:
   "proactive": {
     "enabled": true,
     "dailyDispatchLimit": 10,
+    "minDailyDispatches": 1,
+    "forceAfterHour": 18,
+    "minimumGapMinutes": 180,
     "silentStartHour": 0,
     "silentEndHour": 9,
     "recipients": ["cheng", "cove", "aye"]

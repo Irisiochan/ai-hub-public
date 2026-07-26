@@ -4,6 +4,7 @@ import {
   estimateCostCny,
   isDailyMode,
   parseTriageJson,
+  validateTriageMode,
 } from './triage-core.mjs';
 
 function secretFromEnv(name) {
@@ -38,7 +39,7 @@ export class DeepSeekClient {
       : { type: 'disabled' };
   }
 
-  async call(model, system, user, pricing = {}) {
+  async call(model, system, user, pricing = {}, categories = this.categories) {
     if (!this.key) throw new Error('DeepSeek API key environment variable is missing');
     const startedAt = performance.now();
     const body = await jsonRequest(`${this.baseUrl}/chat/completions`, {
@@ -63,7 +64,7 @@ export class DeepSeekClient {
     }, this.timeoutMs);
     const content = body.choices?.[0]?.message?.content;
     return {
-      result: parseTriageJson(content, this.categories),
+      result: parseTriageJson(content, categories),
       usage: body.usage ?? {},
       costCny: estimateCostCny(body.usage, pricing),
       latencyMs: Math.round(performance.now() - startedAt),
@@ -75,18 +76,26 @@ export class DeepSeekClient {
     const dailyRecipients = Array.isArray(options.dailyRecipients) && options.dailyRecipients.length
       ? options.dailyRecipients
       : DEFAULT_DAILY_RECIPIENTS;
+    const forceActionable = daily && options.forceActionable === true;
+    const taskCategories = this.categories.filter((category) => category !== 'daily');
     const system = daily
       ? [
         'You are the L1 proactive daily-companion gate for an autonomous AI hub.',
         'Decide whether Iris should receive a proactive message right now.',
         'Allowed content: care/health/routine nudges, practical reminders, light chat openers, affectionate check-ins.',
-        'Stay selective — prefer NO_OP when nothing natural fits the current Shanghai time context.',
+        forceActionable
+          ? 'This is the guaranteed daily slot. Choose one natural, low-pressure proactive message; actionable must be true.'
+          : 'Stay selective — prefer NO_OP when nothing natural fits the current Shanghai time context.',
         'Return exactly one JSON object with this contract:',
-        '{"actionable":false,"category":"daily","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
+        forceActionable
+          ? `{"actionable":true,"category":"daily","priority":1,"suggestedRecipient":"${dailyRecipients[0]}","rationale":"brief reason"}`
+          : '{"actionable":false,"category":"daily","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
         'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
         'When actionable is true: category must be "daily" and suggestedRecipient must be exactly one of '
           + `${dailyRecipients.join(', ')}.`,
-        'When actionable is false: suggestedRecipient must be null.',
+        forceActionable
+          ? 'For this guaranteed slot, actionable must be true.'
+          : 'When actionable is false: suggestedRecipient must be null.',
         'Priority 1 is light/routine, 2 is more important care, 3 is urgent (rare).',
         'Pick the recipient by tone and relationship fit among the allowed list only.',
       ].join('\n')
@@ -96,7 +105,7 @@ export class DeepSeekClient {
         'Return exactly one JSON object with this contract:',
         '{"actionable":false,"category":"other","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
         'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
-        `Allowed categories: ${this.categories.join(', ')}.`,
+        `Allowed categories: ${taskCategories.join(', ')}.`,
         'Priority 1 is routine, 2 is important, 3 is urgent.',
         'suggestedRecipient is a configured routing key, or null when rules should decide.',
       ].join('\n');
@@ -109,9 +118,24 @@ export class DeepSeekClient {
       },
       mode: daily ? 'daily' : 'task',
       allowedRecipients: daily ? dailyRecipients : undefined,
-      recentBacklog: backlogSummary?.slice(0, this.backlogMaxChars) || '(unavailable)',
+      proactiveContext: daily ? options.proactiveContext ?? '(unavailable)' : undefined,
+      recentBacklog: daily
+        ? undefined
+        : backlogSummary?.slice(0, this.backlogMaxChars) || '(unavailable)',
     });
-    return this.call(this.flashModel, system, user, this.pricing.flash);
+    const response = await this.call(
+      this.flashModel,
+      system,
+      user,
+      this.pricing.flash,
+      daily ? ['daily'] : taskCategories,
+    );
+    validateTriageMode(response.result, {
+      mode: daily ? 'daily' : 'task',
+      dailyRecipients,
+      forceActionable,
+    });
+    return response;
   }
 
   async fuzzyRoute(event, triageResult, contacts, options = {}) {
@@ -287,6 +311,10 @@ export class VaultClient {
 
   async backlog(query = 'triage-backlog') {
     return this.call('search_vault', { query });
+  }
+
+  async taskContext() {
+    return this.call('get_task_context');
   }
 
   async park(event, result, reason) {

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   buildDailyCheckSummary,
   chooseRecipient,
+  dailyPolicyState,
   DEFAULT_CATEGORIES,
   DELIVERY_POOL_DAILY,
   DELIVERY_POOL_TASK,
@@ -14,8 +15,10 @@ import {
   isShanghaiSilentHour,
   nextTimerDelay,
   normalizeProactiveConfig,
+  shanghaiClock,
   timerSchedule,
   TriageStore,
+  validateTriageMode,
 } from './triage-core.mjs';
 import { DeepSeekClient, HubClient, VaultClient } from './triage-clients.mjs';
 
@@ -74,7 +77,19 @@ function retryDelay(attempt) {
   return Math.min(15 * 60_000, 5000 * (2 ** Math.max(0, attempt - 1)));
 }
 
-function dispatchPrompt(event, result) {
+function dispatchPrompt(event, result, { daily = false } = {}) {
+  if (daily) {
+    return [
+      '这是一次已经通过 daily triage 的主动陪伴机会。',
+      '请现在直接用你自己的自然语气对 Iris 说一条简短消息。',
+      '不要提及 triage、路由、系统事件、后台判断或 NO_OP；不要复述本指令。',
+      '除非上下文里确有具体待办，否则不要登记任务或写长期记忆。',
+      `分诊理由：${result.rationale}`,
+      '',
+      '可参考的当前线索：',
+      event.summary.slice(0, 6000),
+    ].join('\n');
+  }
   return [
     '⚡ AI Hub 自主事件分派',
     `来源：${event.source}`,
@@ -137,14 +152,44 @@ class TriageWorker {
     return this.config.proactive ?? normalizeProactiveConfig({});
   }
 
-  isDailyEvent(event, triageResult = null) {
-    return isDailyMode(event) || isDailyMode(triageResult);
+  isDailyEvent(event) {
+    // Delivery pools are a trusted event-source property. Never let L1 move a
+    // normal task into the daily pool by returning category=daily.
+    return isDailyMode(event);
   }
 
-  dailyPoolFull(now = Date.now()) {
-    const proactive = this.proactiveConfig();
-    if (!proactive.enabled || proactive.dailyDispatchLimit <= 0) return true;
-    return this.store.poolUsage(DELIVERY_POOL_DAILY, now).count >= proactive.dailyDispatchLimit;
+  dailyPolicy(now = Date.now()) {
+    return dailyPolicyState(
+      this.proactiveConfig(),
+      this.store.poolUsage(DELIVERY_POOL_DAILY, now),
+      now,
+    );
+  }
+
+  async proactiveContext(contacts, now = Date.now()) {
+    const usage = this.store.poolUsage(DELIVERY_POOL_DAILY, now);
+    const recentConversations = contacts
+      .filter((contact) => contact?.last_at)
+      .sort((a, b) => Date.parse(b.last_at) - Date.parse(a.last_at))
+      .slice(0, 3)
+      .map((contact) => ({
+        recipient: contact.config?.routing?.recipientKey ?? contact.id,
+        name: contact.name,
+        lastAt: contact.last_at,
+      }));
+    const openTasks = this.vault.enabled
+      ? await this.vault.taskContext().catch((error) => {
+        log('warn', 'proactive task context unavailable', { error: error.message });
+        return '';
+      })
+      : '';
+    return {
+      currentShanghaiTime: shanghaiClock(now).label,
+      dailyDeliveryCount: usage.count,
+      lastDailyDeliveryAt: usage.lastAt === null ? null : new Date(usage.lastAt).toISOString(),
+      recentConversations,
+      openTaskSnapshot: openTasks.slice(0, 3000) || '(unavailable)',
+    };
   }
 
   routeOptions(isDaily) {
@@ -184,10 +229,10 @@ class TriageWorker {
         return true;
       }
 
-      const looksDaily = this.isDailyEvent(event);
+      const isDaily = this.isDailyEvent(event);
       const proactive = this.proactiveConfig();
       if (
-        looksDaily
+        isDaily
         && isShanghaiSilentHour(Date.now(), proactive.silentStartHour, proactive.silentEndHour)
       ) {
         const silentResult = triageResult ?? {
@@ -205,41 +250,62 @@ class TriageWorker {
         log('info', 'event suppressed by silent hours', { eventId: event.id });
         return true;
       }
-      if (looksDaily && this.dailyPoolFull()) {
+      const initialDailyPolicy = isDaily ? this.dailyPolicy() : null;
+      if (isDaily && (initialDailyPolicy.poolFull || initialDailyPolicy.gapBlocked)) {
         const fullResult = triageResult ?? {
           actionable: false,
           category: 'daily',
           priority: 1,
           suggestedRecipient: null,
-          rationale: 'daily proactive pool exhausted for Shanghai day',
+          rationale: initialDailyPolicy.poolFull
+            ? 'daily proactive pool exhausted for Shanghai day'
+            : 'minimum daily proactive gap is still active',
         };
         this.store.finish(event.id, 'noop', {
           triageResult: fullResult,
           costCny,
           triageLatencyMs,
         });
-        log('info', 'event suppressed by daily proactive pool', {
+        log('info', 'event suppressed by daily proactive policy', {
           eventId: event.id,
           limit: proactive.dailyDispatchLimit,
+          reason: initialDailyPolicy.poolFull ? 'pool-full' : 'minimum-gap',
         });
         return true;
       }
 
+      let contacts = null;
       if (!triageResult) {
-        const reviewed = await this.deepseek.triage(
-          event,
-          await this.backlog().catch((error) => {
+        let backlogSummary = '';
+        let triageOptions = {};
+        if (isDaily) {
+          contacts = await this.hub.contacts();
+          triageOptions = {
+            mode: 'daily',
+            dailyRecipients: proactive.recipients,
+            forceActionable: initialDailyPolicy.forceActionable,
+            proactiveContext: await this.proactiveContext(contacts),
+          };
+        } else {
+          backlogSummary = await this.backlog().catch((error) => {
             log('warn', 'backlog unavailable', { error: error.message });
             return '';
-          }),
-          looksDaily
-            ? { mode: 'daily', dailyRecipients: proactive.recipients }
-            : {},
+          });
+        }
+        const reviewed = await this.deepseek.triage(
+          event,
+          backlogSummary,
+          triageOptions,
         );
         triageResult = reviewed.result;
         costCny += reviewed.costCny;
         triageLatencyMs = reviewed.latencyMs;
       }
+      validateTriageMode(triageResult, {
+        mode: isDaily ? 'daily' : 'task',
+        dailyRecipients: proactive.recipients,
+        forceActionable: isDaily && initialDailyPolicy.forceActionable,
+      });
       if (!triageResult.actionable) {
         this.store.finish(event.id, 'noop', { triageResult, costCny, triageLatencyMs });
         log('info', 'event classified NO_OP', {
@@ -252,22 +318,27 @@ class TriageWorker {
         return true;
       }
 
-      const isDaily = this.isDailyEvent(event, triageResult);
-      if (isDaily && this.dailyPoolFull()) {
+      const currentDailyPolicy = isDaily ? this.dailyPolicy() : null;
+      if (isDaily && (currentDailyPolicy.poolFull || currentDailyPolicy.gapBlocked)) {
         this.store.finish(event.id, 'noop', {
           triageResult: {
             ...triageResult,
             actionable: false,
-            rationale: `${triageResult.rationale} | daily pool full`,
+            rationale: `${triageResult.rationale} | ${
+              currentDailyPolicy.poolFull ? 'daily pool full' : 'minimum gap active'
+            }`,
           },
           costCny,
           triageLatencyMs,
         });
-        log('info', 'actionable daily dropped: pool full', { eventId: event.id });
+        log('info', 'actionable daily dropped by policy', {
+          eventId: event.id,
+          reason: currentDailyPolicy.poolFull ? 'pool-full' : 'minimum-gap',
+        });
         return true;
       }
 
-      const contacts = await this.hub.contacts();
+      contacts ??= await this.hub.contacts();
       const options = this.routeOptions(isDaily);
       let route = chooseRecipient({
         contacts,
@@ -321,7 +392,10 @@ class TriageWorker {
         return true;
       }
 
-      await this.hub.dispatch(route.contact.id, dispatchPrompt(event, storedResult));
+      await this.hub.dispatch(
+        route.contact.id,
+        dispatchPrompt(event, storedResult, { daily: isDaily }),
+      );
       this.store.recordDelivery(
         event.id,
         route.contact.id,
@@ -438,11 +512,16 @@ class TriageWorker {
               log('info', 'daily timer skipped: silent hours', { source: source.id });
               return;
             }
-            if (this.dailyPoolFull(now)) {
-              log('info', 'daily timer skipped: pool full', { source: source.id });
+            const policy = this.dailyPolicy(now);
+            if (policy.poolFull || policy.gapBlocked) {
+              log('info', 'daily timer skipped by proactive policy', {
+                source: source.id,
+                reason: policy.poolFull ? 'pool-full' : 'minimum-gap',
+              });
               return;
             }
           }
+          const policy = daily ? this.dailyPolicy(now) : null;
           this.enqueue({
             source: source.id,
             categoryHint: source.category ?? (daily ? 'daily' : 'system'),
@@ -451,7 +530,10 @@ class TriageWorker {
               ? buildDailyCheckSummary({
                 ...source,
                 recipients: this.proactiveConfig().recipients,
-              }, now)
+              }, now, {
+                proactive: this.proactiveConfig(),
+                forceActionable: policy.forceActionable,
+              })
               : (source.summary ?? `Scheduled wake from ${source.id}`),
             payload: {
               ...(source.payload && typeof source.payload === 'object' ? source.payload : {}),
