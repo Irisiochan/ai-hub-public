@@ -93,7 +93,10 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
   `/var/lib/ai-hub/releases`），可用 `HUB_RELEASES_DIR` 覆盖
 - Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是 Claude 配置模板；
   `mcp.gateway.json` 与 `.grok/config.toml` 是网关按需生成的 MCP 配置
-- 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`HUB_MCP_TOKEN`、`DEEPSEEK_API_KEY`
+- 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`HUB_TOKEN`、`HUB_MCP_TOKEN`、`DEEPSEEK_API_KEY`
+- 配置 `HUB_TOKEN` 后，浏览器首次可用 `?token=` 建立 HttpOnly 会话；管理 API 客户端使用
+  `Authorization: Bearer <HUB_TOKEN>`。设备端点继续校验各自 Worker token，`/api/health`
+  保持无鉴权，供 Compose 与部署探针使用
 - CLI 联系人启用 PC Worker 委派前必须配置独立 `HUB_MCP_TOKEN`。该令牌只保护
   内部 `/api/hub-mcp/*`，不要与桌面浏览器会话的 `HUB_TOKEN` 复用；未配置时接口默认关闭
 - Grok Build 启用委派时会在联系人工作目录生成项目级 `.grok/config.toml`；URL 和 Bearer

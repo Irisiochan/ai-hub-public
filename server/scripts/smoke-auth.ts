@@ -9,12 +9,15 @@ import { hubMcpRouter } from '../src/routes/hubMcp.js';
 import { JobStore } from '../src/workers/jobStore.js';
 
 assert.equal(isSelfAuthenticatedInternalPath('/api/worker/connect'), true);
+assert.equal(isSelfAuthenticatedInternalPath('/api/worker/jobs/job-1/recover'), true);
 assert.equal(isSelfAuthenticatedInternalPath('/api/hub-mcp/contact'), true);
+assert.equal(isSelfAuthenticatedInternalPath('/api/health'), true);
 for (const value of [
   '/api/workers',
   '/api/worker-evil',
   '/api/worker/../workers',
   '/api/worker/unknown',
+  '/api/worker/jobs/job-1/recover/extra',
   '/api/hub-mcp-evil',
   '/api/hub-mcp',
   '/api/hub-mcp/contact/extra',
@@ -32,8 +35,10 @@ db.prepare(
 const app = express();
 app.use(express.json());
 app.use(desktopSessionAuth('session-secret'));
+app.all('/api/health', (_req, res) => res.json({ status: 'ok' }));
 app.all('/api/workers', (_req, res) => res.json({ ok: true }));
 app.all('/api/worker/connect', (_req, res) => res.status(418).json({ deviceRoute: true }));
+app.all('/api/worker/jobs/job-1/recover', (_req, res) => res.status(418).json({ deviceRoute: true }));
 app.all('/api/worker-evil', (_req, res) => res.json({ unsafe: true }));
 app.all('/api/hub-mcp-evil', (_req, res) => res.json({ unsafe: true }));
 app.use('/api', hubMcpRouter(db, jobs, 'mcp-secret'));
@@ -45,7 +50,11 @@ const url = (pathname: string) => `http://127.0.0.1:${port}${pathname}`;
 try {
   assert.equal((await fetch(url('/api/workers'))).status, 401);
   assert.equal((await fetch(url('/api/workers'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401);
+  assert.equal((await fetch(url('/api/workers'), { headers: { authorization: 'Bearer wrong' } })).status, 401);
+  assert.equal((await fetch(url('/api/workers'), { headers: { authorization: 'Bearer session-secret' } })).status, 200);
+  assert.equal((await fetch(url('/api/health'))).status, 200);
   assert.equal((await fetch(url('/api/worker/connect'), { method: 'POST' })).status, 418);
+  assert.equal((await fetch(url('/api/worker/jobs/job-1/recover'), { method: 'POST' })).status, 418);
   assert.equal((await fetch(url('/api/worker-evil'))).status, 401);
   assert.equal((await fetch(url('/api/hub-mcp-evil'))).status, 401);
 

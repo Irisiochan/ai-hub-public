@@ -19,7 +19,7 @@ included in the APK artifact.
 
 ## In-app updates
 
-The Android shell checks `GET /api/app/releases/latest` on the configured Hub. A release manifest can
+The Android shell checks `GET /api/app/latest` on the configured Hub. A release manifest can
 offer two independently verified artifacts:
 
 - a same-origin Web bundle ZIP for hot updates;

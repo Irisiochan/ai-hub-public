@@ -20,10 +20,14 @@
   },
   "devDependencies": {
     "electron": "43.2.0",
-    "electron-builder": "26.15.6"
+    "electron-builder": "26.15.7"
   },
   "overrides": {
+    "@electron/asar": "4.2.1",
+    "@electron/universal": "3.0.6",
     "@hono/node-server": "2.0.11",
+    "brace-expansion": "5.0.8",
+    "ejs": "6.0.1",
     "fast-uri": "3.1.4"
   }
 }

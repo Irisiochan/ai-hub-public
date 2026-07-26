@@ -8,7 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "smoke": "node scripts/run-smokes.mjs",
-    "smoke:memory-contract": "node scripts/smoke-memory-vault-contract.mjs"
+    "smoke:memory-contract": "node scripts/smoke-memory-vault-contract.mjs",
+    "check:memory-version": "node scripts/check-memory-vault-version.mjs"
   },
   "dependencies": {
     "@ai-hub/contact-config": "file:../shared/contact-config",
