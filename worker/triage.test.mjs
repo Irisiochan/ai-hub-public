@@ -4,6 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import {
   buildDailyCheckSummary,
   chooseRecipient,
@@ -230,6 +231,56 @@ test('daily model routing ignores rules and task recipient quotas', () => {
   });
   assert.equal(missing.contact, null);
   assert.equal(missing.reason, 'no-route');
+});
+
+test('legacy SQLite deliveries without pool column migrate on open', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-triage-legacy-'));
+  const file = path.join(dir, 'triage.db');
+  const seed = new DatabaseSync(file);
+  try {
+    seed.exec(`
+      CREATE TABLE triage_events (
+        id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        payload TEXT,
+        category_hint TEXT,
+        status TEXT NOT NULL DEFAULT 'queued',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        triage_result TEXT,
+        recipient_id TEXT,
+        error TEXT,
+        cost_cny REAL NOT NULL DEFAULT 0,
+        triage_latency_ms INTEGER
+      );
+      CREATE TABLE triage_deliveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        delivered_at INTEGER NOT NULL
+      );
+      CREATE TABLE triage_source_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+  } finally {
+    seed.close();
+  }
+  const store = new TriageStore(file);
+  try {
+    store.enqueue({ source: 'legacy', summary: 'after migrate', dedupeKey: 'legacy-1' });
+    const claimed = store.claim();
+    store.recordDelivery(claimed.id, 'cove', Date.now(), DELIVERY_POOL_DAILY);
+    assert.equal(store.poolUsage(DELIVERY_POOL_DAILY).count, 1);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('Shanghai silent window and daily delivery pools stay separate from task quotas', () => {

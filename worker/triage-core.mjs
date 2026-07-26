@@ -342,8 +342,6 @@ export class TriageStore {
       );
       CREATE INDEX IF NOT EXISTS idx_triage_deliveries_recipient
         ON triage_deliveries(recipient_id, delivered_at);
-      CREATE INDEX IF NOT EXISTS idx_triage_deliveries_pool
-        ON triage_deliveries(pool, delivered_at);
       CREATE TABLE IF NOT EXISTS triage_source_state (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
@@ -356,12 +354,18 @@ export class TriageStore {
     if (!columns.has('triage_latency_ms')) {
       this.db.exec('ALTER TABLE triage_events ADD COLUMN triage_latency_ms INTEGER');
     }
+    // Existing production DBs were created before pool existed. ALTER first,
+    // then create the pool index — CREATE INDEX on a missing column aborts boot.
     const deliveryColumns = new Set(
       this.db.prepare('PRAGMA table_info(triage_deliveries)').all().map((column) => column.name),
     );
     if (!deliveryColumns.has('pool')) {
       this.db.exec(`ALTER TABLE triage_deliveries ADD COLUMN pool TEXT NOT NULL DEFAULT 'task'`);
     }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_triage_deliveries_pool
+        ON triage_deliveries(pool, delivered_at)
+    `);
   }
 
   enqueue(input) {
