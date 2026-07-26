@@ -131,9 +131,9 @@ jobs:
           path: ai-hub.apk
           retention-days: 14
 
-       - name: Upload embedded web bundle
-         uses: actions/upload-artifact@v7
-         with:
-           name: ai-hub-web-bundle
-           path: web-*.zip
-           retention-days: 14
+      - name: Upload embedded web bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-hub-web-bundle
+          path: web-*.zip
+          retention-days: 14
