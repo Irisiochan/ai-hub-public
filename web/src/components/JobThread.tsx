@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api, type JobMessage, type WorkerJob } from '../api';
 import { formatLocalTime, parseUtcTimestamp } from '../time';
+import { useConfirm, type ConfirmFn } from './ConfirmDialog';
 
 /**
  * 委派任务子会话：挂在原聊天消息下的紧凑状态条。
@@ -19,23 +20,42 @@ export const JOB_ACTIVE = new Set([
 ]);
 
 /** Confirm + soft-hide a job window. Shared by chat thread and Worker panel. */
-export async function hideJobWindow(job: WorkerJob): Promise<boolean> {
+export async function hideJobWindow(job: WorkerJob, confirm: ConfirmFn): Promise<boolean> {
   const active = JOB_ACTIVE.has(job.status);
   if (active) {
-    const ok = window.confirm(
-      '任务仍在队列或执行中。\n\n' +
+    const ok = await confirm({
+      title: '隐藏运行中的任务',
+      message: '任务仍在队列或执行中。\n\n' +
         '删除窗口不会硬删数据，但后台 Worker 仍可能继续执行。\n' +
         '若要停止执行，请先点「取消」。\n\n' +
-        '确定仅删除（隐藏）此任务窗口？'
-    );
+        '确定仅删除（隐藏）此任务窗口？',
+      confirmLabel: '仅隐藏窗口',
+      danger: true,
+    });
     if (!ok) return false;
   } else {
-    const ok = window.confirm(
-      '删除此任务窗口？\n\n仅从界面隐藏（软删除），刷新后不会再出现；任务记录与日志仍保留。'
-    );
+    const ok = await confirm({
+      title: '隐藏任务窗口',
+      message: '删除此任务窗口？\n\n仅从界面隐藏（软删除），刷新后不会再出现；任务记录与日志仍保留。',
+      confirmLabel: '隐藏窗口',
+      danger: true,
+    });
     if (!ok) return false;
   }
   await api.deleteJob(job.id, { force: active });
+  return true;
+}
+
+/** Confirm + mark a blocked job whose commit was completed outside its original worker run. */
+export async function resolveJobOutOfBand(job: WorkerJob, confirm: ConfirmFn): Promise<boolean> {
+  if (job.status !== 'blocked' || job.delivery_state?.startsWith('blocked_') !== true) return false;
+  const ok = await confirm({
+    title: '标记已接力完成',
+    message: '确认这项任务的成果已经由场外接力进入主分支？\n\n确认后任务会转为已完成；此操作不代表已经部署或通过线上验收。',
+    confirmLabel: '确认已接力完成',
+  });
+  if (!ok) return false;
+  await api.resolveJobOutOfBand(job.id);
   return true;
 }
 
@@ -47,6 +67,34 @@ export function jobStatusLabel(status: string): string {
     blocked: '待续接', failed: '失败', cancelled: '已取消', expired: '已过期',
   };
   return labels[status] ?? status;
+}
+
+export function humanJobLabel(job: WorkerJob): string {
+  return job.delivery_summary?.label ?? jobStatusLabel(job.status);
+}
+
+export function DeliverySummaryCard({ job }: { job: WorkerJob }) {
+  const delivery = job.delivery_summary;
+  if (!delivery) return null;
+  return (
+    <section className={`delivery-summary ${delivery.state}`} aria-label="交付状态摘要">
+      <div>
+        <b>{delivery.label}</b>
+        <p>{delivery.summary}</p>
+        <small>下一步负责人：{delivery.nextOwner}</small>
+      </div>
+      <details>
+        <summary>展开内部状态与证据</summary>
+        <dl>
+          <div><dt>任务状态</dt><dd><code>{job.status}</code></dd></div>
+          <div><dt>交付状态</dt><dd><code>{job.delivery_state ?? '未上报'}</code></dd></div>
+          {job.delivery_meta && (
+            <div><dt>交付证据</dt><dd><pre>{JSON.stringify(job.delivery_meta, null, 2)}</pre></dd></div>
+          )}
+        </dl>
+      </details>
+    </section>
+  );
 }
 
 function elapsedText(job: WorkerJob): string {
@@ -100,11 +148,15 @@ interface Props {
 }
 
 export default function JobThread({ job, onChanged }: Props) {
+  const confirm = useConfirm();
   const [showExecution, setShowExecution] = useState(false);
   const [messages, setMessages] = useState<JobMessage[]>([]);
   const [error, setError] = useState('');
   const [hiding, setHiding] = useState(false);
+  const [resolving, setResolving] = useState(false);
   const active = JOB_ACTIVE.has(job.status);
+  const canResolveOutOfBand = job.status === 'blocked'
+    && job.delivery_state?.startsWith('blocked_') === true;
 
   useEffect(() => {
     if (!showExecution) return;
@@ -140,12 +192,38 @@ export default function JobThread({ job, onChanged }: Props) {
     }
   };
 
+  const updateDelivery = async (
+    stage: 'online_waiting_validation' | 'closed_loop' | 'rework_required',
+  ) => {
+    setError('');
+    const presets = {
+      online_waiting_validation: {
+        summary: '对应版本已经上线，等待真实入口验收。',
+        nextOwner: '验收负责人',
+      },
+      closed_loop: {
+        summary: '实现、交付和要求内的验收均已完成。',
+        nextOwner: '无需后续动作',
+      },
+      rework_required: {
+        summary: '当前交付未通过验收，需要按反馈继续处理。',
+        nextOwner: 'PC Worker',
+      },
+    } as const;
+    try {
+      await api.updateJobDelivery(job.id, { stage, ...presets[stage] });
+      onChanged();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
   const hideWindow = async () => {
     if (hiding) return;
     setError('');
     setHiding(true);
     try {
-      const done = await hideJobWindow(job);
+      const done = await hideJobWindow(job, confirm);
       if (done) onChanged();
     } catch (e) {
       setError((e as Error).message);
@@ -154,12 +232,26 @@ export default function JobThread({ job, onChanged }: Props) {
     }
   };
 
+  const resolveOutOfBand = async () => {
+    if (resolving || !canResolveOutOfBand) return;
+    setError('');
+    setResolving(true);
+    try {
+      const done = await resolveJobOutOfBand(job, confirm);
+      if (done) onChanged();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setResolving(false);
+    }
+  };
+
   return (
     <div className={`job-thread ${active ? 'active' : ''} ${job.status}`}>
       <div className="job-thread-head-row">
         <button type="button" className="job-thread-head" onClick={() => setShowExecution(true)}>
           <span className={`job-dot ${job.status}`} />
-          <b>🖥 {jobStatusLabel(job.status)}</b>
+          <b>🖥 {humanJobLabel(job)}</b>
           <span className="job-thread-brief">{job.runner} · {job.prompt.slice(0, 60)}</span>
           <small>{elapsedText(job)}</small>
           <span className="job-thread-open">查看执行过程</span>
@@ -189,7 +281,7 @@ export default function JobThread({ job, onChanged }: Props) {
             <header className="job-execution-header">
               <div>
                 <span className={`job-dot ${job.status}`} />
-                <b>PC Worker · {jobStatusLabel(job.status)}</b>
+                <b>PC Worker · {humanJobLabel(job)}</b>
                 <small>{job.runner} · {elapsedText(job)}</small>
               </div>
               <button
@@ -207,8 +299,10 @@ export default function JobThread({ job, onChanged }: Props) {
                 <span>worker {job.worker_id ?? '待认领'}</span>
                 {job.permissions.shell && <span className="perm-chip">Shell</span>}
                 {job.permissions.ssh && <span className="perm-chip danger">SSH</span>}
+                {job.permissions.write === false && <span className="perm-chip">只读</span>}
                 <span>耗时 {elapsedText(job)}</span>
               </div>
+              <DeliverySummaryCard job={job} />
               <div className="job-msg prompt">
                 <small>任务</small>
                 <pre>{job.prompt}</pre>
@@ -248,6 +342,18 @@ export default function JobThread({ job, onChanged }: Props) {
                   <button type="button" onClick={() => void action('resume')}>
                     {['failed', 'blocked'].includes(job.status) ? '重试' : '继续'}
                   </button>
+                )}
+                {canResolveOutOfBand && (
+                  <button type="button" disabled={resolving} onClick={() => void resolveOutOfBand()}>
+                    {resolving ? '标记中…' : '标记已接力完成'}
+                  </button>
+                )}
+                {!active && (
+                  <>
+                    <button type="button" onClick={() => void updateDelivery('online_waiting_validation')}>标记已上线</button>
+                    <button type="button" onClick={() => void updateDelivery('closed_loop')}>标记已闭环</button>
+                    <button type="button" onClick={() => void updateDelivery('rework_required')}>打回重做</button>
+                  </>
                 )}
                 <button type="button" className="del" disabled={hiding} onClick={() => void hideWindow()}>
                   {hiding ? '删除中…' : '删除窗口'}

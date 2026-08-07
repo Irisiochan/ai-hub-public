@@ -4,10 +4,11 @@
  * returns text. Verifies openai-compat, anthropic, and native Gemini protocols.
  * Not shipped to production — run with: npx tsx scripts/smoke-directapi-tools.ts
  */
+import assert from 'node:assert/strict';
 import http from 'node:http';
 import { DirectApiBackend } from '../src/agents/directApi.js';
 import { AnthropicProvider } from '../src/agents/directApi/anthropic.js';
-import { GeminiProvider } from '../src/agents/directApi/gemini.js';
+import { GeminiProvider, normalizeGeminiFinishReason } from '../src/agents/directApi/gemini.js';
 import { OpenAiProvider } from '../src/agents/directApi/openai.js';
 
 function sse(res: http.ServerResponse, events: unknown[], done = true) {
@@ -25,7 +26,7 @@ const fakeVault = {
   calls: [] as { name: string; args: any }[],
   async call(name: string, args: any) {
     this.calls.push({ name, args });
-    return `【假档案】${name} 查到的内容：ai-hub 是用户的多 AI 群聊网关。`;
+    return `【假档案】${name} 查到的内容：ai-hub 是 User 的多 AI 群聊网关。`;
   },
 } as any;
 
@@ -93,7 +94,7 @@ const openaiSrv = http.createServer((req, res) => {
         },
         {
           choices: [
-            { delta: { tool_calls: [{ index: 0, function: { arguments: 'ries/user-profile.md"}' } }] }, finish_reason: 'tool_calls' },
+            { delta: { tool_calls: [{ index: 0, function: { arguments: 'ries/User-core.md"}' } }] }, finish_reason: 'tool_calls' },
           ],
         },
         {
@@ -172,12 +173,16 @@ const anthropicSrv = http.createServer((req, res) => {
   });
 });
 
+assert.equal(normalizeGeminiFinishReason('MAX_TOKENS'), 'length');
+assert.equal(normalizeGeminiFinishReason('STOP'), 'stop');
+assert.equal(normalizeGeminiFinishReason('SAFETY'), 'safety');
+
 // ---------- native Gemini mock ----------
 let geminiHits = 0;
 const signedFunctionPart = {
   functionCall: {
     name: 'read_file',
-    args: { path: 'memories/user-profile.md' },
+    args: { path: 'memories/User-core.md' },
     id: 'gemini-fc-1',
   },
   thoughtSignature: 'opaque-signature-must-survive',
@@ -310,11 +315,17 @@ await runTurn(geminiBackend, 'gemini', 'read_file', (usage) => {
   if (usage?.output !== 37) throw new Error(`expected output=37 (12+25), got ${usage?.output}`);
   if (usage?.cacheRead !== 7) throw new Error(`expected final-round cacheRead=7, got ${usage?.cacheRead}`);
   if (usage?.providerRounds !== 2) throw new Error(`expected providerRounds=2, got ${usage?.providerRounds}`);
+  if (usage?.finishReason !== 'stop') {
+    throw new Error(`expected Gemini finishReason=stop (STOP 归一), got ${usage?.finishReason}`);
+  }
 });
 if (!smokeLogs.some((line) => line.includes(
   'gemini usageMetadata={"promptTokenCount":180,"candidatesTokenCount":20,"thoughtsTokenCount":5,"cachedContentTokenCount":7}'
 ))) {
   throw new Error('expected complete Gemini usageMetadata diagnostic log');
+}
+if (!smokeLogs.some((line) => line.includes('finishReason=stop'))) {
+  throw new Error('expected Gemini usageLog to include finishReason=stop');
 }
 
 const disabledConfig = {

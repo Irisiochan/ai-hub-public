@@ -1,19 +1,42 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, connectEvents, type Contact, type ContactStatus, type Message, type UserProfile } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  api,
+  connectEvents,
+  type Contact,
+  type ContactStatus,
+  type Message,
+  type MessageOrigin,
+  type MessageReadState,
+  type MessageReadStates,
+  type UserProfile,
+} from './api';
 import ChatPane from './components/ChatPane';
 import ContactConfig from './components/ContactConfig';
 import ContactList from './components/ContactList';
 import PublishStatusPanel from './components/PublishStatusPanel';
 import UserConfig from './components/UserConfig';
 import WorkerPanel from './components/WorkerPanel';
-import { appendMessageDelta, mergeIncomingMessage, mergeMessageRows } from './messageMerge';
+import {
+  appendMessageDelta,
+  createTrailingMessageReconciler,
+  mergeIncomingMessage,
+  mergeMessageRows,
+  shouldReconcileMessagesAfterStatus,
+} from './messageMerge';
+import { effectiveMessageOrigin } from './messageSource.ts';
+import { incrementReadStateForIncoming, unreadHydrationAfter } from './unreadState';
+
+const emptyReadStates = (): MessageReadStates => ({
+  main: { origin: 'main', lastReadMessageId: 0, firstUnreadId: null, unreadCount: 0 },
+  side: { origin: 'side', lastReadMessageId: 0, firstUnreadId: null, unreadCount: 0 },
+});
 
 export default function App() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Record<string, Message[]>>({});
   const [statuses, setStatuses] = useState<Record<string, ContactStatus>>({});
-  const [unread, setUnread] = useState<Record<string, number>>({});
+  const [readStates, setReadStates] = useState<Record<string, MessageReadStates>>({});
   const [configFor, setConfigFor] = useState<{ contact: Contact | null } | null>(null);
   const [user, setUser] = useState<UserProfile>({ name: 'User', avatar: '🦋', color: '#e94560' });
   const [userConfigOpen, setUserConfigOpen] = useState(false);
@@ -22,11 +45,29 @@ export default function App() {
 
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
+  const activeChannelRef = useRef<MessageOrigin>('main');
+  const activeChannelContactRef = useRef<string | null>(null);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  const statusesRef = useRef(statuses);
+  statusesRef.current = statuses;
   const eventsRef = useRef<{ refresh(): void } | null>(null);
+  const lastSubscriptionRef = useRef<string | null>(selectedId);
+  const incomingIdsRef = useRef(new Set<string>());
+
+  const applyReadState = useCallback((contactId: string, state: MessageReadState) => {
+    setReadStates((prev) => {
+      const contactStates = prev[contactId] ?? emptyReadStates();
+      return { ...prev, [contactId]: { ...contactStates, [state.origin]: state } };
+    });
+  }, []);
 
   const upsertMessage = useCallback((msg: Message) => {
+    const incomingKey = `${msg.contact_id}:${msg.id}`;
+    const alreadyPresent =
+      incomingIdsRef.current.has(incomingKey) ||
+      (messagesRef.current[msg.contact_id] ?? []).some((message) => message.id === msg.id);
+    incomingIdsRef.current.add(incomingKey);
     setMessages((prev) => {
       const list = prev[msg.contact_id] ?? [];
       const idx = list.findIndex((m) => m.id === msg.id);
@@ -38,28 +79,53 @@ export default function App() {
     });
     setContacts((prev) =>
       prev.map((c) =>
-        c.id === msg.contact_id && msg.kind === 'text'
+        c.id === msg.contact_id && msg.kind === 'text' && effectiveMessageOrigin(msg) === 'main'
           ? { ...c, last_content: msg.content, last_at: msg.created_at }
           : c
       )
     );
-    if (msg.contact_id !== selectedRef.current && msg.sender !== 'user') {
-      setUnread((prev) => ({ ...prev, [msg.contact_id]: (prev[msg.contact_id] ?? 0) + 1 }));
-    }
-  }, []);
-
-  const loadMessages = useCallback(async (contactId: string) => {
-    const { messages: rows } = await api.messages(contactId, { limit: 50 });
-    setMessages((prev) => {
-      const existing = prev[contactId] ?? [];
-      return { ...prev, [contactId]: mergeMessageRows(existing, rows) };
+    const origin = effectiveMessageOrigin(msg) as MessageOrigin;
+    setReadStates((prev) => {
+      const contactStates = prev[msg.contact_id] ?? emptyReadStates();
+      const next = incrementReadStateForIncoming(contactStates[origin], msg, alreadyPresent);
+      if (!next || next === contactStates[origin]) return prev;
+      return { ...prev, [msg.contact_id]: { ...contactStates, [origin]: next } };
     });
   }, []);
 
-  const loadEarlier = useCallback(async (contactId: string) => {
-    const list = messagesRef.current[contactId] ?? [];
+  const loadMessages = useCallback(async (contactId: string) => {
+    const loadChannel = async (origin: MessageOrigin) => {
+      const initial = await api.messages(contactId, { limit: 50, origin });
+      let rows = initial.messages;
+      let state = initial.readState ?? emptyReadStates()[origin];
+      const after = unreadHydrationAfter(state, rows.map((message) => message.id));
+      if (after !== null) {
+        const hydrated = await api.messages(contactId, { after, limit: 1000, origin });
+        rows = mergeMessageRows(hydrated.messages, rows);
+        state = hydrated.readState ?? state;
+      }
+      return { rows, state };
+    };
+    const [main, side] = await Promise.all([loadChannel('main'), loadChannel('side')]);
+    setMessages((prev) => {
+      const existing = prev[contactId] ?? [];
+      return { ...prev, [contactId]: mergeMessageRows(existing, [...main.rows, ...side.rows]) };
+    });
+    setReadStates((prev) => ({
+      ...prev,
+      [contactId]: { main: main.state, side: side.state },
+    }));
+  }, []);
+
+  const reconcileMessages = useMemo(
+    () => createTrailingMessageReconciler(loadMessages),
+    [loadMessages]
+  );
+
+  const loadEarlier = useCallback(async (contactId: string, origin: MessageOrigin) => {
+    const list = (messagesRef.current[contactId] ?? []).filter((message) => message.origin === origin);
     if (list.length === 0) return;
-    const { messages: rows } = await api.messages(contactId, { before: list[0].id, limit: 50 });
+    const { messages: rows } = await api.messages(contactId, { before: list[0].id, limit: 50, origin });
     if (rows.length === 0) return;
     setMessages((prev) => {
       const existing = prev[contactId] ?? [];
@@ -70,26 +136,46 @@ export default function App() {
   const resync = useCallback(async () => {
     const { contacts: list } = await api.contacts();
     setContacts(list);
-    void api.getUser().then(setUser).catch(() => {});
-    setStatuses((prev) => {
+    setReadStates((prev) => {
       const next = { ...prev };
-      for (const c of list) {
-        const prevStatus = prev[c.id];
-        const busy =
-          c.state === 'thinking' ||
-          c.state === 'streaming' ||
-          c.state.startsWith('tool:');
-        // Prefer server member; if contacts snapshot omitted it mid-turn, keep
-        // the previous member while state is still busy (never invent room title).
-        const member =
-          c.member ??
-          (busy && prevStatus?.state === c.state ? prevStatus.member : undefined);
-        next[c.id] = { state: c.state, member };
+      for (const contact of list) {
+        if (contact.readStates) next[contact.id] = contact.readStates;
       }
       return next;
     });
-    if (selectedRef.current) await loadMessages(selectedRef.current);
-  }, [loadMessages]);
+    void api.getUser().then(setUser).catch(() => {});
+    const previousStatuses = statusesRef.current;
+    const nextStatuses = { ...previousStatuses };
+    const reconcileIds = new Set<string>();
+    for (const c of list) {
+      const prevStatus = previousStatuses[c.id];
+      const busy = c.state === 'thinking' || c.state === 'streaming' || c.state.startsWith('tool:');
+      const member = c.member ?? (busy && prevStatus?.state === c.state ? prevStatus.member : undefined);
+      nextStatuses[c.id] = { state: c.state, member, origin: c.origin };
+      if (shouldReconcileMessagesAfterStatus(prevStatus?.state, c.state, messagesRef.current[c.id] ?? [])) {
+        reconcileIds.add(c.id);
+      }
+    }
+    statusesRef.current = nextStatuses;
+    setStatuses(nextStatuses);
+    if (selectedRef.current) reconcileIds.add(selectedRef.current);
+    await Promise.all([...reconcileIds].map((contactId) => reconcileMessages(contactId)));
+  }, [reconcileMessages]);
+
+  const handleStatus = useCallback(({ contactId, state, member, origin }: {
+    contactId: string;
+    state: string;
+    member?: string;
+    origin?: MessageOrigin;
+  }) => {
+    const previous = statusesRef.current[contactId];
+    const next = { state, member, origin };
+    statusesRef.current = { ...statusesRef.current, [contactId]: next };
+    setStatuses((current) => ({ ...current, [contactId]: next }));
+    if (shouldReconcileMessagesAfterStatus(previous?.state, state, messagesRef.current[contactId] ?? [])) {
+      void reconcileMessages(contactId).catch(() => {});
+    }
+  }, [reconcileMessages]);
 
   useEffect(() => {
     void resync();
@@ -99,14 +185,11 @@ export default function App() {
         setMessages((prev) => {
           const list = prev[contactId];
           if (!list) return prev;
-          return {
-            ...prev,
-            [contactId]: appendMessageDelta(list, messageId, text),
-          };
+          return { ...prev, [contactId]: appendMessageDelta(list, messageId, text) };
         });
       },
-      onStatus: ({ contactId, state, member }) =>
-        setStatuses((prev) => ({ ...prev, [contactId]: { state, member } })),
+      onStatus: handleStatus,
+      onReadState: ({ contactId, ...state }) => applyReadState(contactId, state),
       onPrune: ({ contactId, ids, afterId }) =>
         setMessages((prev) => {
           const list = prev[contactId];
@@ -133,24 +216,24 @@ export default function App() {
     }, () => selectedRef.current ? [selectedRef.current] : []);
     eventsRef.current = connection;
     return () => connection.disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [handleStatus, resync, upsertMessage]);
 
   useEffect(() => {
+    if (lastSubscriptionRef.current === selectedId) return;
+    lastSubscriptionRef.current = selectedId;
     eventsRef.current?.refresh();
   }, [selectedId]);
 
-  const select = useCallback(
-    (id: string | null) => {
-      setSelectedId(id);
-      if (id) {
-        setUnread((prev) => ({ ...prev, [id]: 0 }));
-        void loadMessages(id);
-      }
-    },
-    [loadMessages]
-  );
+  const select = useCallback((id: string | null) => {
+    setSelectedId(id);
+    activeChannelRef.current = 'main';
+    activeChannelContactRef.current = id;
+    if (id) void reconcileMessages(id);
+  }, [reconcileMessages]);
 
+  const unread = useMemo(() => Object.fromEntries(
+    contacts.map((contact) => [contact.id, readStates[contact.id]?.main.unreadCount ?? 0])
+  ), [contacts, readStates]);
   const selected = contacts.find((c) => c.id === selectedId) ?? null;
 
   return (
@@ -175,18 +258,25 @@ export default function App() {
           status={statuses[selected.id] ?? { state: 'idle' }}
           user={user}
           onBack={() => select(null)}
-          onLoadEarlier={() => void loadEarlier(selected.id)}
+          readStates={readStates[selected.id] ?? emptyReadStates()}
+          sideUnread={(readStates[selected.id]?.side.unreadCount ?? 0) > 0}
+          onChannelChange={(channel) => {
+            activeChannelRef.current = channel;
+            activeChannelContactRef.current = selected.id;
+          }}
+          onMarkRead={(origin, throughMessageId) => {
+            void api.markRead(selected.id, origin, throughMessageId)
+              .then(({ readState }) => applyReadState(selected.id, readState))
+              .catch(() => {});
+          }}
+          onLoadEarlier={(origin) => void loadEarlier(selected.id, origin)}
           onSettings={() => setConfigFor({ contact: selected })}
         />
       ) : (
-        <div className="chat-empty">选个联系人开聊</div>
+        <div className="chat-empty">选个人开聊 🍊</div>
       )}
       {configFor && (
-        <ContactConfig
-          contact={configFor.contact}
-          contacts={contacts}
-          onClose={() => setConfigFor(null)}
-        />
+        <ContactConfig contact={configFor.contact} contacts={contacts} onClose={() => setConfigFor(null)} />
       )}
       {userConfigOpen && <UserConfig user={user} onClose={() => setUserConfigOpen(false)} />}
       {workerPanelOpen && <WorkerPanel onClose={() => setWorkerPanelOpen(false)} />}

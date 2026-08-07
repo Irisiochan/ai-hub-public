@@ -7,6 +7,7 @@ import {
   SUMMARY_FORMAT_MARKER,
 } from '../src/agents/conversationSummary.js';
 import { DirectApiBackend } from '../src/agents/directApi.js';
+import { roomTurnNotice } from '../src/agents/roomPrompt.js';
 import { openDb, type MessageRow } from '../src/db.js';
 import { shanghaiStamp } from '../src/memory/inject.js';
 
@@ -57,7 +58,7 @@ try {
   db.prepare(
     `INSERT INTO contacts (id, name, backend, kind, config)
      VALUES ('room-time', '时间群', 'api', 'room', '{}'),
-            ('gamma-time', 'Agent Gamma', 'api', 'dm', '{}'),
+            ('galami-time', '示例助手', 'api', 'dm', '{}'),
             ('dm-time', '私聊', 'api', 'dm', '{}')`
   ).run();
 
@@ -68,7 +69,7 @@ try {
   );
   insertRoom.run('user', 'user', '红油头发旧话题', '2026-07-23 04:59:08');
   const oldRoomReply = insertRoom.run(
-    'gamma-time',
+    'galami-time',
     'assistant',
     '旧回复里的今晚',
     '2026-07-23 05:00:00'
@@ -94,27 +95,35 @@ try {
   db.prepare(
     `INSERT INTO conversation_summaries
        (contact_id, member_id, summary, through_message_id, version)
-     VALUES ('room-time', 'gamma-time', '- 07-23 User：红油头发旧话题', ?, 1)`
+     VALUES ('room-time', 'galami-time', '- 07-23 User：红油头发旧话题', ?, 1)`
   ).run(Number(oldRoomReply.lastInsertRowid));
 
   const roomBackend = new DirectApiBackend({
     ...backendOpts,
     maxHistoryMessages: 2,
     contactId: 'room-time',
-    memberId: 'gamma-time',
+    memberId: 'galami-time',
     roomMode: {
-      selfId: 'gamma-time',
-      nameOf: (sender) => sender === 'user' ? 'User' : 'Agent Gamma',
+      selfId: 'galami-time',
+      nameOf: (sender) => sender === 'user' ? 'User' : '示例助手',
     },
   });
+  const currentRoomIds = [
+    Number(currentRoom.lastInsertRowid),
+    Number(currentRoom2.lastInsertRowid),
+    Number(currentRoom3.lastInsertRowid),
+  ];
+  const currentRoomNotice = roomTurnNotice('normal', [
+    { id: 'user', name: 'User' },
+  ], {
+    messageIds: currentRoomIds,
+    fromCreatedAt: '2026-07-26 10:34:56',
+    throughCreatedAt: '2026-07-26 10:35:04',
+  });
   const roomHistory = (roomBackend as any).history(
-    '只处理标有「本轮新消息」的内容',
+    currentRoomNotice,
     undefined,
-    [
-      Number(currentRoom.lastInsertRowid),
-      Number(currentRoom2.lastInsertRowid),
-      Number(currentRoom3.lastInsertRowid),
-    ]
+    currentRoomIds
   );
   const roomText = [
     roomHistory.summarySystem,
@@ -128,8 +137,8 @@ try {
   );
   assert.match(
     roomText,
-    /"sender_type":"user","occurred_at":"2026-07-26 周日 18:34 CST","temporal":"本轮新消息","content":"今天只讨论动物会说什么"/,
-    'API 群聊本轮精确消息 ID 必须在引用数据中标为 User 的本轮新消息'
+    /"sender_type":"User","occurred_at":"2026-07-26 周日 18:34 CST","temporal":"历史消息","content":"今天只讨论动物会说什么"/,
+    'API 群聊当前窗口内的历史行也必须保持稳定历史标签'
   );
   assert.doesNotMatch(
     roomText,
@@ -137,13 +146,25 @@ try {
     '旧回复不得因位于近期窗口而被误标为本轮'
   );
   assert.equal(
-    roomText.split('"temporal":"本轮新消息"').length - 1,
+    roomText.split('"temporal":"历史消息"').length - 1,
     3,
-    '本轮群消息数超过 maxHistoryMessages 时仍必须完整保留在原文窗口'
+    '当前窗口超过 maxHistoryMessages 时仍必须以稳定历史标签完整保留'
+  );
+  assert.doesNotMatch(
+    roomText,
+    /"temporal":"本轮新消息"/,
+    'API 群 history 不得再按当前窗口翻转历史行标签'
+  );
+  assert.ok(
+    currentRoomNotice.includes(`"message_ids":[${currentRoomIds.join(',')}]`)
+      && currentRoomNotice.includes('"from":"2026-07-26 周日 18:34 CST"')
+      && currentRoomNotice.includes('"through":"2026-07-26 周日 18:35 CST"')
+      && currentRoomNotice.includes('"count":3'),
+    'manifest 必须用真实 ID 和同格式上海时间锚定当前窗口'
   );
   const upgradedSummary = db.prepare(
     `SELECT summary FROM conversation_summaries
-     WHERE contact_id = 'room-time' AND member_id = 'gamma-time'`
+     WHERE contact_id = 'room-time' AND member_id = 'galami-time'`
   ).get() as { summary: string };
   assert.ok(
     upgradedSummary.summary.startsWith(SUMMARY_FORMAT_MARKER),

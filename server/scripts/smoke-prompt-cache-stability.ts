@@ -5,9 +5,14 @@
  * and promptCache=off removing all markers.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { DirectApiBackend } from '../src/agents/directApi.js';
 import { AnthropicProvider } from '../src/agents/directApi/anthropic.js';
 import type { HistoryMessage, ProviderTools } from '../src/agents/directApi/provider.js';
+import { openDb } from '../src/db.js';
 
 const requests: Array<{ body: any; headers: http.IncomingHttpHeaders }> = [];
 const server = http.createServer((req, res) => {
@@ -79,6 +84,64 @@ try {
   assert.equal(requests[0].headers['anthropic-beta'], undefined, 'legacy cache beta header must not be sent');
   assert(firstLogs.includes('provider=anthropic breakpoints=4 hit=3 write=1'));
   assert(secondLogs.includes('provider=anthropic breakpoints=4 hit=3 write=1'));
+
+  const roomDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-room-cache-'));
+  const roomDb = openDb(path.join(roomDir, 'hub.db'));
+  try {
+    roomDb.prepare(`
+      INSERT INTO contacts (id, name, backend, kind, config)
+      VALUES ('room-cache', '缓存群', 'room', 'room', '{}'),
+             ('gem-cache', 'Gem', 'api', 'dm', '{}'),
+             ('codex-cache', 'Codex', 'api', 'dm', '{}')
+    `).run();
+    const insert = roomDb.prepare(`
+      INSERT INTO messages (contact_id, sender, role, kind, content, status, created_at)
+      VALUES ('room-cache', ?, ?, 'text', ?, 'done', ?)
+    `);
+    insert.run('user', 'user', '群聊起点', '2026-08-05 07:00:00');
+    const codex = insert.run('codex-cache', 'assistant', '上一位成员接话', '2026-08-05 07:00:10');
+    const user = insert.run('user', 'user', 'User 本轮补充', '2026-08-05 07:00:20');
+    const backend = new DirectApiBackend({
+      provider: 'openai-compat',
+      baseUrl: 'https://example.invalid',
+      apiKey: 'unused',
+      model: 'unused',
+      maxHistoryMessages: 60,
+      historyTokenBudget: 24_000,
+      minRecentTurns: 2,
+      summaryMaxTokens: 2_000,
+      historySummaryStrategy: 'off',
+      maxTokens: 128,
+      turnTimeoutMs: 1_000,
+      db: roomDb,
+      uploadsDir: roomDir,
+      contactId: 'room-cache',
+      memberId: 'gem-cache',
+      log: () => {},
+      roomMode: {
+        selfId: 'gem-cache',
+        nameOf: (sender) => ({ user: 'User', 'codex-cache': 'Codex', 'gem-cache': 'Gem' })[sender] ?? sender,
+      },
+    });
+    const firstRoom = (backend as any).history(
+      'window one', undefined, [Number(codex.lastInsertRowid), Number(user.lastInsertRowid)]
+    );
+    const secondRoom = (backend as any).history(
+      'window two', undefined, [Number(user.lastInsertRowid)]
+    );
+    const firstRows = firstRoom.messages.slice(0, -1);
+    const secondRows = secondRoom.messages.slice(0, -1);
+    assert.deepEqual(
+      firstRows,
+      secondRows,
+      'adjacent room turns must serialize every existing history item byte-stably'
+    );
+    assert.doesNotMatch(JSON.stringify(firstRows), /本轮新消息/);
+    assert.match(JSON.stringify(firstRows), /历史消息/);
+  } finally {
+    roomDb.close();
+    fs.rmSync(roomDir, { recursive: true, force: true });
+  }
   console.log('prompt cache stability smoke: ok');
 } finally {
   await new Promise<void>((resolve) => server.close(() => resolve()));

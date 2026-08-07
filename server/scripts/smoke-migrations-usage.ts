@@ -15,9 +15,9 @@ for (const file of [freshPath, upgradePath]) {
 }
 
 const migrations = loadMigrationFiles();
-assert.equal(migrations.length, 14);
+assert.equal(migrations.length, 15);
 assert.equal(migrations[0].name, '0001_init.sql');
-assert.equal(migrations.at(-1)?.name, '0014_usage_daily.sql');
+assert.equal(migrations.at(-1)?.name, '0015_message_origin.sql');
 
 function addContact(db: Database.Database, id: string): void {
   db.prepare('INSERT INTO contacts (id, name, backend, kind, config) VALUES (?, ?, ?, ?, ?)')
@@ -34,11 +34,15 @@ function addUsage(db: Database.Database, contactId: string, usage: Record<string
 
 let db = openDb(freshPath);
 try {
-  assert.equal(db.pragma('user_version', { simple: true }), 14);
+  assert.equal(db.pragma('user_version', { simple: true }), 15);
   addContact(db, 'fresh');
   const first = addUsage(db, 'fresh', { input: 10, output: 2, cacheCreation: 3, cacheRead: 4 });
   const repo = new UsageRepo(db);
   assert.deepEqual(repo.summary('fresh').total, { input: 10, output: 2, cacheCreation: 3, cacheRead: 4 });
+  assert.equal(
+    (db.prepare('SELECT origin FROM messages WHERE id = ?').get(first) as { origin: string }).origin,
+    'main', 'new rows that omit origin must remain compatible with the main window'
+  );
 
   db.prepare('UPDATE messages SET meta = ? WHERE id = ?')
     .run(JSON.stringify({ usage: { input: 20, output: 5, cacheCreation: 0, cacheRead: 8 } }), first);
@@ -68,10 +72,15 @@ legacy.close();
 
 db = openDb(upgradePath);
 try {
-  assert.equal(db.pragma('user_version', { simple: true }), 14);
+  assert.equal(db.pragma('user_version', { simple: true }), 15);
   assert.deepEqual(new UsageRepo(db).summary('upgrade').total,
     { input: 33, output: 9, cacheCreation: 4, cacheRead: 12 },
     '0014 must backfill existing usage rows');
+  assert.deepEqual(
+    db.prepare("SELECT DISTINCT origin FROM messages WHERE contact_id = 'upgrade'").all(),
+    [{ origin: 'main' }],
+    '0015 must leave every historical row in main without heuristic backfill'
+  );
 } finally {
   db.close();
   for (const file of [freshPath, upgradePath]) {

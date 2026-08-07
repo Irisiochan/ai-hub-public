@@ -2,78 +2,81 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { HubConfig } from './config.js';
 import type { Db } from './db.js';
-import type { HubLogger } from './logger.js';
 
-/** First-boot public seed: neutral product identities, never private personas. */
-export function seedIfEmpty(db: Db, config: HubConfig, logger?: HubLogger): void {
+function writeIfMissing(file: string, lines: string[]): void {
+  if (fs.existsSync(file)) return;
+  fs.writeFileSync(file, `${lines.join('\n')}\n`, 'utf8');
+}
+
+/** Public first boot: generic contacts only; Compose provides memory automatically. */
+export function seedIfEmpty(db: Db, config: HubConfig): void {
   const count = db.prepare('SELECT COUNT(*) AS c FROM contacts').get() as { c: number };
   if (count.c > 0) return;
 
-  const claudeDir = path.join(config.agentsDir, 'claude-code');
+  const claudeDir = path.join(config.agentsDir, 'claude');
   fs.mkdirSync(claudeDir, { recursive: true });
+  writeIfMissing(path.join(claudeDir, 'CLAUDE.md'), [
+    '# ai-hub chat mode',
+    '',
+    'You are the Claude contact in an IM-style AI client.',
+    '',
+    '- Reply naturally and concisely unless the user asks for detail.',
+    '- Do not claim tools or permissions that are not available.',
+    '- Use memory context supplied by the gateway when it is available.',
+  ]);
 
-  const claudeMd = path.join(claudeDir, 'CLAUDE.md');
-  if (!fs.existsSync(claudeMd)) {
-    fs.writeFileSync(
-      claudeMd,
-      [
-        '# AI Hub chat mode',
-        '',
-        'You are Claude Code in a private, self-hosted AI Hub.',
-        '',
-        '- Reply like a natural chat message; stay concise unless detail is useful.',
-        '- Do not infer the user\'s identity or your persona from memory metadata.',
-        '- When WORKFLOW_PRELOADED is present, do not reread global workflow files.',
-        '- Use only the tools and workspaces explicitly enabled for this contact.',
-        '',
-      ].join('\n'),
-      'utf-8'
-    );
-  }
-
-  const insert = db.prepare(
+  db.prepare(
     `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
-     VALUES (?, ?, ?, ?, ?, 'dm', ?, ?)`
-  );
-
-  insert.run(
-    'claude-code', 'Claude Code', '🟧', '#d97757', 'claude-cli',
+     VALUES (?, ?, ?, ?, ?, 'dm', ?, 0)`
+  ).run(
+    'claude',
+    'Claude',
+    '🤖',
+    '#d97706',
+    'claude-cli',
     JSON.stringify({
-      cwd: 'claude-code',
+      cwd: 'claude',
       allowedTools: ['Read', 'Grep', 'Glob'],
       disallowedTools: ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch'],
-      appendSystemPrompt:
-        'You are Claude Code chatting with the current AI Hub user. Keep a conversational tone and do not assume a name or relationship.',
-    }),
-    0
+      appendSystemPrompt: 'You are chatting through ai-hub. Keep replies natural, direct, and suitable for IM.',
+    })
   );
 
-  insert.run(
-    'codex', 'Codex', '🧩', '#10a37f', 'codex',
+  console.log('  seeded contact: Claude (claude-cli)');
+}
+
+/** Add a generic Codex contact without modifying existing contacts or sessions. */
+export function ensureCodexContact(db: Db, config: HubConfig): void {
+  const codexDir = path.join(config.agentsDir, 'codex');
+  fs.mkdirSync(codexDir, { recursive: true });
+  writeIfMissing(path.join(codexDir, 'AGENTS.md'), [
+    '# ai-hub chat mode',
+    '',
+    'You are the Codex contact in an IM-style AI client.',
+    '',
+    '- Reply naturally and concisely unless the user asks for detail.',
+    '- Treat the filesystem as read-only unless project access is explicitly enabled.',
+    '- Use memory context supplied by the gateway when it is available.',
+  ]);
+
+  const existing = db.prepare('SELECT id FROM contacts WHERE id = ?').get('codex');
+  if (existing) return;
+
+  db.prepare(
+    `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
+     VALUES (?, ?, ?, ?, ?, 'dm', ?, 1)`
+  ).run(
+    'codex',
+    'Codex',
+    '💻',
+    '#2563eb',
+    'codex',
     JSON.stringify({
       cwd: 'codex',
       developerInstructions:
-        'You are Codex chatting with the current AI Hub user. Keep a conversational tone and do not assume a name or relationship.',
-    }),
-    1
+        'You are chatting through ai-hub. Keep replies natural and direct. Do not use shell or file-writing tools unless project access is explicitly enabled.',
+    })
   );
 
-  insert.run(
-    'grok-build', 'Grok Build', '⚡', '#334155', 'grok-cli',
-    JSON.stringify({
-      cwd: 'grok-build',
-      appendSystemPrompt:
-        'You are Grok Build chatting with the current AI Hub user. Keep a conversational tone and do not assume a name or relationship.',
-    }),
-    2
-  );
-
-  if (logger) {
-    logger.info(
-      { component: 'seed', contacts: ['claude-code', 'codex', 'grok-build'] },
-      'seeded neutral first-boot contacts'
-    );
-  } else {
-    console.log('  seeded contacts: Claude Code, Codex, Grok Build');
-  }
+  console.log('  seeded contact: Codex (codex)');
 }

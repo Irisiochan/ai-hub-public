@@ -10,7 +10,7 @@ const MEMORY_TOOLS = [
   {
     name: 'search_vault',
     description:
-      '在当前用户的共享记忆库中按关键词搜索（多个词空格分隔，AND 逻辑），返回匹配的文件清单。',
+      '在 User 的共享记忆库中按关键词搜索（多个词空格分隔，AND 逻辑），返回匹配的文件清单。',
     schema: {
       type: 'object',
       properties: { query: { type: 'string', description: '搜索关键词' } },
@@ -19,7 +19,7 @@ const MEMORY_TOOLS = [
   },
   {
     name: 'read_file',
-    description: '读取记忆库中某个文件的全文。path 是相对路径，例如 "memories/user-profile.md"。',
+    description: '读取记忆库中某个文件的全文。path 是相对路径，例如 "memories/User-core.md"。',
     schema: {
       type: 'object',
       properties: { path: { type: 'string', description: '相对于记忆库根目录的路径' } },

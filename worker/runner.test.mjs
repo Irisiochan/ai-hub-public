@@ -18,12 +18,28 @@ test('server delivery contract is passed through to runner prompt', () => {
   const spec = buildRunnerSpec({ ...baseJob, runner: 'claude' }, {}, { platform: 'win32' });
   assert.match(spec.stdin, /SERVER DELIVERY CONTRACT/);
   assert.match(spec.stdin, /do the work/);
+  assert.match(spec.stdin, /Do not use SSH or operate remote machines/);
+
+  const ssh = buildRunnerSpec({
+    ...baseJob,
+    runner: 'claude',
+    permissions: { write: true, shell: true, ssh: true },
+  }, {}, { platform: 'win32' });
+  assert.match(ssh.stdin, /SSH\/VPS operations are explicitly allowed/);
 });
 
 test('claude permission table separates read, write and shell profiles', () => {
   const read = buildRunnerSpec({ ...baseJob, runner: 'claude' }, {}, { platform: 'win32' });
   assert.equal(read.args[read.args.indexOf('--allowedTools') + 1], 'Read,Grep,Glob');
   assert.equal(read.args[read.args.indexOf('--disallowedTools') + 1], 'Bash');
+
+  const shellRead = buildRunnerSpec({
+    ...baseJob,
+    runner: 'claude',
+    permissions: { write: false, shell: true },
+  }, {}, { platform: 'win32' });
+  assert.equal(shellRead.args[shellRead.args.indexOf('--allowedTools') + 1], 'Read,Grep,Glob,Bash');
+  assert.equal(shellRead.args[shellRead.args.indexOf('--disallowedTools') + 1], 'Write,Edit');
 
   const write = buildRunnerSpec({
     ...baseJob,
@@ -79,6 +95,33 @@ test('codex resume and fresh execution keep their distinct CLI forms', () => {
   }, {}, { platform: 'win32' });
   assert.deepEqual(resumed.args.slice(0, 3), ['exec', 'resume', '--json']);
   assert.equal(resumed.args.includes('thread-123'), true);
+});
+
+test('codex danger-full-access passthrough drops windows sandbox but honors read-only jobs', () => {
+  const full = buildRunnerSpec({
+    ...baseJob,
+    runner: 'codex',
+    permissions: { write: true, shell: true },
+  }, { codexSandboxMode: 'danger-full-access' }, { platform: 'win32' });
+  const sandboxIndex = full.args.indexOf('--sandbox');
+  assert.equal(full.args[sandboxIndex + 1], 'danger-full-access');
+  assert.equal(full.args.some((arg) => arg.startsWith('windows.sandbox=')), false);
+
+  const readOnly = buildRunnerSpec({
+    ...baseJob,
+    runner: 'codex',
+    permissions: { write: false, shell: true },
+  }, { codexSandboxMode: 'danger-full-access' }, { platform: 'win32' });
+  const roIndex = readOnly.args.indexOf('--sandbox');
+  assert.equal(readOnly.args[roIndex + 1], 'read-only', '只读单不得因直通配置获得写权限');
+
+  const defaultCfg = buildRunnerSpec({
+    ...baseJob,
+    runner: 'codex',
+    permissions: { write: true, shell: true },
+  }, {}, { platform: 'win32' });
+  const defIndex = defaultCfg.args.indexOf('--sandbox');
+  assert.equal(defaultCfg.args[defIndex + 1], 'workspace-write', '未配置直通时行为不变');
 });
 
 test('codex reasoning effort uses the supported config override for fresh and resumed runs', () => {

@@ -1,5 +1,5 @@
 /**
- * Smoke test: PC Worker manual pause/resume and per-boot auto reset.
+ * Smoke test: PC Worker manual pause/resume; pause sticks until explicit resume.
  * Run with: npx tsx scripts/smoke-worker-control.ts
  */
 import fs from 'node:fs';
@@ -41,7 +41,7 @@ async function call(url: string, init: RequestInit = {}) {
 
 try {
   const paired = await call('/workers', {
-    method: 'POST', body: JSON.stringify({ id: 'my-pc', name: 'My PC' }),
+    method: 'POST', body: JSON.stringify({ id: 'my-pc', name: 'User PC' }),
   });
   const auth = { Authorization: `Bearer ${paired.token}` };
   const capabilities = {
@@ -71,7 +71,7 @@ try {
   check('同次开机重连仍暂停', connected.worker.acceptingJobs === false && connected.worker.status === 'paused');
 
   const created = jobs.create({
-    requestedBy: 'user', runner: 'codex', workspace: dir, prompt: 'smoke',
+    requestedBy: 'User', runner: 'codex', workspace: dir, prompt: 'smoke',
     permissions: { write: true, shell: true },
   });
   if ('error' in created) throw new Error(created.error);
@@ -83,7 +83,15 @@ try {
     method: 'POST', headers: auth,
     body: JSON.stringify({ bootId: 'boot-b', capabilities }),
   });
-  check('新开机自动恢复接单', connected.worker.acceptingJobs === true && connected.worker.status === 'online');
+  check('新开机重连仍保持暂停', connected.worker.acceptingJobs === false && connected.worker.status === 'paused');
+
+  const pausedAfterBootClaim = await call('/worker/claim?wait=0', { headers: auth });
+  check('bootId 变化后仍不认领', pausedAfterBootClaim.job === null && pausedAfterBootClaim.acceptingJobs === false);
+
+  controlled = await call('/workers/my-pc/control', {
+    method: 'POST', body: JSON.stringify({ enabled: true }),
+  });
+  check('手动恢复接单', controlled.acceptingJobs === true && controlled.status === 'online');
 
   const resumedClaim = await call('/worker/claim?wait=0', { headers: auth });
   check('恢复后可以认领原任务', resumedClaim.job?.id === created.job.id && resumedClaim.acceptingJobs === true);
@@ -91,7 +99,8 @@ try {
     'claim 下发 protocol v2 与服务端交付契约',
     resumedClaim.protocolVersion === 2
       && typeof resumedClaim.deliveryContract === 'string'
-      && resumedClaim.deliveryContract.includes('standalone JSON line')
+      && resumedClaim.deliveryContract.includes('standalone line')
+      && resumedClaim.deliveryContract.includes('fenced/multiline JSON block')
   );
 
   await call(`/worker/jobs/${created.job.id}/start`, {
@@ -163,7 +172,7 @@ try {
   );
 
   const staleCreated = jobs.create({
-    requestedBy: 'user', runner: 'codex', workspace: dir, prompt: 'stale fallback smoke',
+    requestedBy: 'User', runner: 'codex', workspace: dir, prompt: 'stale fallback smoke',
     permissions: { write: true, shell: true },
   });
   if ('error' in staleCreated) throw new Error(staleCreated.error);
@@ -229,15 +238,15 @@ try {
   fs.mkdirSync(workspaceA);
   fs.mkdirSync(workspaceB);
   const parallelA = jobs.create({
-    requestedBy: 'user', runner: 'codex', workspace: workspaceA, prompt: 'parallel a',
+    requestedBy: 'User', runner: 'codex', workspace: workspaceA, prompt: 'parallel a',
     priority: 10, permissions: { write: true, shell: true, ssh: false },
   });
   const sameWorkspace = jobs.create({
-    requestedBy: 'user', runner: 'codex', workspace: workspaceA, prompt: 'parallel same workspace',
+    requestedBy: 'User', runner: 'codex', workspace: workspaceA, prompt: 'parallel same workspace',
     priority: 9, permissions: { write: true, shell: true, ssh: false },
   });
   const parallelB = jobs.create({
-    requestedBy: 'user', runner: 'codex', workspace: workspaceB, prompt: 'parallel b',
+    requestedBy: 'User', runner: 'codex', workspace: workspaceB, prompt: 'parallel b',
     priority: 8, permissions: { write: true, shell: true, ssh: false },
   });
   if ('error' in parallelA || 'error' in sameWorkspace || 'error' in parallelB) {
@@ -274,7 +283,7 @@ try {
   });
 
   const recoveryCreated = jobs.create({
-    requestedBy: 'user', runner: 'codex', workspace: workspaceA, prompt: 'recover me',
+    requestedBy: 'User', runner: 'codex', workspace: workspaceA, prompt: 'recover me',
     permissions: { write: true, shell: true, ssh: false },
   });
   if ('error' in recoveryCreated) throw new Error(recoveryCreated.error);
@@ -301,7 +310,7 @@ try {
   });
 
   const expiryCreated = jobs.create({
-    requestedBy: 'user', runner: 'codex', workspace: workspaceB, prompt: 'expire recovery',
+    requestedBy: 'User', runner: 'codex', workspace: workspaceB, prompt: 'expire recovery',
     permissions: { write: true, shell: true, ssh: false },
   });
   if ('error' in expiryCreated) throw new Error(expiryCreated.error);

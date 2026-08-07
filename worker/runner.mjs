@@ -9,12 +9,14 @@ const CODEX_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'
 
 const CLAUDE_PERMISSIONS = {
   read: { allowed: ['Read', 'Grep', 'Glob'], denied: ['Bash'] },
+  shellRead: { allowed: ['Read', 'Grep', 'Glob', 'Bash'], denied: ['Write', 'Edit'] },
   write: { allowed: ['Read', 'Grep', 'Glob', 'Write', 'Edit'], denied: ['Bash'] },
   shell: { allowed: ['Read', 'Grep', 'Glob', 'Write', 'Edit', 'Bash'], denied: [] },
 };
 
 const GROK_PERMISSIONS = {
   read: { denied: ['search_replace', 'run_terminal_command'], approve: false },
+  shellRead: { denied: ['search_replace'], approve: true },
   write: { denied: ['run_terminal_command'], approve: true },
   shell: { denied: [], approve: true },
 };
@@ -22,6 +24,7 @@ const GROK_PERMISSIONS = {
 function permissionProfile(perms = {}) {
   if (perms.write && perms.shell) return 'shell';
   if (perms.write) return 'write';
+  if (perms.shell) return 'shellRead';
   return 'read';
 }
 
@@ -96,13 +99,17 @@ export function buildRunnerSpec(job, cfg, runtime = {}) {
   }
 
   if (job.runner !== 'codex') throw new Error(`unsupported runner: ${job.runner}`);
-  const sandbox = perms.write ? 'workspace-write' : 'read-only';
+  // codexSandboxMode="danger-full-access"：宿主沙箱在本机不可用时（见 vault
+  // windows-codex-linked-worktree-apply-patch-acl），经 User 授权的全信任直通。
+  // 写权限仍由 perms.write 决定：只读单照旧压成 read-only，不因直通放开。
+  const fullAccess = cfg.codexSandboxMode === 'danger-full-access' && perms.write;
+  const sandbox = fullAccess ? 'danger-full-access' : (perms.write ? 'workspace-write' : 'read-only');
   const command = cfg.codexCommand ?? (platform === 'win32' ? 'codex.cmd' : 'codex');
   const model = validModel(opts.model) ? opts.model : cfg.codexModel;
   const modelArgs = validModel(model) ? ['--model', model] : [];
   const reasoningArgs = CODEX_REASONING_EFFORTS.has(opts.reasoning)
     ? ['--config', `model_reasoning_effort="${opts.reasoning}"`] : [];
-  const windowsSandbox = platform === 'win32'
+  const windowsSandbox = !fullAccess && platform === 'win32'
     && ['elevated', 'unelevated'].includes(cfg.codexWindowsSandbox ?? 'unelevated')
     ? ['--config', `windows.sandbox="${cfg.codexWindowsSandbox ?? 'unelevated'}"`]
     : [];

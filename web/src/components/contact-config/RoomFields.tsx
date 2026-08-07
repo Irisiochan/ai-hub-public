@@ -10,27 +10,79 @@ interface Props {
   onRespondAll(value: boolean): void;
 }
 
+const ROUNDS = [0, 1, 2, 3];
+
 export default function RoomFields(props: Props) {
   return (
-    <fieldset className="mem-toggles">
-      <legend>群成员</legend>
-      {props.contacts.map((contact) => (
-        <label key={contact.id}>
-          <input type="checkbox" checked={props.members.includes(contact.id)} onChange={() => props.onToggleMember(contact.id)} />
-          {contact.avatar} {contact.name}
-          <span className="field-hint" style={{ marginLeft: 6 }}>({contact.backend})</span>
-        </label>
-      ))}
-      <p className="field-hint">群里用 @名字 点名，@all 叫全员；默认无 @ 时不调用模型，避免无意消耗。</p>
-      <label>
-        <input type="checkbox" checked={props.respondAllByDefault} onChange={(event) => props.onRespondAll(event.target.checked)} />
-        无 @ 时默认全员响应（更热闹，也更耗 token）
-      </label>
-      <label className="field" style={{ maxWidth: 160 }}>
-        接话轮数（0-3）
-        <input type="number" min={0} max={3} value={props.reactionRounds} onChange={(event) => props.onReactionRounds(Math.min(3, Math.max(0, Number(event.target.value) || 0)))} />
-      </label>
-      <p className="field-hint">每轮点名发言后，成员会看到彼此的新发言并可自然接话（或沉默）。0 = 关闭，回到纯点名制。</p>
-    </fieldset>
+    <>
+      <div className="cfg-group">
+        <h3>
+          成员 <small>已选 {props.members.length} 个</small>
+        </h3>
+        <div className="member-list">
+          {props.contacts.map((contact) => {
+            const on = props.members.includes(contact.id);
+            return (
+              <button
+                key={contact.id}
+                type="button"
+                className={'member-row' + (on ? ' selected' : '')}
+                aria-pressed={on}
+                onClick={() => props.onToggleMember(contact.id)}
+              >
+                <span className="avatar" style={on ? { boxShadow: `inset 0 0 0 1.5px ${contact.color}88` } : undefined}>
+                  {contact.avatar}
+                </span>
+                <span className="member-id">
+                  <b>{contact.name}</b>
+                  <small>{contact.backend}</small>
+                </span>
+                <span className="member-check" aria-hidden="true">
+                  ✓
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <p className="cfg-note">群里用 @名字 点名，@all 叫全员；默认无 @ 时不调用模型，避免无意消耗。</p>
+      </div>
+
+      <div className="cfg-group">
+        <h3>发言规则</h3>
+        <div className="switch-row">
+          <span>
+            <b>无 @ 时默认全员响应</b>
+            <small>更热闹，也更耗 token</small>
+          </span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={props.respondAllByDefault}
+            className={'switch' + (props.respondAllByDefault ? ' on' : '')}
+            onClick={() => props.onRespondAll(!props.respondAllByDefault)}
+          >
+            <span className="switch-knob" />
+          </button>
+        </div>
+        <div className="switch-row sub">
+          <span>
+            <b>互相接话轮数</b>
+            <small>成员看到彼此发言后还能再接几轮；0 = 纯点名制</small>
+          </span>
+          <div className="num-seg" role="group" aria-label="接话轮数">
+            {ROUNDS.map((n) => (
+              <button
+                key={n}
+                type="button"
+                className={n === props.reactionRounds ? 'selected' : ''}
+                onClick={() => props.onReactionRounds(n)}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </>
   );
 }

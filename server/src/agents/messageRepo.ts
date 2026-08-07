@@ -1,4 +1,4 @@
-import type { Db, MessageRow } from '../db.js';
+import type { Db, MessageOrigin, MessageRow } from '../db.js';
 
 export interface MessageFields {
   role: string;
@@ -6,6 +6,7 @@ export interface MessageFields {
   content: string;
   status: string;
   turnId: string | null;
+  origin?: MessageOrigin;
   meta?: unknown;
 }
 
@@ -13,13 +14,17 @@ export interface RoomDeliveryRow {
   id: number;
   sender: string;
   content: string;
+  meta: string;
   /** sqlite UTC 文本；渲染前必须过 shanghaiStamp 转成 +8 */
   created_at: string;
 }
 
 export interface RecentTextRow {
+  role: MessageRow['role'];
   sender: string;
   content: string;
+  origin: MessageOrigin;
+  meta: string;
   /** sqlite UTC 文本；渲染前必须过 shanghaiStamp 转成 +8 */
   created_at: string;
 }
@@ -32,21 +37,22 @@ export class MessageRepo {
     this.statements = {
       contactName: db.prepare('SELECT name FROM contacts WHERE id = ?'),
       insert: db.prepare(
-        `INSERT INTO messages (contact_id, sender, role, kind, content, status, turn_id, meta)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO messages (contact_id, sender, role, kind, content, status, turn_id, meta, origin)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ),
       byId: db.prepare('SELECT * FROM messages WHERE id = ?'),
+      queueSource: db.prepare('SELECT origin, sender, meta FROM messages WHERE id = ?'),
       updateWithMeta: db.prepare('UPDATE messages SET content = ?, status = ?, meta = ? WHERE id = ?'),
       update: db.prepare('UPDATE messages SET content = ?, status = ? WHERE id = ?'),
       softDeleteAfter: db.prepare('UPDATE messages SET deleted = 1 WHERE contact_id = ? AND id > ?'),
       recentText: db.prepare(
-        `SELECT sender, content, created_at FROM messages
+        `SELECT role, sender, content, origin, meta, created_at FROM messages
          WHERE contact_id = ? AND kind = 'text' AND status = 'done' AND deleted = 0
          ORDER BY id DESC LIMIT ?`
       ),
       maxId: db.prepare('SELECT COALESCE(MAX(id), 0) AS m FROM messages WHERE contact_id = ?'),
       unreadRoomText: db.prepare(
-        `SELECT id, sender, content, created_at FROM messages
+        `SELECT id, sender, content, meta, created_at FROM messages
          WHERE contact_id = ? AND id > ? AND deleted = 0 AND kind = 'text' AND status = 'done'
            AND sender != ?
          ORDER BY id ASC LIMIT ?`
@@ -73,7 +79,8 @@ export class MessageRepo {
       fields.content,
       fields.status,
       fields.turnId,
-      JSON.stringify(fields.meta ?? {})
+      JSON.stringify(fields.meta ?? {}),
+      fields.origin ?? 'main'
     );
     return this.byId(Number(result.lastInsertRowid));
   }
@@ -105,6 +112,12 @@ export class MessageRepo {
 
   historyAfter(contactId: string, afterId: number): MessageRow[] {
     return this.statements.historyAfter.all(contactId, afterId) as MessageRow[];
+  }
+
+  queueSource(id: number): { origin: MessageOrigin; sender: string; meta: string } | undefined {
+    return this.statements.queueSource.get(id) as
+      | { origin: MessageOrigin; sender: string; meta: string }
+      | undefined;
   }
 
   private byId(id: number): MessageRow {

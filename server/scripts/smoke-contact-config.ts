@@ -58,6 +58,8 @@ try {
   assert.strictEqual(first, second, 'same ContactRow must reuse configParsed');
   assert.equal(first.historyTokenBudget, 8000, 'stored config receives API defaults');
   assert.equal(first.promptCache, 'auto', 'stored API config defaults prompt cache to auto');
+  assert.equal(first.routing.enabled, false, 'stored contacts do not opt into autonomous routing by default');
+  assert.equal(first.routing.dailyLimit, 10, 'routing receives a conservative daily default');
   assert.equal(first.futureFlag, true, 'unknown stored fields remain forward-compatible');
   assert.equal(Object.keys(openContact(row)).includes('configParsed'), false, 'configParsed must be non-enumerable');
   assert.equal('configParsed' in { ...row }, false, 'spreading a row must not leak parsed secrets');
@@ -84,12 +86,22 @@ try {
       id: 'valid-api', name: 'Valid API', backend: 'api',
       config: {
         provider: 'openai-compat', model: 'test-model', apiKey: TEST_KEY, baseUrl: '', futureFlag: 'kept',
+        routing: {
+          enabled: true,
+          recipientKey: 'engineering',
+          categories: ['file-change'],
+          minPriority: 2,
+          dailyLimit: 8,
+          cooldownMinutes: 20,
+        },
       },
     }),
   });
   assert.equal(result.status, 201, 'valid API contact should be created');
   assert.equal(result.body.config.apiKey, MASKED_TEST_KEY, 'API response must mask key');
   assert.equal(result.body.config.historyTokenBudget, 8000, 'POST stores schema defaults');
+  assert.equal(result.body.config.routing.recipientKey, 'engineering', 'POST stores triage routing policy');
+  assert.equal(result.body.config.routing.dailyLimit, 8, 'routing daily limit survives validation');
   assert.equal(result.body.config.futureFlag, 'kept', 'unknown fields should not break existing advanced config');
   assert.equal(JSON.stringify(result.body).includes(TEST_KEY), false, 'clear API key must not escape');
 
@@ -106,6 +118,19 @@ try {
     }),
   });
   assert.equal(result.status, 400, 'malicious numeric ranges must be rejected');
+
+  result = await json('/valid-api', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      config: {
+        provider: 'gemini',
+        model: 'gemini-test',
+        apiKey: MASKED_TEST_KEY,
+        routing: { enabled: true, categories: ['system'], dailyLimit: 0 },
+      },
+    }),
+  });
+  assert.equal(result.status, 400, 'routing limits outside the safe range must be rejected');
 
   result = await json('/valid-api', {
     method: 'PATCH',

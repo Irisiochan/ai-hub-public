@@ -17,8 +17,8 @@ fs.mkdirSync(uploadsDir, { recursive: true });
 const db = openDb(dbPath);
 const sse = new SseHub();
 const members = [
-  { id: 'alpha', name: 'Agent Alpha', kind: 'dm' },
-  { id: 'beta', name: 'Agent Beta', kind: 'dm' },
+  { id: 'claude', name: 'Claude', kind: 'dm' },
+  { id: 'codex', name: 'Codex', kind: 'dm' },
 ];
 let trackedCalls = 0;
 let trackedOptions: any;
@@ -79,7 +79,7 @@ try {
   assert.equal(topicResponse.status, 202);
   const topic = await topicResponse.json() as any;
   assert.equal(topic.status, 'running');
-  assert.deepEqual(topic.targets, ['alpha', 'beta']);
+  assert.deepEqual(topic.targets, ['claude', 'codex']);
   assert.equal(trackedCalls, 1);
   assert.equal(trackedOptions.capture, false, 'room-host content must skip memory capture');
   assert.equal(trackedOptions.reactionRounds, 3);
@@ -116,6 +116,104 @@ try {
   assert.equal((await duplicate.json() as any).messageId, topic.messageId);
   assert.equal(trackedCalls, 1);
 
+  const coordination = {
+    kind: 'execution',
+    taskPath: 'tasks/coordination-smoke.md',
+    branch: 'coordination-smoke',
+    workspace: 'C:/ai-hub-codex',
+    planHash: 'b'.repeat(64),
+    executor: 'codex',
+  };
+  const coordinationResponse = await fetch(
+    'http://127.0.0.1:' + port + '/api/contacts/room/room-host/messages',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: '@codex 工作对接派单',
+        targetIds: ['codex'],
+        reactionRounds: 0,
+        idempotencyKey: 'coordination:' + coordination.taskPath + ':' + coordination.planHash,
+        coordination,
+      }),
+    }
+  );
+  assert.equal(coordinationResponse.status, 202);
+  const coordinationRound = await coordinationResponse.json() as any;
+  await new Promise((resolve) => setImmediate(resolve));
+  const coordinationRow = db.prepare('SELECT meta, idempotency_key FROM messages WHERE id = ?')
+    .get(coordinationRound.messageId) as any;
+  assert.deepEqual(JSON.parse(coordinationRow.meta).roomHost.coordination, coordination);
+  assert.equal(
+    coordinationRow.idempotency_key,
+    'coordination:' + coordination.taskPath + ':' + coordination.planHash,
+  );
+  assert.equal(trackedCalls, 2);
+
+  const verification = {
+    kind: 'verification',
+    taskPath: 'tasks/verification-smoke.md',
+    due: '2026-08-06',
+    verifier: 'codex',
+  };
+  const verificationResponse = await fetch(
+    'http://127.0.0.1:' + port + '/api/contacts/room/room-host/messages',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: '@codex 只读验收单',
+        targetIds: ['codex'],
+        reactionRounds: 0,
+        idempotencyKey: 'verification:v1:' + verification.taskPath + ':' + verification.due,
+        coordination: verification,
+      }),
+    }
+  );
+  assert.equal(verificationResponse.status, 202);
+  const verificationRound = await verificationResponse.json() as any;
+  await new Promise((resolve) => setImmediate(resolve));
+  const verificationRow = db.prepare('SELECT meta, idempotency_key FROM messages WHERE id = ?')
+    .get(verificationRound.messageId) as any;
+  assert.deepEqual(JSON.parse(verificationRow.meta).roomHost.coordination, verification);
+  assert.equal(
+    verificationRow.idempotency_key,
+    'verification:v1:' + verification.taskPath + ':' + verification.due,
+  );
+  assert.equal(trackedCalls, 3);
+
+  const mismatchedVerificationResponse = await fetch(
+    'http://127.0.0.1:' + port + '/api/contacts/room/room-host/messages',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: '@claude 错目标验收单',
+        targetIds: ['claude'],
+        idempotencyKey: 'verification:v1:' + verification.taskPath + ':' + verification.due,
+        coordination: verification,
+      }),
+    }
+  );
+  assert.equal(mismatchedVerificationResponse.status, 400);
+  assert.equal(trackedCalls, 3, 'verification contract mismatch must fail before room dispatch');
+
+  const forgedCoordinationResponse = await fetch(
+    'http://127.0.0.1:' + port + '/api/contacts/room/room-host/messages',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: '@codex 伪造派单',
+        targetIds: ['codex'],
+        idempotencyKey: 'coordination:forged',
+        coordination: { ...coordination, planHash: 'not-a-hash' },
+      }),
+    }
+  );
+  assert.equal(forgedCoordinationResponse.status, 400);
+  assert.equal(trackedCalls, 3, 'invalid coordination meta must fail before room dispatch');
+
   const summaryResponse = await fetch(
     `http://127.0.0.1:${port}/api/contacts/room/room-host/messages`,
     {
@@ -131,7 +229,7 @@ try {
   );
   assert.equal(summaryResponse.status, 201);
   assert.equal((await summaryResponse.json() as any).status, 'done');
-  assert.equal(trackedCalls, 1, 'summary must not open another room round');
+  assert.equal(trackedCalls, 3, 'summary must not open another room round');
 
   console.log('room host smoke: ok');
 } finally {

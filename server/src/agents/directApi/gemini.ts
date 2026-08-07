@@ -27,6 +27,17 @@ interface GeminiRoundResponse {
   parts: Record<string, any>[];
 }
 
+/**
+ * Gemini 原生 finishReason（如 MAX_TOKENS / STOP）归一成与 OpenAI 兼容的小写标签，
+ * 好让 message meta 与前端 `outputLimitWarning`（认 `length`）共用一条路径。
+ */
+export function normalizeGeminiFinishReason(reason: string): string {
+  const upper = reason.trim().toUpperCase();
+  if (upper === 'MAX_TOKENS') return 'length';
+  if (upper === 'STOP') return 'stop';
+  return reason.trim().toLowerCase();
+}
+
 export class GeminiProvider implements DirectApiProvider<GeminiConversation> {
   constructor(
     private config: ProviderConfig,
@@ -114,6 +125,10 @@ export class GeminiProvider implements DirectApiProvider<GeminiConversation> {
       }
       if (event.error) throw new Error(event.error.message ?? 'Gemini stream error');
       for (const candidate of event.candidates ?? []) {
+        if (typeof candidate.finishReason === 'string' && candidate.finishReason) {
+          // 流式多包会重复带同一 finishReason；以最后一次非空为准。
+          usage.finishReason = normalizeGeminiFinishReason(candidate.finishReason);
+        }
         for (const part of candidate.content?.parts ?? []) {
           parts.push(part);
           if (typeof part.text === 'string' && part.text) {
@@ -140,7 +155,12 @@ export class GeminiProvider implements DirectApiProvider<GeminiConversation> {
       .map((call) => ({ id: call.id, name: call.name, input: call.args ?? {} }));
     yield {
       type: 'round',
-      result: { calls, response: { parts } satisfies GeminiRoundResponse, usage },
+      result: {
+        calls,
+        response: { parts } satisfies GeminiRoundResponse,
+        usage,
+        text: parts.flatMap((part) => !part.thought && typeof part.text === 'string' ? [part.text] : []).join(''),
+      },
     };
   }
 
@@ -181,12 +201,14 @@ export class GeminiProvider implements DirectApiProvider<GeminiConversation> {
     total.input = round.input;
     if (this.config.promptCache !== 'off') total.cacheRead = round.cacheRead ?? 0;
     total.output += round.output;
+    if (round.finishReason) total.finishReason = round.finishReason;
   }
 
   usageLog(usage: ProviderUsage): string {
     return `gemini usage display.input=${usage.input} roundsSum=${usage.inputRoundsSum ?? 0} ` +
       `output=${usage.output} ` +
       (this.config.promptCache === 'off' ? '' : `cacheRead=${usage.cacheRead ?? 0} `) +
-      `providerRounds=${usage.providerRounds ?? 0}`;
+      `providerRounds=${usage.providerRounds ?? 0}` +
+      (usage.finishReason ? ` finishReason=${usage.finishReason}` : '');
   }
 }

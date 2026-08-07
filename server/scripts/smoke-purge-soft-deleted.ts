@@ -46,15 +46,15 @@ const bubble = ins.run('agent', 'assistant', 'pass bubble', 0, nowTs);
 // job: old hidden done → purge; recent hidden → keep; active hidden → keep
 db.prepare(
   `INSERT INTO jobs (id, requested_by, runner, workspace, prompt, status, priority, idempotency_key, permissions, deleted, created_at, updated_at)
-   VALUES (?, 'user', 'claude', ?, 'p', ?, 0, ?, '{}', 1, ?, ?)`
+   VALUES (?, 'User', 'claude', ?, 'p', ?, 0, ?, '{}', 1, ?, ?)`
 ).run('job-old', dir, 'done', 'idem-old', oldTs, oldTs);
 db.prepare(
   `INSERT INTO jobs (id, requested_by, runner, workspace, prompt, status, priority, idempotency_key, permissions, deleted, created_at, updated_at)
-   VALUES (?, 'user', 'claude', ?, 'p', ?, 0, ?, '{}', 1, ?, ?)`
+   VALUES (?, 'User', 'claude', ?, 'p', ?, 0, ?, '{}', 1, ?, ?)`
 ).run('job-recent', dir, 'done', 'idem-recent', midTs, midTs);
 db.prepare(
   `INSERT INTO jobs (id, requested_by, runner, workspace, prompt, status, priority, idempotency_key, permissions, deleted, created_at, updated_at)
-   VALUES (?, 'user', 'claude', ?, 'p', ?, 0, ?, '{}', 1, ?, ?)`
+   VALUES (?, 'User', 'claude', ?, 'p', ?, 0, ?, '{}', 1, ?, ?)`
 ).run('job-running', dir, 'running', 'idem-run', oldTs, oldTs);
 
 // --- hard delete internal bubble ---

@@ -40,12 +40,12 @@ async function call(url: string, init: RequestInit = {}) {
 
 try {
   const doneJob = jobs.create({
-    requestedBy: 'user',
+    requestedBy: 'User',
     runner: 'claude',
     workspace: dir,
     prompt: 'finished work',
     permissions: { write: true, shell: false, ssh: false },
-    originContactId: 'assistant',
+    originContactId: 'claude',
     originAnchorId: 1,
   });
   if ('error' in doneJob) throw new Error(doneJob.error);
@@ -53,12 +53,12 @@ try {
     .run(doneJob.job.id);
 
   const runningJob = jobs.create({
-    requestedBy: 'user',
+    requestedBy: 'User',
     runner: 'claude',
     workspace: dir,
     prompt: 'still running',
     permissions: { write: true, shell: false, ssh: false },
-    originContactId: 'assistant',
+    originContactId: 'claude',
     originAnchorId: 2,
   });
   if ('error' in runningJob) throw new Error(runningJob.error);
@@ -67,7 +67,7 @@ try {
   ).run(runningJob.job.id);
 
   const pendingJob = jobs.create({
-    requestedBy: 'user',
+    requestedBy: 'User',
     runner: 'claude',
     workspace: dir,
     prompt: 'queued',

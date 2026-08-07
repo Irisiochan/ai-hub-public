@@ -1,8 +1,8 @@
 services:
   memory-vault:
     build:
-      # Keep the memory system as a versioned external dependency. Override
-      # MEMORY_VAULT_VERSION only when intentionally testing another release.
+      # Memory Vault is a versioned external dependency, not source copied into
+      # this repository. Override only when intentionally testing a release.
       context: "https://github.com/Irisiochan/memory-vault.git#${MEMORY_VAULT_VERSION:-v0.6.0}"
     restart: unless-stopped
     init: true
@@ -14,8 +14,6 @@ services:
       VAULT_GIT_SYNC: auto
     volumes:
       - ./vault-data:/vault
-    ports:
-      - "127.0.0.1:8900:8900"
     healthcheck:
       test:
         - CMD

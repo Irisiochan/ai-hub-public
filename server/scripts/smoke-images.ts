@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { claudePermissionDecision, claudeTurnText } from '../src/agents/claudeCli.js';
 import { codexTurnInput } from '../src/agents/codexAppServer.js';
@@ -97,7 +97,7 @@ try {
   assert.equal(grokInput.type, 'acp');
   assert.deepEqual(grokInput.content[0], { type: 'text', text: '看图' });
   assert.equal(grokInput.content[1].type, 'resource_link');
-  assert.equal(grokInput.content[1].uri, pathToFileURL(dmImagePaths[0]).href);
+  assert.equal(grokInput.content[1].uri, new URL(`file:///${dmImagePaths[0].replaceAll('\\', '/')}`).href);
   assert.equal(grokInput.content[1].name, 'dm.png');
   assert.equal(grokInput.content[1].mimeType, 'image/png');
   assert.equal(grokInput.content[1].data, undefined, 'Grok 图片不得再把 base64 塞进命令行参数');

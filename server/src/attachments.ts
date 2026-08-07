@@ -110,20 +110,39 @@ export function persistImage(
   messageId: number,
   file: Express.Multer.File
 ): AttachmentRow {
-  if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) throw new Error('只支持 JPEG、PNG、WebP、GIF 图片');
-  if (file.size > MAX_IMAGE_BYTES) throw new Error('单张图片不能超过 10 MB');
-  if (!hasImageSignature(file.buffer, file.mimetype)) throw new Error('图片内容与文件格式不匹配');
+  return persistImageBuffer(db, uploadsDir, messageId, {
+    bytes: file.buffer,
+    mimeType: file.mimetype,
+    originalName: file.originalname,
+  });
+}
+
+export function persistImageBuffer(
+  db: Db,
+  uploadsDir: string,
+  messageId: number,
+  image: { bytes: Buffer; mimeType: string; originalName?: string }
+): AttachmentRow {
+  if (!ALLOWED_IMAGE_TYPES.has(image.mimeType)) throw new Error('只支持 JPEG、PNG、WebP、GIF 图片');
+  if (image.bytes.length > MAX_IMAGE_BYTES) throw new Error('单张图片不能超过 10 MB');
+  if (!hasImageSignature(image.bytes, image.mimeType)) throw new Error('图片内容与文件格式不匹配');
   ensureUploadsDir(uploadsDir);
-  const ext = file.mimetype === 'image/jpeg' ? '.jpg' : `.${file.mimetype.slice(6)}`;
+  const ext = image.mimeType === 'image/jpeg' ? '.jpg' : `.${image.mimeType.slice(6)}`;
   const storedName = `${crypto.randomUUID()}${ext}`;
-  fs.writeFileSync(path.join(uploadsDir, storedName), file.buffer, { mode: 0o600, flag: 'wx' });
+  fs.writeFileSync(path.join(uploadsDir, storedName), image.bytes, { mode: 0o600, flag: 'wx' });
   try {
     const result = db
       .prepare(
         `INSERT INTO message_attachments (message_id, stored_name, original_name, mime_type, size)
          VALUES (?, ?, ?, ?, ?)`
       )
-      .run(messageId, storedName, path.basename(file.originalname || `image${ext}`), file.mimetype, file.size);
+      .run(
+        messageId,
+        storedName,
+        path.basename(image.originalName || `image${ext}`),
+        image.mimeType,
+        image.bytes.length,
+      );
     return db
       .prepare('SELECT * FROM message_attachments WHERE id = ?')
       .get(Number(result.lastInsertRowid)) as AttachmentRow;

@@ -5,6 +5,7 @@ export type SseEvent =
   | 'delta' // { contactId, messageId, text } streaming append
   | 'status' // { contactId, state, detail? }
   | 'contact' // contact config changed
+  | 'read-state' // persisted main/side read cursor changed
   | 'prune' // { contactId, ids?: number[], afterId?: number } messages removed
   | 'user' // user profile changed
   | 'worker'

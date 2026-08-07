@@ -10,7 +10,7 @@ process.env.DEPLOY_TOKEN = 'smoke-secret';
 process.env.DEPLOY_SCRIPT = '/nonexistent/smoke-deploy-guard.sh';
 process.env.DEPLOY_LOG = `${process.cwd()}/smoke-deploy-never-written.log`;
 
-const { systemRouter } = await import('../src/routes/system.js');
+const { deployControlRouter } = await import('../src/routes/system.js');
 
 let failures = 0;
 function check(label: string, cond: boolean, detail = '') {
@@ -18,11 +18,9 @@ function check(label: string, cond: boolean, detail = '') {
   if (!cond) failures++;
 }
 
-const fakeConfig = { memory: { repoPath: null } } as any;
-
 const app = express();
 app.use(express.json());
-app.use('/api', systemRouter(fakeConfig));
+app.use('/api', deployControlRouter());
 const server = app.listen(0, '127.0.0.1');
 await new Promise((r) => server.once('listening', r));
 const port = (server.address() as any).port;
@@ -63,7 +61,7 @@ check('status 带 token → 200 且 running=false', res.status === 200 && body.r
 // 5. 未配置 DEPLOY_TOKEN 的网关 → 503（token 在 router 创建时快照）
 delete process.env.DEPLOY_TOKEN;
 const app2 = express();
-app2.use('/api', systemRouter(fakeConfig));
+app2.use('/api', deployControlRouter());
 const server2 = app2.listen(0, '127.0.0.1');
 await new Promise((r) => server2.once('listening', r));
 const port2 = (server2.address() as any).port;

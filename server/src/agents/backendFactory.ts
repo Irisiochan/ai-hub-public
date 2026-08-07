@@ -14,7 +14,6 @@ import {
   type DelegationCfg,
 } from './gatewayTools.js';
 import { GrokCliBackend } from './grokCli.js';
-import { GROK_HUB_ALLOW_RULE, syncManagedGrokHubMcpConfig } from './grokMcpConfig.js';
 import type { PromptComposer, PromptContext, StartPrompt } from './promptComposer.js';
 import type { AgentBackend } from './types.js';
 
@@ -43,14 +42,6 @@ interface BuildInput {
 
 interface BackendBuilder {
   build(input: BuildInput): AgentBackend;
-}
-
-export function managedHubMcpConfig(url: string): Record<string, unknown> {
-  return {
-    type: 'http',
-    url,
-    headers: { Authorization: 'Bearer ${HUB_MCP_TOKEN}' },
-  };
 }
 
 function workspace(input: BuildInput, allowProjectAccess: boolean): { cwd: string; access: Record<string, any> } {
@@ -94,7 +85,7 @@ class ClaudeBuilder implements BackendBuilder {
     });
     if (delegationOn) {
       allowedTools.push('mcp__hub__*');
-      preamble = deps.prompts.withDelegation(preamble, delegation, 'mcp__hub__');
+      preamble = deps.prompts.withDelegation(preamble, delegation, 'mcp__hub__', ctx.log);
       ctx.log('worker delegation enabled (mcp hub tools)');
     }
     return new ClaudeCliBackend({
@@ -128,12 +119,11 @@ class CodexBuilder implements BackendBuilder {
       mcpServers = [{
         name: 'hub',
         url: `http://${host}:${deps.config.port}/api/hub-mcp/${encodeURIComponent(ctx.agent.id)}`,
-        bearerTokenEnvVar: 'HUB_MCP_TOKEN',
-        enabledTools: ['delegate_to_worker', 'worker_job_status', 'worker_job_cancel'],
+        enabledTools: ['delegate_to_worker', 'worker_job_status', 'worker_job_cancel', 'worker_job_update_delivery'],
         required: true,
         defaultToolsApprovalMode: 'approve' as const,
       }];
-      preamble = deps.prompts.withDelegation(preamble, delegation, 'mcp__hub__');
+      preamble = deps.prompts.withDelegation(preamble, delegation, 'mcp__hub__', ctx.log);
       ctx.log('worker delegation enabled (codex hub MCP)');
     }
     return new CodexAppServerBackend({
@@ -158,15 +148,10 @@ class GrokBuilder implements BackendBuilder {
     const memoryMcpOn = !!deps.vault && ctx.memory.injectOnSpawn;
     const allowRules: string[] = [];
     if (memoryMcpOn) allowRules.push('MCPTool(memory-vault__*)');
-    const host = ['0.0.0.0', '::'].includes(deps.config.host) ? '127.0.0.1' : deps.config.host;
-    const hubMcpUrl = delegationOn
-      ? `http://${host}:\${HUB_PORT:-${deps.config.port}}/api/hub-mcp/${encodeURIComponent(ctx.agent.id)}`
-      : undefined;
-    syncManagedGrokHubMcpConfig(cwd, hubMcpUrl);
     if (delegationOn) {
-      allowRules.push(GROK_HUB_ALLOW_RULE);
-      preamble = deps.prompts.withDelegation(preamble, delegation, 'hub__');
-      ctx.log('worker delegation enabled (grok project hub MCP)');
+      allowRules.push('MCPTool(hub__*)');
+      preamble = deps.prompts.withDelegation(preamble, delegation, 'hub__', ctx.log);
+      ctx.log('worker delegation enabled (grok hub MCP)');
     }
     return new GrokCliBackend({
       cliPath: cfg.cliPath ?? deps.config.grok.cliPath,
@@ -174,8 +159,12 @@ class GrokBuilder implements BackendBuilder {
       model: cfg.model ?? undefined,
       allowRules,
       disallowedTools: ['search_replace', 'run_terminal_command'],
+      // 聊天联系人拿不到项目写权限（上面 workspace(input, false)），改文件和跑命令的
+      // 工具又被 --disallowed-tools 整个摘掉，剩下能批的只有只读工具和 vault/hub 两个
+      // MCP。不开的话 search_tool / use_tool 这类内置元工具会落到 headless 的确认弹窗，
+      // 没人点 → 整轮 stop_reason=cancelled（2026-07-31 阿野写记忆库就是这么断的）。
+      alwaysApprove: true,
       preamble: [cfg.appendSystemPrompt, preamble].filter(Boolean).join('\n') || undefined,
-      env: delegationOn ? { GROK_FOLDER_TRUST: '0' } : undefined,
       turnTimeoutMs: deps.config.grok.turnTimeoutMs,
       log: ctx.log,
     });
@@ -191,7 +180,7 @@ class ApiBuilder implements BackendBuilder {
       extraTools = buildDelegateTools(
         deps.jobStore!, deps.db, ctx.agent.id, delegation, ctx.convo.id
       );
-      preamble = deps.prompts.withDelegation(preamble, delegation);
+      preamble = deps.prompts.withDelegation(preamble, delegation, '', ctx.log);
       ctx.log('worker delegation enabled (native tools)');
     }
     const provider = cfg.provider === 'anthropic'
@@ -221,7 +210,7 @@ class ApiBuilder implements BackendBuilder {
       summaryMaxTokens: Math.max(Number(cfg.summaryMaxTokens ?? 3000), 256),
       historySummaryStrategy: cfg.historySummaryStrategy === 'off'
         ? 'off' : cfg.historySummaryStrategy === 'external' ? 'external' : 'extractive',
-      maxTokens: cfg.maxTokens ?? 4096,
+      maxTokens: cfg.maxTokens ?? 8192,
       contextWindowTokens: Math.max(Number(cfg.contextWindowTokens ?? 128_000), 0),
       turnTimeoutMs: deps.config.claude.turnTimeoutMs,
       db: deps.db,
@@ -267,12 +256,13 @@ class ManagedMcpConfig {
     }
     if (opts.includeHub) {
       const host = ['0.0.0.0', '::'].includes(config.host) ? '127.0.0.1' : config.host;
-      servers.hub = managedHubMcpConfig(
-        `http://${host}:${config.port}/api/hub-mcp/${this.agent.id}`
-      );
+      servers.hub = { type: 'http', url: `http://${host}:${config.port}/api/hub-mcp/${this.agent.id}` };
     }
     if (Object.keys(servers).length === 0) return opts.base;
-    const dir = path.resolve(config.agentsDir, opts.cwdName ?? this.agent.id);
+    // 生成物不能落在代码检出里：M1.5 之后 systemd 用 ProtectSystem=strict 把
+    // /opt/ai-hub 挂成只读，只有 data 目录（DB 所在处）与 /var/lib/ai-hub 可写。
+    // 写进 agentsDir 会以 EROFS 打挂后端启动。CLI 只吃绝对路径，放哪儿都行。
+    const dir = path.resolve(path.dirname(config.dbPath), 'agents', opts.cwdName ?? this.agent.id);
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, 'mcp.gateway.json');
     const body = JSON.stringify({ mcpServers: servers }, null, 2);
@@ -304,11 +294,6 @@ export class BackendFactory {
     const prompt = await this.deps.prompts.composeStart(ctx, ctx.resumeToken);
     const delegation: DelegationCfg = cfg.delegation ?? {};
     const delegationOn = delegation.enabled === true && !!this.deps.jobStore;
-    const cliDelegationOn =
-      delegationOn && ['claude-cli', 'codex', 'grok-cli'].includes(ctx.agent.backend);
-    if (cliDelegationOn && !process.env.HUB_MCP_TOKEN?.trim()) {
-      throw new Error('Worker 委派需要配置独立的 HUB_MCP_TOKEN');
-    }
     const builder = this.builders[ctx.agent.backend];
     if (!builder) throw new Error(`backend "${ctx.agent.backend}" 不认识`);
     return builder.build({

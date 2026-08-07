@@ -14,6 +14,7 @@ $script:WorkerDir = $PSScriptRoot
 $script:LauncherPath = $MyInvocation.MyCommand.Path
 $script:WorkerPath = Join-Path $script:WorkerDir 'worker.mjs'
 $script:StateStorePath = Join-Path $script:WorkerDir 'state-store.mjs'
+$script:BackupCatchupPath = Join-Path (Split-Path $script:WorkerDir -Parent) 'deploy\startup-offsite-backup.ps1'
 $script:LegacyStatePath = Join-Path $script:WorkerDir 'launcher-state.json'
 $stateFile = 'worker-state.json'
 if (Test-Path -LiteralPath $Config) {
@@ -198,6 +199,19 @@ function Start-WorkerProcess([string]$NodePath) {
   return $proc
 }
 
+function Start-BackupCatchup {
+  if (-not (Test-Path -LiteralPath $script:BackupCatchupPath)) {
+    Write-LauncherLog 'WARN' "backup catch-up script missing: $script:BackupCatchupPath"
+    return
+  }
+  $args = @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+    '-File', ('"{0}"' -f $script:BackupCatchupPath)
+  )
+  Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WindowStyle Hidden | Out-Null
+  Write-LauncherLog 'INFO' 'startup backup catch-up requested'
+}
+
 function Stop-WorkerChild {
   if (-not $script:Child -or $script:Child.HasExited) { return }
   try {
@@ -244,12 +258,18 @@ function Invoke-LauncherRun {
     }
 
     $crashes = New-Object Collections.Generic.List[DateTime]
+    $backupCatchupStarted = $false
     while (-not (Test-StopRequested)) {
       while (-not (Test-NetworkReady $serverUri)) {
         Save-State 'waiting' 'waiting for Tailscale and gateway'
         if (-not (Wait-Controlled 10)) { break }
       }
       if (Test-StopRequested) { break }
+      if (-not $backupCatchupStarted) {
+        Start-BackupCatchup
+        $backupCatchupStarted = $true
+      }
+
       try {
         $script:Child = Start-WorkerProcess $node
         Save-State 'starting' 'worker process started' $script:Child.Id

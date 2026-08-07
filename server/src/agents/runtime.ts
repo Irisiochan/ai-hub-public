@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
 import type { HubConfig, MemoryConfig } from '../config.js';
 import { attachmentPathsForMessages, hardDeleteMessages } from '../attachments.js';
-import type { ContactRow, Db, MessageRow } from '../db.js';
+import type { ContactRow, Db, MessageOrigin, MessageRow } from '../db.js';
 import { maybeCapture } from '../memory/capture.js';
+import { maybeWriteBackTask } from '../memory/taskWriteback.js';
 import { timestampedMessage } from '../memory/inject.js';
 import type { VaultClient } from '../memory/vaultClient.js';
 import { getUserProfile } from '../routes/user.js';
@@ -10,31 +11,93 @@ import type { SseHub } from '../sse.js';
 import type { JobStore } from '../workers/jobStore.js';
 import type { HubLogger } from '../logger.js';
 import { BackendFactory } from './backendFactory.js';
+import {
+  backgroundDedupeMinutes,
+  decideBackgroundNotification,
+} from './backgroundNotification.js';
 import { touchConversationSummary } from './conversationSummary.js';
+import { ConversationSummaryRepo } from './conversationSummaryRepo.js';
 import { contactConfig, openContact } from './configSchemas.js';
 import { MessageRepo, type RoomDeliveryRow } from './messageRepo.js';
+import { frameAutomatedTurn, replyTriggerMeta } from './messageSource.js';
 import { PromptComposer, type PromptContext } from './promptComposer.js';
 import {
+  normalizeRoomCoordinationDispatch,
   quotedRoomMessage,
   roomTurnNotice,
+  type RoomCoordinationDispatch,
   type RoomTurnSender,
 } from './roomPrompt.js';
 import { SessionRepo } from './sessionRepo.js';
 import type { AgentBackend, TurnHandle } from './types.js';
+import { AffectService } from './affectService.js';
+import type {
+  CoordinationRoomDispatchInput,
+  CoordinationRoomDispatchResult,
+} from './coordinationRoom.js';
 
 export type RoomTurnOutcome = 'spoke' | 'passed' | 'silent' | 'error';
+
+export interface DmTurnResult {
+  outcome: 'done' | 'error' | 'interrupted';
+  text: string;
+  messageId?: number;
+}
+
+export interface TrackedDmTurn {
+  status: 'queued' | 'full';
+  completion: Promise<DmTurnResult>;
+}
 
 interface RoomDelivery {
   text: string;
   promptText: string;
   upToId: number;
   messageIds: number[];
+  fromCreatedAt: string;
+  throughCreatedAt: string;
   senders: RoomTurnSender[];
+  coordinationDispatch?: RoomCoordinationDispatch;
   imagePaths: string[];
 }
 
+export function coordinationDispatchForRoomRows(
+  rows: readonly RoomDeliveryRow[],
+  recipientId: string
+): RoomCoordinationDispatch | undefined {
+  for (let index = rows.length - 1; index >= 0; index--) {
+    const row = rows[index];
+    if (row.sender !== 'room-host') continue;
+    try {
+      const meta = JSON.parse(row.meta || '{}') as {
+        roomHost?: { targets?: unknown; coordination?: unknown };
+      };
+      const coordination = normalizeRoomCoordinationDispatch(meta.roomHost?.coordination);
+      const targets = Array.isArray(meta.roomHost?.targets) ? meta.roomHost.targets : [];
+      const expectedRecipient = coordination?.kind === 'verification'
+        ? coordination.verifier
+        : coordination?.executor;
+      if (coordination && expectedRecipient === recipientId && targets.includes(recipientId)) {
+        return coordination;
+      }
+    } catch {
+      // Malformed or legacy message metadata remains quoted history, never trusted routing.
+    }
+  }
+  return undefined;
+}
+
 type QueueItem =
-  | { kind: 'dm'; userMessageId: number; text: string; enqueuedAt: number }
+  | {
+      kind: 'dm';
+      userMessageId: number;
+      text: string;
+      origin: MessageOrigin;
+      sourceMeta: string;
+      userAuthored: boolean;
+      enqueuedAt: number;
+      resolve?: (result: DmTurnResult) => void;
+    }
   // 群聊回合：出队时才构建增量 transcript；reaction = 接话轮（可 [PASS] 沉默）
   | { kind: 'room-turn'; mode: 'normal' | 'reaction'; enqueuedAt: number; resolve: (r: RoomTurnOutcome) => void };
 
@@ -58,6 +121,9 @@ export interface AgentDeps {
   vault: VaultClient | null;
   jobStore: JobStore | null;
   logger?: HubLogger;
+  dispatchCoordinationRoomHost?: (
+    input: CoordinationRoomDispatchInput
+  ) => CoordinationRoomDispatchResult;
 }
 
 /**
@@ -75,16 +141,27 @@ export class AgentRuntime {
   private crashes: number[] = [];
   private seenMemoryPaths = new Set<string>();
   state = 'idle';
+  stateOrigin: MessageOrigin = 'main';
+  private stateTrigger: Record<string, unknown> | null = null;
+  private replyToMessageId: number | null = null;
 
   private readonly messages: MessageRepo;
   private readonly sessions: SessionRepo;
   private readonly prompts: PromptComposer;
+  private readonly affect: AffectService;
   private readonly backendFactory: BackendFactory;
 
   constructor(private convo: ContactRow, private agent: ContactRow, private deps: AgentDeps) {
     this.messages = new MessageRepo(deps.db);
     this.sessions = new SessionRepo(deps.db);
-    this.prompts = new PromptComposer(deps.vault, this.messages);
+    this.affect = new AffectService(deps.db, (message) => this.log(message));
+    this.prompts = new PromptComposer(
+      deps.vault,
+      this.messages,
+      deps.config.agentsDir,
+      new ConversationSummaryRepo(deps.db),
+      this.affect
+    );
     this.backendFactory = new BackendFactory({
       db: deps.db,
       config: deps.config,
@@ -127,10 +204,48 @@ export class AgentRuntime {
   }
 
   enqueue(item: { userMessageId: number; text: string }): 'queued' | 'full' {
-    if (this.queue.length >= QUEUE_CAP) return 'full';
-    this.queue.push({ kind: 'dm', ...item, enqueuedAt: Date.now() });
+    return this.enqueueDm(item, false).status;
+  }
+
+  enqueueTracked(item: { userMessageId: number; text: string }): TrackedDmTurn {
+    return this.enqueueDm(item, true);
+  }
+
+  private enqueueDm(
+    item: { userMessageId: number; text: string },
+    tracked: boolean,
+  ): TrackedDmTurn {
+    if (this.queue.length >= QUEUE_CAP) {
+      return {
+        status: 'full',
+        completion: Promise.resolve({ outcome: 'error', text: 'queue full' }),
+      };
+    }
+    let resolve: ((result: DmTurnResult) => void) | undefined;
+    const completion = tracked
+      ? new Promise<DmTurnResult>((done) => { resolve = done; })
+      : Promise.resolve({ outcome: 'interrupted' as const, text: '' });
+    const source = this.messages.queueSource(item.userMessageId);
+    const origin = source?.origin ?? 'main';
+    this.queue.push({
+      kind: 'dm',
+      ...item,
+      origin,
+      sourceMeta: source?.meta ?? '{}',
+      userAuthored: source?.sender === 'user',
+      enqueuedAt: Date.now(),
+      resolve,
+    });
     void this.run();
-    return 'queued';
+    return { status: 'queued', completion };
+  }
+
+  private cancelQueued(reason: string): void {
+    const queued = this.queue.splice(0);
+    for (const item of queued) {
+      if (item.kind === 'dm') item.resolve?.({ outcome: 'interrupted', text: reason });
+      else item.resolve('error');
+    }
   }
 
   /** 群聊回合：编排器 await 结果（spoke/silent/error），实现顺序发言与接话轮。 */
@@ -146,15 +261,19 @@ export class AgentRuntime {
   }
 
   async reset(): Promise<void> {
-    this.queue = [];
+    this.cancelQueued('会话已重置');
+    await this.currentHandle?.interrupt();
     await this.backend?.stop();
     this.backend = null;
     this.crashes = [];
     this.sessions.deactivate(this.convo.id, this.isRoom ? this.memberId : undefined);
+    this.stateOrigin = 'main';
+    this.stateTrigger = null;
     this.setState('idle');
   }
 
   async stop(): Promise<void> {
+    this.cancelQueued('网关正在停止');
     await this.backend?.stop();
     this.backend = null;
   }
@@ -171,17 +290,19 @@ export class AgentRuntime {
 
   private setState(state: string, detail?: string): void {
     this.state = state;
+    const origin = this.stateOrigin;
     this.deps.sse.broadcast('status', {
       contactId: this.convo.id,
       state,
       detail,
+      origin,
       // Room turns must always carry the member display name — UI must never
       // fall back to the room title (e.g. 「会议室 思考中」).
       member: this.isRoom ? this.agent.name : undefined,
     });
   }
 
-  /** 发言人显示名：user → 当前用户资料名，其余查联系人表。 */
+  /** 发言人显示名：user → User 的资料名，其余查联系人表。 */
   private nameOf(sender: string): string {
     if (sender === 'user') return getUserProfile(this.deps.db).name;
     if (sender === 'room-host') return 'DS 主持';
@@ -196,12 +317,71 @@ export class AgentRuntime {
     status: string;
     turnId: string | null;
     meta?: unknown;
+    origin?: MessageOrigin;
   }): MessageRow {
-    return this.messages.insert(this.convo.id, this.agent.id, fields);
+    const background = this.stateTrigger?.messageType === 'background-event';
+    const failure = background && fields.kind === 'error';
+    const failureKey = fields.content.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 120);
+    const baseMeta = background
+      ? failure
+        ? { notification: { kind: 'failure', route: 'main', key: `${this.stateTrigger?.eventSource ?? 'background'}:failure:${failureKey}` } }
+        : { uiHidden: true }
+      : {};
+    const meta = {
+      ...baseMeta,
+      ...(this.replyToMessageId ? { replyToMessageId: this.replyToMessageId } : {}),
+      ...(fields.meta && typeof fields.meta === 'object' ? fields.meta : {}),
+      ...(this.stateTrigger ? { trigger: this.stateTrigger } : {}),
+    };
+    return this.messages.insert(this.convo.id, this.agent.id, {
+      ...fields,
+      meta,
+      origin: fields.origin ?? (failure ? 'main' : this.stateOrigin),
+    });
   }
 
   private updateMessage(id: number, content: string, status: string, meta?: unknown): MessageRow {
-    return this.messages.update(id, content, status, meta);
+    const base = {
+      ...(this.replyToMessageId ? { replyToMessageId: this.replyToMessageId } : {}),
+      ...(meta && typeof meta === 'object' ? meta : {}),
+    };
+    const enriched = this.stateTrigger ? { ...base, trigger: this.stateTrigger } : base;
+    return this.messages.update(id, content, status, enriched);
+  }
+
+  private backgroundNotificationSeen(key: string, beforeId?: number): boolean {
+    const minutes = backgroundDedupeMinutes();
+    if (minutes <= 0) return false;
+    const beforeClause = typeof beforeId === 'number' ? ' AND id < ?' : '';
+    const row = this.deps.db.prepare(
+      `SELECT id FROM messages
+       WHERE contact_id = ? AND origin = 'main'
+         AND json_extract(meta, '$.notification.key') = ?
+         AND created_at >= datetime('now', ?)
+         ${beforeClause}
+       ORDER BY id DESC LIMIT 1`
+    ).get(
+      this.convo.id,
+      key,
+      `-${minutes} minutes`,
+      ...(typeof beforeId === 'number' ? [beforeId] : []),
+    );
+    return row !== undefined;
+  }
+
+  private suppressDuplicateBackgroundFailure(row: MessageRow): boolean {
+    if (this.stateTrigger?.messageType !== 'background-event' || row.kind !== 'error') return false;
+    let meta: Record<string, any> = {};
+    try { meta = JSON.parse(row.meta || '{}'); } catch {}
+    const key = typeof meta.notification?.key === 'string' ? meta.notification.key : '';
+    if (!key || !this.backgroundNotificationSeen(key, row.id)) return false;
+    this.messages.update(row.id, row.content, row.status, {
+      ...meta,
+      uiHidden: true,
+      notification: { ...meta.notification, route: 'suppress', duplicate: true },
+    });
+    this.log('duplicate background failure suppressed', { notificationKey: key });
+    return true;
   }
 
   private async run(): Promise<void> {
@@ -260,19 +440,19 @@ export class AgentRuntime {
    * @param affectedFromId 变更起始 message id；省略/0 表示整份摘要作废（会话重置等）
    */
   async invalidateCliContext(affectedFromId?: number): Promise<void> {
+    const cfg = contactConfig(this.agent);
+    const result = touchConversationSummary(
+      this.deps.db,
+      this.convo.id,
+      this.isRoom ? this.memberId : undefined,
+      affectedFromId ?? 0,
+      {
+        summaryMaxTokens: Math.max(Number(cfg.summaryMaxTokens ?? 3000), 256),
+        historyTokenBudget: Math.max(Number(cfg.historyTokenBudget ?? 8000), 2048),
+        nameOf: this.isRoom ? (s) => this.nameOf(s) : undefined,
+      }
+    );
     if (this.agent.backend === 'api') {
-      const cfg = contactConfig(this.agent);
-      const result = touchConversationSummary(
-        this.deps.db,
-        this.convo.id,
-        this.isRoom ? this.memberId : undefined,
-        affectedFromId ?? 0,
-        {
-          summaryMaxTokens: Math.max(Number(cfg.summaryMaxTokens ?? 3000), 256),
-          historyTokenBudget: Math.max(Number(cfg.historyTokenBudget ?? 8000), 2048),
-          nameOf: this.isRoom ? (s) => this.nameOf(s) : undefined,
-        }
-      );
       this.log(
         `API rolling summary touch action=${result.action}` +
           (result.action === 'rebuilt'
@@ -284,6 +464,14 @@ export class AgentRuntime {
       this.backend?.invalidateHistory?.(affectedFromId);
       return;
     }
+    this.log(
+      `CLI rolling summary touch action=${result.action}` +
+        (result.action === 'rebuilt'
+          ? ` through=${result.through} rows=${result.rows} tokens=${result.tokens}`
+          : result.action === 'kept'
+            ? ` through=${result.through}`
+            : '')
+    );
     this.sessions.deactivate(this.convo.id, this.isRoom ? this.memberId : undefined);
     if (this.isRoom) {
       // 存档回放会覆盖历史，跳过重复的增量投递
@@ -372,12 +560,15 @@ export class AgentRuntime {
       promptText: kept.map(renderPrompt).join('\n'),
       upToId,
       messageIds: kept.map((row) => row.id),
+      fromCreatedAt: kept[0].created_at,
+      throughCreatedAt: kept[kept.length - 1].created_at,
       senders: [...new Map(
         kept.map((row) => [
           row.sender,
           { id: row.sender, name: this.nameOf(row.sender) },
         ])
       ).values()],
+      coordinationDispatch: coordinationDispatchForRoomRows(kept, this.agent.id),
       imagePaths: attachmentPathsForMessages(
         this.deps.db,
         this.deps.config.uploadsDir,
@@ -390,6 +581,19 @@ export class AgentRuntime {
     const { sse } = this.deps;
     const convoId = this.convo.id;
     const turnStartedAt = Date.now();
+    this.stateOrigin = item.kind === 'dm' ? item.origin : 'main';
+    this.stateTrigger = item.kind === 'dm'
+      ? replyTriggerMeta(item.userMessageId, item.sourceMeta)
+      : null;
+    this.replyToMessageId = item.kind === 'dm' ? item.userMessageId : null;
+    let dmSettled = false;
+    const settleDm = (result: DmTurnResult) => {
+      if (item.kind === 'dm' && !dmSettled) {
+        dmSettled = true;
+        item.resolve?.(result);
+      }
+    };
+    const backgroundTurn = this.stateTrigger?.messageType === 'background-event';
     const queueWaitMs = Math.max(turnStartedAt - item.enqueuedAt, 0);
     const modeLabel = item.kind === 'room-turn' ? `room-${item.mode}` : 'dm';
     let prepMs = 0;
@@ -432,10 +636,12 @@ export class AgentRuntime {
         status: 'done',
         turnId: null,
       });
-      sse.broadcast('message', row);
+      if (!this.suppressDuplicateBackgroundFailure(row)) sse.broadcast('message', row);
       this.setState('error', 'crash lockout');
-      this.queue = [];
+      this.cancelQueued('连续崩溃锁定');
+      settleDm({ outcome: 'error', text: row.content, messageId: row.id });
       settle('error');
+      this.replyToMessageId = null;
       return;
     }
 
@@ -469,10 +675,12 @@ export class AgentRuntime {
         status: 'done',
         turnId: null,
       });
-      sse.broadcast('message', row);
+      if (!this.suppressDuplicateBackgroundFailure(row)) sse.broadcast('message', row);
       this.setState('error', e.message);
       logTiming('error');
+      settleDm({ outcome: 'error', text: row.content, messageId: row.id });
       settle('error');
+      this.replyToMessageId = null;
       return;
     }
 
@@ -480,35 +688,46 @@ export class AgentRuntime {
     let thinkingRow: MessageRow | null = null;
     let textBuf = '';
     let thinkingBuf = '';
+    let terminalEventSeen = false;
 
     // 本轮实际投喂的文本
     const sourceText = item.kind === 'dm' ? item.text : delivery!.text;
     const reactionSuffix =
       '（接话机会：看完上面新发言，想接就简短接一句；没什么可补充就只回 [PASS]。）';
     const normalSuffix = '（轮到你了。实在没话说也可以只回 [PASS]。）';
+    const roomWindow = delivery ? {
+      messageIds: delivery.messageIds,
+      fromCreatedAt: delivery.fromCreatedAt,
+      throughCreatedAt: delivery.throughCreatedAt,
+    } : undefined;
     let turnText: string;
     if (item.kind === 'dm') {
-      turnText = item.text;
+      turnText = frameAutomatedTurn(item.sourceMeta, item.text);
     } else if (this.agent.backend === 'api') {
-      // API 群历史含最新消息；精确 ID 会在 history 中标出本轮窗口，无需重复正文。
+      // API 群历史含最新消息；稳定 history 不再翻转标签，本轮窗口由 manifest 标出。
       turnText = [
-        roomTurnNotice(item.mode, delivery!.senders),
+        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch),
         item.mode === 'reaction' ? reactionSuffix : normalSuffix,
       ].join('\n');
     } else {
       turnText = [
-        roomTurnNotice(item.mode, delivery!.senders),
+        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch),
         delivery!.promptText,
         item.mode === 'reaction' ? reactionSuffix : normalSuffix,
       ].join('\n');
     }
 
     const mem = this.memCfg();
+    // M1 privacy boundary: DM + User-authored only. Room transcripts can include
+    // other members and automated turns, so they are excluded from both payload
+    // injection and sidecar scoring.
+    const affectUserTurn = !backgroundTurn && item.kind === 'dm' && item.userAuthored;
     turnText = await this.prompts.composeTurn(
       this.promptContext(),
       turnText,
       sourceText,
-      this.seenMemoryPaths
+      this.seenMemoryPaths,
+      affectUserTurn
     );
 
     const handle = this.backend!.sendTurn({
@@ -530,6 +749,11 @@ export class AgentRuntime {
 
           case 'delta':
             markText();
+            if (backgroundTurn) {
+              textBuf += ev.text;
+              this.setState('streaming');
+              break;
+            }
             if (!textRow) {
               textRow = this.insertMessage({
                 role: 'assistant',
@@ -555,10 +779,12 @@ export class AgentRuntime {
                 status: 'streaming',
                 turnId,
               });
-              sse.broadcast('message', thinkingRow);
+              if (!backgroundTurn) sse.broadcast('message', thinkingRow);
             }
             thinkingBuf += ev.text;
-            sse.broadcast('delta', { contactId: convoId, messageId: thinkingRow.id, text: ev.text });
+            if (!backgroundTurn) {
+              sse.broadcast('delta', { contactId: convoId, messageId: thinkingRow.id, text: ev.text });
+            }
             break;
 
           case 'tool_use': {
@@ -571,7 +797,7 @@ export class AgentRuntime {
               turnId,
               meta: { name: ev.name, input: ev.inputSummary },
             });
-            sse.broadcast('message', row);
+            if (!backgroundTurn) sse.broadcast('message', row);
             this.setState(`tool:${ev.name}`);
             break;
           }
@@ -582,12 +808,72 @@ export class AgentRuntime {
 
           case 'done': {
             if (thinkingRow) {
-              sse.broadcast('message', this.updateMessage(thinkingRow.id, thinkingBuf, 'done'));
+              const updated = this.updateMessage(thinkingRow.id, thinkingBuf, 'done');
+              if (!backgroundTurn) sse.broadcast('message', updated);
             }
             const finalText = stableFinalText(textBuf, ev.finalText);
             const passed = this.isRoom && PASS_RE.test(finalText.trim());
 
-            if (passed) {
+            if (backgroundTurn) {
+              const decision = decideBackgroundNotification(finalText, item.kind === 'dm' ? item.sourceMeta : {});
+              const roomResult = decision.route === 'main'
+                && decision.descriptor?.messageType === 'background-event'
+                && this.deps.dispatchCoordinationRoomHost
+                ? this.deps.dispatchCoordinationRoomHost({
+                    targetId: 'claude',
+                    content: `@claude 后台任务通知\n${decision.content}`,
+                    kind: 'background-notification',
+                    duplicateKey: decision.key,
+                    duplicateMinutes: backgroundDedupeMinutes(),
+                    meta: {
+                      notification: {
+                        kind: decision.kind,
+                        key: decision.key,
+                        source: decision.descriptor?.eventSource ?? 'background',
+                        eventId: decision.descriptor?.eventId,
+                        sourceContactId: this.convo.id,
+                      },
+                    },
+                  })
+                : null;
+              const roomPosted = roomResult?.status === 'posted';
+              const duplicate = roomResult?.status === 'duplicate'
+                || (!roomResult && decision.route === 'main' && this.backgroundNotificationSeen(decision.key));
+              const route = duplicate
+                ? 'suppress'
+                : roomPosted
+                  ? 'coordination-room'
+                  : decision.route;
+              const row = this.insertMessage({
+                role: 'assistant',
+                kind: 'text',
+                content: decision.content || 'NO_OP',
+                status: 'done',
+                turnId,
+                origin: route === 'main' ? 'main' : 'side',
+                meta: {
+                  usage: ev.usage,
+                  uiHidden: route === 'suppress' || route === 'coordination-room',
+                  notification: {
+                    kind: decision.kind,
+                    route,
+                    key: decision.key,
+                    duplicate,
+                    source: decision.descriptor?.eventSource ?? 'background',
+                    eventId: decision.descriptor?.eventId,
+                  },
+                },
+              });
+              if (route !== 'suppress' && route !== 'coordination-room') sse.broadcast('message', row);
+              this.log('background notification routed', {
+                notificationKind: decision.kind,
+                notificationRoute: route,
+                duplicate,
+                eventSource: decision.descriptor?.eventSource,
+                roomId: roomResult?.roomId,
+                roomFallbackReason: roomResult?.status === 'unavailable' ? roomResult.reason : undefined,
+              });
+            } else if (passed) {
               // 成员选择沉默：内部气泡无审计价值 → 物理删除 + prune（不走 soft-delete）
               const retractIds = [textRow?.id, thinkingRow?.id].filter(
                 (id): id is number => typeof id === 'number'
@@ -598,10 +884,8 @@ export class AgentRuntime {
               }
               this.log('passed (silent, hard-deleted bubbles)');
             } else if (textRow) {
-              sse.broadcast(
-                'message',
-                this.updateMessage(textRow.id, finalText, 'done', { usage: ev.usage })
-              );
+              textRow = this.updateMessage(textRow.id, finalText, 'done', { usage: ev.usage });
+              sse.broadcast('message', textRow);
             } else if (finalText) {
               const row = this.insertMessage({
                 role: 'assistant',
@@ -611,8 +895,14 @@ export class AgentRuntime {
                 turnId,
                 meta: { usage: ev.usage },
               });
+              textRow = row;
               sse.broadcast('message', row);
             }
+            settleDm({
+              outcome: 'done',
+              text: finalText,
+              ...(textRow ? { messageId: textRow.id } : {}),
+            });
             if (item.kind === 'room-turn' && delivery) {
               this.sessions.setLastSeen(convoId, this.agent.id, delivery.upToId);
             }
@@ -629,26 +919,44 @@ export class AgentRuntime {
                 this.log(`session token threshold reached (${this.sessionInputTokens}/${threshold}) — rolling over`);
               }
             }
-            // 自动捕捉只在 DM 里跑：群消息由派发层按“用户原话、群级一次”捕捉，
+            if (affectUserTurn && !passed && finalText.trim()) {
+              void this.affect.scoreAfterTurn(this.agent, sourceText, finalText);
+            }
+            // 自动捕捉只在 DM 里跑：群消息由派发层按"User 原话、群级一次"捕捉，
             // 成员发言（带名字前缀的 transcript）永不参与——防记忆污染
-            if (!this.isRoom && this.deps.vault && mem.capture) {
-              void maybeCapture(
+            if (!this.isRoom && item.kind === 'dm' && item.userAuthored && this.deps.vault && mem.capture) {
+              const contact = { id: this.agent.id, name: this.agent.name };
+              void maybeWriteBackTask(
+                this.deps.db,
                 this.deps.vault,
-                { id: this.agent.id, name: this.agent.name },
+                contact,
+                item.userMessageId,
                 sourceText,
-                finalText,
                 (m) => this.log(m)
-              ).catch(() => {});
+              ).then((outcome) => {
+                if (!['ignored', 'rejected', 'ambiguous'].includes(outcome.status)) return;
+                return maybeCapture(
+                  this.deps.vault!,
+                  contact,
+                  sourceText,
+                  finalText,
+                  (m) => this.log(m)
+                );
+              }).catch((error) => this.log(
+                `task writeback pipeline failed: ${error instanceof Error ? error.message : String(error)}`
+              ));
             }
             logTiming(passed ? 'passed' : 'spoke', sourceText.length, finalText.length);
             settle(passed ? 'passed' : 'spoke');
+            terminalEventSeen = true;
             break;
           }
 
           case 'error': {
             markEvent();
             if (thinkingRow) {
-              sse.broadcast('message', this.updateMessage(thinkingRow.id, thinkingBuf, 'interrupted'));
+              const updated = this.updateMessage(thinkingRow.id, thinkingBuf, 'interrupted');
+              if (!backgroundTurn) sse.broadcast('message', updated);
             }
             if (textRow) {
               sse.broadcast('message', this.updateMessage(textRow.id, textBuf, 'interrupted'));
@@ -660,7 +968,8 @@ export class AgentRuntime {
               status: 'done',
               turnId,
             });
-            sse.broadcast('message', row);
+            if (!this.suppressDuplicateBackgroundFailure(row)) sse.broadcast('message', row);
+            settleDm({ outcome: 'error', text: ev.message, messageId: row.id });
             if (ev.fatal) {
               this.recordCrash();
               this.backend = null;
@@ -668,12 +977,27 @@ export class AgentRuntime {
             this.setState('error', ev.message);
             logTiming('error', sourceText.length, textBuf.length);
             settle('error');
+            terminalEventSeen = true;
             break;
           }
         }
       }
     } finally {
       this.currentHandle = null;
+      if (!terminalEventSeen) {
+        settleDm({ outcome: 'interrupted', text: '后端事件流意外结束' });
+        if (thinkingRow) {
+          const updated = this.updateMessage(thinkingRow.id, thinkingBuf, 'interrupted');
+          if (!backgroundTurn) sse.broadcast('message', updated);
+        }
+        if (textRow) {
+          sse.broadcast(
+            'message',
+            this.updateMessage(textRow.id, textBuf, 'interrupted')
+          );
+        }
+        this.log('backend event stream ended without a terminal event');
+      }
       settle('error'); // 流意外结束的兜底
       if (this.rolloverAfterTurn) {
         this.rolloverAfterTurn = false;
@@ -687,6 +1011,7 @@ export class AgentRuntime {
         this.setState('idle');
       }
       if (!timingLogged) logTiming('error');
+      this.replyToMessageId = null;
     }
   }
 }

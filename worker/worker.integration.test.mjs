@@ -24,25 +24,22 @@ test('worker runs two different workspaces concurrently without external model a
   fs.mkdirSync(workspaceA);
   fs.mkdirSync(workspaceB);
   const fakeRunner = path.join(dir, 'fake-runner.mjs');
-  const fakeClaude = process.platform === 'win32'
-    ? path.join(dir, 'fake-claude.cmd')
-    : fakeRunner;
-  fs.writeFileSync(fakeRunner, `#!/usr/bin/env node
+  const fakeClaude = path.join(dir, process.platform === 'win32' ? 'fake-claude.cmd' : 'fake-claude');
+  fs.writeFileSync(fakeRunner, `
 process.stdin.resume();
 setTimeout(() => {
   console.log(JSON.stringify({ type: 'result', result: 'local fake runner done', session_id: 'fake_session' }));
 }, 450);
 setTimeout(() => process.exit(0), 500);
 `, 'utf8');
-  if (process.platform === 'win32') {
-    fs.writeFileSync(
-      fakeClaude,
-      `@echo off\r\n"${process.execPath}" "${fakeRunner}" %*\r\n`,
-      'utf8'
-    );
-  } else {
-    fs.chmodSync(fakeRunner, 0o755);
-  }
+  fs.writeFileSync(
+    fakeClaude,
+    process.platform === 'win32'
+      ? `@echo off\r\n"${process.execPath}" "${fakeRunner}" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "${fakeRunner}" "$@"\n`,
+    'utf8'
+  );
+  if (process.platform !== 'win32') fs.chmodSync(fakeClaude, 0o755);
 
   const jobs = [
     {

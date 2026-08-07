@@ -1,7 +1,13 @@
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import type { Db, JobRow } from '../db.js';
 import type { SseHub } from '../sse.js';
+import { publicJob } from './deliveryStatus.js';
+
+const execFileAsync = promisify(execFile);
+const GIT_SHA_RE = /^[0-9a-f]{7,64}$/i;
 
 /**
  * Shared job-queue operations, extracted from the workers router so both the
@@ -29,6 +35,30 @@ export const RUNNING_WINDOW_STATUSES = new Set([
   'cancel_requested',
 ]);
 export const LEASE_SECONDS = 45;
+export const DELIVERY_STAGES = new Set([
+  'delivered_waiting_deploy',
+  'online_waiting_validation',
+  'closed_loop',
+  'user_decision',
+  'rework_required',
+]);
+
+export interface DeliveryUpdateInput {
+  stage: string;
+  summary?: string;
+  nextOwner?: string;
+  blocker?: string;
+  evidence?: Record<string, unknown>;
+}
+
+function jsonRecord(raw: string | null | undefined): Record<string, unknown> {
+  try {
+    const value = raw ? JSON.parse(raw) : {};
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
 
 export interface CreateJobInput {
   requestedBy: string;
@@ -76,6 +106,8 @@ export class JobStore {
   /** Terminal transition hook (done/blocked/failed/interrupted). Set by index.ts. */
   onFinished: ((job: JobRow) => void) | null = null;
   private readonly statements: Record<string, any>;
+  private outOfBandTimer: NodeJS.Timeout | null = null;
+  private outOfBandSweepRunning = false;
 
   constructor(private db: Db, private sse: SseHub) {
     this.statements = {
@@ -133,9 +165,26 @@ export class JobStore {
         `UPDATE jobs SET status = 'done', error = NULL, delivery_state = 'delivered', delivery_meta = ?,
          lease_until = NULL, updated_at = datetime('now') WHERE id = ? AND status = 'blocked'`
       ),
+      resolveOutOfBand: db.prepare(
+        `UPDATE jobs SET status = 'done', error = NULL, delivery_state = 'delivered_out_of_band', delivery_meta = ?,
+         lease_until = NULL, updated_at = datetime('now')
+         WHERE id = ? AND status = 'blocked' AND delivery_state LIKE 'blocked\_%' ESCAPE '\\'`
+      ),
+      blockedOutOfBandCandidates: db.prepare(
+        `SELECT * FROM jobs WHERE status = 'blocked' AND delivery_state LIKE 'blocked\_%' ESCAPE '\\'
+         ORDER BY updated_at ASC LIMIT 100`
+      ),
       complete: db.prepare(
         `UPDATE jobs SET status = ?, result = ?, error = ?, delivery_state = ?, delivery_meta = ?, lease_until = NULL,
-         updated_at = datetime('now') WHERE id = ?`
+         updated_at = datetime('now') WHERE id = ? AND status = ?`
+      ),
+      updateDelivery: db.prepare(
+        `UPDATE jobs SET delivery_meta = ?, updated_at = datetime('now')
+         WHERE id = ? AND deleted = 0`
+      ),
+      deploymentCandidates: db.prepare(
+        `SELECT * FROM jobs WHERE deleted = 0 AND status = 'done' AND delivery_state = 'delivered'
+         ORDER BY updated_at DESC LIMIT 500`
       ),
     };
   }
@@ -200,15 +249,7 @@ export class JobStore {
 
   emitJob(id: string): void {
     const row = this.get(id);
-    if (row) this.sse.broadcast('job', { ...row, permissions: this.json(row.permissions, {}) });
-  }
-
-  private json<T>(raw: string, fallback: T): T {
-    try {
-      return JSON.parse(raw) as T;
-    } catch {
-      return fallback;
-    }
+    if (row) this.sse.broadcast('job', publicJob(row));
   }
 
   private notifyFinished(id: string): void {
@@ -316,7 +357,108 @@ export class JobStore {
     return { status: 'done' };
   }
 
-  /** Worker complete 回传的收口，含终态通知；cancelled/paused 由用户主导。 */
+  resolveBlockedOutOfBand(
+    job: JobRow,
+    actor: string,
+    resolution: { mode: 'git_ancestor' | 'manual'; head?: string }
+  ): { status: 'done'; job: JobRow } | { error: string } {
+    if (job.status !== 'blocked') return { error: `cannot resolve out of band from ${job.status}` };
+    if (!job.delivery_state?.startsWith('blocked_')) {
+      return { error: `delivery state ${job.delivery_state ?? 'missing'} is not resolvable out of band` };
+    }
+    const previous = jsonRecord(job.delivery_meta);
+    const previousDeclared = previous.declared && typeof previous.declared === 'object'
+      && !Array.isArray(previous.declared) ? previous.declared as Record<string, unknown> : {};
+    const permissions = jsonRecord(job.permissions);
+    const resolvedAt = new Date().toISOString();
+    const automatic = resolution.mode === 'git_ancestor';
+    const reason = automatic
+      ? 'declared head is an ancestor of the server checkout HEAD'
+      : 'manually confirmed as completed by an out-of-band continuation';
+    const deliveryMeta = JSON.stringify({
+      ...previous,
+      state: 'delivered_out_of_band',
+      resolvedAt,
+      resolutionReason: reason,
+      resolution: {
+        mode: resolution.mode,
+        reason,
+        resolvedAt,
+        resolvedBy: actor,
+        ...(resolution.head ? { head: resolution.head } : {}),
+      },
+      declared: {
+        ...previousDeclared,
+        stage: permissions.write === false ? 'closed_loop' : 'delivered_waiting_deploy',
+        summary: permissions.write === false
+          ? '场外接力已经完成，结论与证据已交付。'
+          : '场外接力成果已经进入主分支，等待部署与线上验收。',
+        nextOwner: permissions.write === false ? '无需后续动作' : '部署负责人',
+      },
+    }).slice(0, 100_000);
+    const result = this.statements.resolveOutOfBand.run(deliveryMeta, job.id);
+    if (!result.changes) return { error: 'job changed before out-of-band resolution' };
+    this.addMessage(
+      job.id,
+      actor,
+      'state',
+      automatic
+        ? `场外接力已自动确认完成（HEAD ${resolution.head?.slice(0, 12) ?? 'unknown'} 已进入服务端主分支）`
+        : '场外接力已由 User 手动确认完成'
+    );
+    this.emitJob(job.id);
+    this.notifyFinished(job.id);
+    return { status: 'done', job: this.get(job.id)! };
+  }
+
+  async sweepBlockedOutOfBand(repoPath: string): Promise<string[]> {
+    if (this.outOfBandSweepRunning) return [];
+    this.outOfBandSweepRunning = true;
+    try {
+      const promoted: string[] = [];
+      const candidates = this.statements.blockedOutOfBandCandidates.all() as JobRow[];
+      for (const job of candidates) {
+        const meta = jsonRecord(job.delivery_meta);
+        const head = typeof meta.head === 'string' ? meta.head.trim() : '';
+        if (!GIT_SHA_RE.test(head)) continue;
+        try {
+          await execFileAsync(
+            'git',
+            ['-c', `safe.directory=${path.resolve(repoPath)}`, '-C', repoPath, 'merge-base', '--is-ancestor', head, 'HEAD'],
+            { timeout: 10_000, windowsHide: true }
+          );
+        } catch {
+          // Exit 1 means "not an ancestor"; invalid/missing objects are skipped too.
+          continue;
+        }
+        const outcome = this.resolveBlockedOutOfBand(job, 'system', { mode: 'git_ancestor', head });
+        if ('job' in outcome) promoted.push(job.id);
+      }
+      return promoted;
+    } finally {
+      this.outOfBandSweepRunning = false;
+    }
+  }
+
+  startOutOfBandResolver(
+    repoPath = process.env.AI_HUB_REPO_PATH ?? '/opt/ai-hub',
+    intervalMs = 30_000
+  ): void {
+    if (this.outOfBandTimer) return;
+    void this.sweepBlockedOutOfBand(repoPath);
+    this.outOfBandTimer = setInterval(() => void this.sweepBlockedOutOfBand(repoPath), intervalMs);
+    this.outOfBandTimer.unref();
+  }
+
+  stopOutOfBandResolver(): void {
+    if (this.outOfBandTimer) clearInterval(this.outOfBandTimer);
+    this.outOfBandTimer = null;
+  }
+
+  /**
+   * Worker complete 回传的收口，含终态通知。
+   * 终态重试必须幂等：不能重复写审计消息/广播/continuation，也不能复活 cancelled/paused。
+   */
   complete(
     job: JobRow,
     requested: unknown,
@@ -324,19 +466,125 @@ export class JobStore {
     error: string | null,
     deliveryState: string | null = null,
     deliveryMeta: string | null = null
-  ): string {
+  ): { status: string; changed: boolean } | { error: string } {
+    const current = this.get(job.id);
+    if (!current) return { error: 'job not found' };
+    const terminal = new Set([
+      'done',
+      'blocked',
+      'failed',
+      'interrupted',
+      'cancelled',
+      'paused',
+      'expired',
+    ]);
+    if (terminal.has(current.status)) {
+      return { status: current.status, changed: false };
+    }
+    if (!ACTIVE_STATUSES.has(current.status)) {
+      return { error: `cannot complete from ${current.status}` };
+    }
+
     let status =
       requested === 'done' ? 'done'
       : requested === 'blocked' ? 'blocked'
       : requested === 'paused' ? 'paused'
       : requested === 'interrupted' ? 'interrupted'
       : 'failed';
-    if (job.status === 'cancel_requested') status = 'cancelled';
-    if (job.status === 'pause_requested') status = 'paused';
-    this.statements.complete.run(status, result, error, deliveryState, deliveryMeta, job.id);
-    this.addMessage(job.id, job.worker_id ?? 'worker', status === 'done' ? 'result' : 'state', result || error || status);
+    if (current.status === 'cancel_requested') status = 'cancelled';
+    if (current.status === 'pause_requested') status = 'paused';
+    const update = this.statements.complete.run(
+      status,
+      result,
+      error,
+      deliveryState,
+      deliveryMeta,
+      current.id,
+      current.status
+    );
+    if (!update.changes) {
+      const latest = this.get(current.id);
+      if (latest && terminal.has(latest.status)) {
+        return { status: latest.status, changed: false };
+      }
+      return { error: `job changed before completion${latest ? ` (${latest.status})` : ''}` };
+    }
+    this.addMessage(
+      current.id,
+      current.worker_id ?? 'worker',
+      status === 'done' ? 'result' : 'state',
+      result || error || status
+    );
+    this.emitJob(current.id);
+    if (['done', 'blocked', 'failed', 'interrupted'].includes(status)) {
+      this.notifyFinished(current.id);
+    }
+    return { status, changed: true };
+  }
+
+  updateDelivery(
+    id: string,
+    actor: string,
+    input: DeliveryUpdateInput
+  ): { job: JobRow } | { error: string } {
+    const job = this.get(id);
+    if (!job || job.deleted === 1) return { error: 'job not found' };
+    if (ACTIVE_STATUSES.has(job.status) || job.status === 'pending') {
+      return { error: `cannot update delivery while job is ${job.status}` };
+    }
+    const stage = input.stage.trim().toLowerCase().replace(/-/g, '_');
+    if (!DELIVERY_STAGES.has(stage)) return { error: `invalid delivery stage ${stage}` };
+    const previous = jsonRecord(job.delivery_meta);
+    const {
+      stage: _previousStage,
+      lifecycleStage: _previousLifecycleStage,
+      humanStatus: _previousHumanStatus,
+      summary: _previousSummary,
+      nextOwner: _previousNextOwner,
+      next_owner: _previousNextOwnerSnake,
+      blocker: _previousBlocker,
+      needsUserDecision: _previousNeedsDecision,
+      ...baseMeta
+    } = previous;
+    const previousDeclared = previous.declared && typeof previous.declared === 'object'
+      && !Array.isArray(previous.declared) ? previous.declared as Record<string, unknown> : {};
+    const {
+      stage: _declaredStage,
+      lifecycleStage: _declaredLifecycleStage,
+      summary: _declaredSummary,
+      nextOwner: _declaredNextOwner,
+      next_owner: _declaredNextOwnerSnake,
+      blocker: _declaredBlocker,
+      needsUserDecision: _declaredNeedsDecision,
+      needs_user_decision: _declaredNeedsDecisionSnake,
+      ...baseDeclared
+    } = previousDeclared;
+    const summary = typeof input.summary === 'string' ? input.summary.trim().slice(0, 500) : '';
+    const nextOwner = typeof input.nextOwner === 'string' ? input.nextOwner.trim().slice(0, 100) : '';
+    const blocker = typeof input.blocker === 'string' ? input.blocker.trim().slice(0, 100) : '';
+    const updatedAt = new Date().toISOString();
+    const deliveryMeta = JSON.stringify({
+      ...baseMeta,
+      ...(input.evidence ?? {}),
+      declared: {
+        ...baseDeclared,
+        stage,
+        ...(summary ? { summary } : {}),
+        ...(nextOwner ? { nextOwner } : {}),
+        ...(blocker ? { blocker } : {}),
+      },
+      conclusionUpdatedAt: updatedAt,
+      conclusionUpdatedBy: actor,
+    }).slice(0, 100_000);
+    const result = this.statements.updateDelivery.run(deliveryMeta, job.id);
+    if (!result.changes) return { error: 'job changed before delivery update' };
+    this.addMessage(job.id, actor, 'state', `交付结论更新为 ${stage}${summary ? `：${summary}` : ''}`);
     this.emitJob(job.id);
-    if (['done', 'blocked', 'failed', 'interrupted'].includes(status)) this.notifyFinished(job.id);
-    return status;
+    return { job: this.get(job.id)! };
+  }
+
+  deploymentCandidates(): JobRow[] {
+    return (this.statements.deploymentCandidates.all() as JobRow[])
+      .filter((job) => publicJob(job).delivery_summary.state === 'delivered_waiting_deploy');
   }
 }

@@ -9,7 +9,7 @@ import {
 import { captureEvalCases, dirtyHubAutoCases, trueTaskCases } from './capture-eval-cases.js';
 
 assert.equal(dirtyHubAutoCases.length, 5, 'eval corpus has 5 dirty hub-auto samples (false positives)');
-assert.equal(trueTaskCases.length, 2, 'eval corpus has 2 synthetic true task samples');
+assert.equal(trueTaskCases.length, 2, 'eval corpus has 2 true task samples (codex-0734, codex-1403)');
 assert.equal(captureEvalCases.length, 7);
 
 assert.equal(detectTrigger('明天下午三点见'), '时间与计划');
@@ -82,7 +82,7 @@ for (const item of dirtyHubAutoCases) {
     }
   );
   assert.equal(writes.length, 0, `${item.id} must not enter inbox`);
-  if (item.id === 'system-receipt') {
+  if (item.id === 'aye-1427') {
     assert.equal(reviewed, false, 'worker receipt must be stopped before LLM review');
   }
 }
@@ -107,7 +107,7 @@ for (const item of trueTaskCases) {
   const { writes, vault } = makeVault();
   await maybeCapture(
     vault as never,
-    { id: 'reply-echo-test', name: 'Assistant' },
+    { id: 'reply-echo-test', name: '示例助手' },
     '翻下我的档案',
     '你明天有个待办，长期偏好也在这里',
     () => {},
@@ -121,7 +121,7 @@ for (const item of trueTaskCases) {
   const { writes, vault } = makeVault();
   await maybeCapture(
     vault as never,
-    { id: 'llm-pending-test', name: 'Assistant' },
+    { id: 'llm-pending-test', name: '示例助手' },
     '提醒我有空处理一下',
     '',
     () => {},
@@ -159,7 +159,7 @@ for (const review of [
   }
 }
 
-// Room capture is attributed to the room, stores the user's raw text once, and
+// Room capture is attributed to the room, stores User's raw text once, and
 // omits an empty pseudo-reply section.
 {
   const { writes, vault } = makeVault();

@@ -82,20 +82,89 @@ function normalizeDeliveryDeclaration(value) {
   const { committed, pushed } = value;
   if (typeof committed !== 'boolean' || typeof pushed !== 'boolean') return null;
   if (pushed && !committed) return null;
-  return { committed, pushed };
+  const allowedStages = new Set([
+    'delivered_waiting_deploy',
+    'online_waiting_validation',
+    'closed_loop',
+    'user_decision',
+    'rework_required',
+  ]);
+  const stage = typeof value.stage === 'string'
+    ? value.stage.trim().toLowerCase().replace(/-/g, '_')
+    : '';
+  const summary = typeof value.summary === 'string' ? value.summary.trim().slice(0, 500) : '';
+  const nextOwner = typeof value.nextOwner === 'string'
+    ? value.nextOwner.trim().slice(0, 100)
+    : typeof value.next_owner === 'string' ? value.next_owner.trim().slice(0, 100) : '';
+  const blocker = typeof value.blocker === 'string' ? value.blocker.trim().slice(0, 100) : '';
+  return {
+    committed,
+    pushed,
+    ...(allowedStages.has(stage) ? { stage } : {}),
+    ...(summary ? { summary } : {}),
+    ...(nextOwner ? { nextOwner } : {}),
+    ...(value.needsUserDecision === true || value.needs_user_decision === true
+      ? { needsUserDecision: true }
+      : {}),
+    ...(blocker ? { blocker } : {}),
+  };
 }
 
 export function extractDeliveryDeclaration(value) {
+  if (Array.isArray(value)) {
+    for (const item of [...value].reverse()) {
+      const declaration = extractDeliveryDeclaration(item);
+      if (declaration) return declaration;
+    }
+    return null;
+  }
   if (value && typeof value === 'object') {
     const direct = normalizeDeliveryDeclaration(value.delivery);
     if (direct) return direct;
+    for (const key of ['content', 'message', 'result', 'output', 'text']) {
+      const declaration = extractDeliveryDeclaration(value[key]);
+      if (declaration) return declaration;
+    }
   }
   if (typeof value !== 'string') return null;
-  for (const rawLine of value.split(/\r?\n/).reverse()) {
-    const line = rawLine.trim();
-    if (!line || line === '```' || line.startsWith('```')) continue;
+
+  const candidates = [];
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/gi;
+  for (const match of value.matchAll(fenced)) candidates.push(match[1]);
+
+  let depth = 0;
+  let start = -1;
+  let quoted = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+      continue;
+    }
+    if (char === '{') {
+      if (depth === 0) start = index;
+      depth++;
+    } else if (char === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        candidates.push(value.slice(start, index + 1));
+        start = -1;
+      }
+    }
+  }
+  candidates.push(...value.split(/\r?\n/), value);
+  for (const rawCandidate of candidates.reverse()) {
+    const candidate = rawCandidate.trim();
+    if (!candidate || candidate === '```' || candidate.startsWith('```')) continue;
     try {
-      const parsed = JSON.parse(line);
+      const parsed = JSON.parse(candidate);
       const declaration = extractDeliveryDeclaration(parsed);
       if (declaration) return declaration;
     } catch {}
@@ -104,7 +173,7 @@ export function extractDeliveryDeclaration(value) {
 }
 
 function declarationResult(after, exitCode, declaration, deliveryMode) {
-  if (!declaration || exitCode !== 0) return null;
+  if (!declaration) return null;
   const state = declaration.committed
     ? declaration.pushed ? 'delivered' : 'blocked_unpushed'
     : 'blocked_local_changes';
@@ -117,6 +186,7 @@ function declarationResult(after, exitCode, declaration, deliveryMode) {
     deliveryMode,
     source: 'cli',
     declared: declaration,
+    ...(exitCode !== 0 ? { runnerExitCode: exitCode } : {}),
   };
 }
 
@@ -187,6 +257,10 @@ export function classifyDelivery(before, after, exitCode, options = {}) {
     deliveryMode,
     source: 'git',
   };
+}
+
+export function deliveryCompletesJob(delivery, exitCode) {
+  return exitCode === 0 || (delivery?.state === 'delivered' && delivery?.source === 'cli');
 }
 
 export function reconciliationDecision(delivery, current, ancestorIncluded, options = {}) {

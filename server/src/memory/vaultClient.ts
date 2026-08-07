@@ -2,6 +2,15 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { Db } from '../db.js';
 
+export const MEMORY_OUTBOX_MAX_ATTEMPTS = 8;
+const MEMORY_OUTBOX_BASE_RETRY_MS = 60_000;
+const MEMORY_OUTBOX_MAX_RETRY_MS = 60 * 60_000;
+
+export function memoryOutboxRetryDelayMs(attempts: number): number {
+  const exponent = Math.min(Math.max(Math.trunc(attempts) - 1, 0), 6);
+  return Math.min(MEMORY_OUTBOX_BASE_RETRY_MS * (2 ** exponent), MEMORY_OUTBOX_MAX_RETRY_MS);
+}
+
 /**
  * MCP client for the memory vault's streamable-http server, hardened for
  * gateway use: reconnect-on-failure with retries, and a SQLite outbox so
@@ -90,19 +99,43 @@ export class VaultClient {
     if (this.flushing) return;
     this.flushing = true;
     try {
+      const now = Date.now();
       const rows = this.db
-        .prepare('SELECT * FROM memory_outbox ORDER BY id LIMIT 20')
-        .all() as { id: number; tool: string; args: string; attempts: number }[];
+        .prepare(
+          `SELECT * FROM memory_outbox
+           WHERE status = 'pending' AND next_attempt_at <= ?
+           ORDER BY id LIMIT 20`
+        )
+        .all(now) as { id: number; tool: string; args: string; attempts: number }[];
       for (const row of rows) {
         try {
           await this.call(row.tool, JSON.parse(row.args), 0);
           this.db.prepare('DELETE FROM memory_outbox WHERE id = ?').run(row.id);
           this.log(`outbox flushed: ${row.tool} #${row.id}`);
         } catch (e: any) {
-          this.db
-            .prepare('UPDATE memory_outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?')
-            .run(String(e.message).slice(0, 200), row.id);
-          break; // vault still down — retry the rest next tick
+          const error = String(e?.message ?? e).slice(0, 200);
+          const attempts = row.attempts + 1;
+          if (attempts >= MEMORY_OUTBOX_MAX_ATTEMPTS) {
+            this.db.prepare(
+              `UPDATE memory_outbox
+               SET attempts = ?, last_error = ?, status = 'dead',
+                   next_attempt_at = 0, dead_at = datetime('now')
+               WHERE id = ?`
+            ).run(attempts, error, row.id);
+            this.log(
+              `outbox dead-lettered: ${row.tool} #${row.id} after ${attempts} attempts: ${error}`
+            );
+            continue;
+          }
+          const delayMs = memoryOutboxRetryDelayMs(attempts);
+          this.db.prepare(
+            `UPDATE memory_outbox
+             SET attempts = ?, last_error = ?, next_attempt_at = ?
+             WHERE id = ?`
+          ).run(attempts, error, now + delayMs, row.id);
+          this.log(
+            `outbox retry scheduled: ${row.tool} #${row.id} attempt ${attempts} in ${delayMs}ms: ${error}`
+          );
         }
       }
     } finally {

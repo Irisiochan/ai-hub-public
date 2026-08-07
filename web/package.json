@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node test/externalLinks.test.mjs && node test/messageMerge.test.mjs && node test/statusText.test.mjs && node test/appUpdate.test.mjs && node test/jobThread.test.mjs",
+    "test": "node test/externalLinks.test.mjs && node test/messageMerge.test.mjs && node test/messageWarnings.test.mjs && node test/events.test.mjs && node test/sendIdempotency.test.mjs && node test/statusText.test.mjs && node test/appUpdate.test.mjs && node test/jobThread.test.mjs && node test/sideChannel.test.mjs && node test/sideQuote.test.mjs && node test/sideJobActions.test.mjs && node test/unreadState.test.mjs && node test/messagePresentation.test.mjs && node test/time.test.mjs && node test/confirmDialog.test.mjs",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "preview": "vite preview"
   },

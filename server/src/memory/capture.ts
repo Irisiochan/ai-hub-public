@@ -27,7 +27,7 @@ const REVIEW_CAPTURE_THRESHOLD = 0.8;
 const REVIEW_REJECT_THRESHOLD = 0.2;
 const lastCapture = new Map<string, number>();
 
-const WORKER_RECEIPT_RE = /^⚙\s*Worker 任务回执（网关自动通知，.+也看得到这条）/;
+const WORKER_RECEIPT_RE = /^⚙\s*Worker 任务回执（网关自动通知，User 也看得到这条）/;
 
 export interface CaptureReview {
   decision: 'capture' | 'reject' | 'pending';
@@ -51,10 +51,25 @@ export function isSystemReceipt(text: string): boolean {
     );
 }
 
+/**
+ * 剥掉 Markdown 引用行。副窗「引到主窗」会把机器原文以 `> ` 引用块塞进她的消息，
+ * 那是她引过来的，不是她自己说的话——触发词只该落在她自己新写的那部分上。
+ * 摘要档引用可能凑不齐 isSystemReceipt 需要的三个子串，光靠那道闸拦不住。
+ */
+export function stripQuotedLines(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*>/.test(line))
+    .join('\n')
+    .trim();
+}
+
 export function detectTrigger(text: string): string | null {
   if (isSystemReceipt(text)) return null;
+  const own = stripQuotedLines(text);
+  if (!own) return null;
   for (const t of TRIGGERS) {
-    if (t.re.test(text)) return t.reason;
+    if (t.re.test(own)) return t.reason;
   }
   return null;
 }
@@ -171,7 +186,7 @@ export async function maybeCapture(
   log: (msg: string) => void,
   reviewer: CaptureReviewer = reviewCaptureWithDeepSeek
 ): Promise<void> {
-  // Only the user's original message may trigger capture. Model replies often repeat
+  // Only User's original message may trigger capture. Model replies often repeat
   // dates, preferences and TODO words from injected memory or room transcripts;
   // treating those words as new user facts creates self-echo and identity bleed.
   const reason = detectTrigger(userText);

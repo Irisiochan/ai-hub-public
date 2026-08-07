@@ -100,7 +100,7 @@ try {
     baseUrl: `http://127.0.0.1:${port}/v1/chat/completions`,
     contactId: 'room',
     memberId: 'deepseek-member',
-    roomMode: { selfId: 'api-member', nameOf: (s: string) => (s === 'user' ? 'User' : s) },
+    roomMode: { selfId: 'deepseek-member', nameOf: (s: string) => (s === 'user' ? 'User' : s) },
     log: () => {},
   };
   const roomTurn = { text: '（群里有新消息，见对话历史。）' };

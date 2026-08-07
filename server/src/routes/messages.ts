@@ -11,9 +11,17 @@ import {
   withAttachments,
   withAttachmentsMany,
 } from '../attachments.js';
-import type { ContactRow, Db, MessageRow } from '../db.js';
+import type { ContactRow, Db, MessageOrigin, MessageRow } from '../db.js';
 import type { SseHub } from '../sse.js';
 import { UsageRepo } from '../agents/usageRepo.js';
+import {
+  automationMeta,
+  legacyAutomationDescriptor,
+  normalizeAutomationDescriptor,
+  type AutomationDescriptor,
+} from '../agents/messageSource.js';
+import { getMessageReadState, markMessagesRead } from '../readState.js';
+import { normalizeRoomCoordinationDispatch } from '../agents/roomPrompt.js';
 
 export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploadsDir: string): Router {
   const r = Router();
@@ -57,6 +65,23 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
       | ContactRow
       | undefined;
 
+  const findIdempotentMessage = (
+    contactId: string,
+    idempotencyKey: string
+  ): MessageRow | undefined =>
+    db.prepare(
+      `SELECT * FROM messages
+       WHERE contact_id = ? AND idempotency_key = ?
+       ORDER BY id DESC LIMIT 1`
+    ).get(contactId, idempotencyKey) as MessageRow | undefined;
+
+  const duplicateMessageResponse = (row: MessageRow) => ({
+    messageId: row.id,
+    persisted: true,
+    queued: null,
+    duplicate: true,
+  });
+
   const parseMeta = (row: MessageRow): Record<string, any> => {
     try {
       return JSON.parse(row.meta || '{}') as Record<string, any>;
@@ -82,37 +107,73 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     const contact = getContact(req.params.id);
     if (!contact) return res.status(404).json({ error: 'contact not found' });
 
-    const limit = Math.min(Number(req.query.limit) || 50, 200);
     const before = req.query.before ? Number(req.query.before) : null;
     const after = req.query.after ? Number(req.query.after) : null;
+    const origin = typeof req.query.origin === 'string' ? req.query.origin : 'main';
+    // Initial unread hydration may request more than one normal 50-row page.
+    const limit = Math.min(Number(req.query.limit) || 50, after !== null ? 1000 : 200);
+    if (!['main', 'side', 'all'].includes(origin)) {
+      return res.status(400).json({ error: 'origin must be main, side, or all' });
+    }
+    const originClause = origin === 'all' ? '' : ' AND origin = ?';
+    const originArgs = origin === 'all' ? [] : [origin];
+    const visibleClause = " AND COALESCE(json_extract(meta, '$.uiHidden'), 0) != 1";
 
     let rows: MessageRow[];
     if (after !== null) {
       rows = db
         .prepare(
-          'SELECT * FROM messages WHERE contact_id = ? AND deleted = 0 AND id > ? ORDER BY id ASC LIMIT ?'
+          `SELECT * FROM messages WHERE contact_id = ? AND deleted = 0${originClause}${visibleClause}
+           AND id > ? ORDER BY id ASC LIMIT ?`
         )
-        .all(contact.id, after, limit) as MessageRow[];
+        .all(contact.id, ...originArgs, after, limit) as MessageRow[];
     } else if (before !== null) {
       rows = (
         db
           .prepare(
-            'SELECT * FROM messages WHERE contact_id = ? AND deleted = 0 AND id < ? ORDER BY id DESC LIMIT ?'
+            `SELECT * FROM messages WHERE contact_id = ? AND deleted = 0${originClause}${visibleClause}
+             AND id < ? ORDER BY id DESC LIMIT ?`
           )
-          .all(contact.id, before, limit) as MessageRow[]
+          .all(contact.id, ...originArgs, before, limit) as MessageRow[]
       ).reverse();
     } else {
       rows = (
         db
           .prepare(
-            'SELECT * FROM messages WHERE contact_id = ? AND deleted = 0 ORDER BY id DESC LIMIT ?'
+            `SELECT * FROM messages WHERE contact_id = ? AND deleted = 0${originClause}${visibleClause}
+             ORDER BY id DESC LIMIT ?`
           )
-          .all(contact.id, limit) as MessageRow[]
+          .all(contact.id, ...originArgs, limit) as MessageRow[]
       ).reverse();
     }
-    res.json({ messages: withAttachmentsMany(db, rows) });
+    res.json({
+      messages: withAttachmentsMany(db, rows),
+      readState: origin === 'all'
+        ? null
+        : getMessageReadState(db, contact.id, origin as MessageOrigin),
+    });
   });
 
+
+  r.patch('/:id/messages/read', (req, res) => {
+    const contact = getContact(req.params.id);
+    if (!contact) return res.status(404).json({ error: 'contact not found' });
+    const origin = req.body?.origin;
+    const throughMessageId = Number(req.body?.throughMessageId);
+    if (origin !== 'main' && origin !== 'side') {
+      return res.status(400).json({ error: 'origin must be main or side' });
+    }
+    if (!Number.isSafeInteger(throughMessageId) || throughMessageId <= 0) {
+      return res.status(400).json({ error: 'throughMessageId must be a positive integer' });
+    }
+    try {
+      const readState = markMessagesRead(db, contact.id, origin, throughMessageId);
+      sse.broadcast('read-state', { contactId: contact.id, ...readState });
+      res.json({ readState });
+    } catch (error) {
+      res.status(404).json({ error: (error as Error).message });
+    }
+  });
   r.get('/:id/room-rounds/:roundId', (req, res) => {
     const contact = getContact(req.params.id);
     if (!contact) return res.status(404).json({ error: 'contact not found' });
@@ -127,7 +188,7 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     res.json(roomHostResponse(row));
   });
 
-  /** 非用户发起的群主持消息。该入口永不触发 memory capture。 */
+  /** 非 User 发起的群主持消息。该入口永不触发 memory capture。 */
   r.post('/:id/room-host/messages', (req, res) => {
     const contact = getContact(req.params.id);
     if (!contact) return res.status(404).json({ error: 'contact not found' });
@@ -142,15 +203,10 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     const idempotencyKey = typeof req.body?.idempotencyKey === 'string'
       ? req.body.idempotencyKey.trim().slice(0, 200)
       : '';
-
-    if (idempotencyKey) {
-      const existing = db.prepare(
-        `SELECT * FROM messages
-         WHERE contact_id = ? AND sender = 'room-host'
-           AND json_extract(meta, '$.roomHost.idempotencyKey') = ?
-         ORDER BY id DESC LIMIT 1`
-      ).get(contact.id, idempotencyKey) as MessageRow | undefined;
-      if (existing) return res.status(200).json(roomHostResponse(existing));
+    const coordinationSupplied = req.body?.coordination !== undefined;
+    const coordination = normalizeRoomCoordinationDispatch(req.body?.coordination);
+    if (coordinationSupplied && !coordination) {
+      return res.status(400).json({ error: 'coordination metadata is invalid' });
     }
 
     const members = manager.imageRoomMembers(contact);
@@ -169,6 +225,30 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     if (trigger && targetOverride.length === 0) {
       return res.status(400).json({ error: 'room host message must target at least one room member' });
     }
+    if (coordination) {
+      const expectedTarget = coordination.kind === 'verification'
+        ? coordination.verifier
+        : coordination.executor;
+      const expectedKey = coordination.kind === 'verification'
+        ? `verification:v1:${coordination.taskPath}:${coordination.due}`
+        : `coordination:${coordination.taskPath}:${coordination.planHash}`;
+      if (!trigger
+          || targetOverride.length !== 1
+          || targetOverride[0].id !== expectedTarget
+          || idempotencyKey !== expectedKey) {
+        return res.status(400).json({ error: 'coordination routing contract mismatch' });
+      }
+    }
+
+    if (idempotencyKey) {
+      const existing = db.prepare(
+        `SELECT * FROM messages
+         WHERE contact_id = ? AND sender = 'room-host'
+           AND json_extract(meta, '$.roomHost.idempotencyKey') = ?
+         ORDER BY id DESC LIMIT 1`
+      ).get(contact.id, idempotencyKey) as MessageRow | undefined;
+      if (existing) return res.status(200).json(roomHostResponse(existing));
+    }
 
     const roundId = crypto.randomUUID();
     const initialMeta = {
@@ -179,14 +259,16 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
         status: trigger ? 'running' : 'done',
         targets: targetOverride.map((member) => member.id),
         reactionRounds: trigger
-          ? Math.min(Math.max(Number(req.body?.reactionRounds ?? 3), 0), 3)
+          ? Math.min(Math.max(Number(req.body?.reactionRounds ?? 2), 0), 3)
           : 0,
+        coordination: coordination || undefined,
       },
     };
     const result = db.prepare(
-      `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta)
-       VALUES (?, 'room-host', 'user', 'text', ?, 'done', ?)`
-    ).run(contact.id, content, JSON.stringify(initialMeta));
+      `INSERT INTO messages
+         (contact_id, sender, role, kind, content, status, meta, origin, idempotency_key)
+       VALUES (?, 'room-host', 'user', 'text', ?, 'done', ?, 'main', ?)`
+    ).run(contact.id, content, JSON.stringify(initialMeta), idempotencyKey || null);
     const row = db.prepare('SELECT * FROM messages WHERE id = ?')
       .get(Number(result.lastInsertRowid)) as MessageRow;
     sse.broadcast('message', withAttachments(db, row));
@@ -284,6 +366,11 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     db.prepare('UPDATE messages SET deleted = 1 WHERE id = ?').run(mid);
     deleteMessageFiles(db, uploadsDir, mid);
     sse.broadcast('prune', { contactId: contact.id, ids: [mid] });
+    const origin = row.origin;
+    sse.broadcast('read-state', {
+      contactId: contact.id,
+      ...getMessageReadState(db, contact.id, origin),
+    });
     await manager.invalidateConversation(contact, mid);
     res.json({ ok: true });
   });
@@ -302,6 +389,41 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
     const files = (req.files ?? []) as Express.Multer.File[];
     if (!content && files.length === 0) return res.status(400).json({ error: 'content or image required' });
+    const explicitAutomation = normalizeAutomationDescriptor(req.body?.automation);
+    const legacyAutomation = explicitAutomation ? null : legacyAutomationDescriptor(content);
+    const automated = req.body?.automated === true || explicitAutomation !== null || legacyAutomation !== null;
+    let automation: AutomationDescriptor | null = explicitAutomation ?? legacyAutomation;
+    const hidden = req.body?.hidden === true;
+    const requestedOrigin = automation?.messageType === 'background-event'
+      ? 'side'
+      : req.body?.origin ?? 'main';
+    if (requestedOrigin !== 'main' && requestedOrigin !== 'side') {
+      return res.status(400).json({ error: 'origin must be main or side' });
+    }
+    if (hidden && !automated) {
+      return res.status(400).json({ error: 'hidden messages must be automated' });
+    }
+    const origin: MessageOrigin = contact.kind === 'room' ? 'main' : requestedOrigin;
+    if (automated && !automation) {
+      automation = {
+        messageType: requestedOrigin === 'side'
+          ? 'background-event'
+          : hidden ? 'proactive-trigger' : 'automation-trigger',
+        eventSource: 'unspecified-automation',
+      };
+    }
+    const explicitIdempotencyKey = typeof req.body?.idempotencyKey === 'string'
+      ? req.body.idempotencyKey.trim().slice(0, 200)
+      : '';
+    const idempotencyKey = explicitIdempotencyKey
+      || (automation?.eventId
+        ? `automation:${automation.eventSource}:${automation.eventId}`.slice(0, 200)
+        : '');
+    if (idempotencyKey) {
+      const existing = findIdempotentMessage(contact.id, idempotencyKey);
+      if (existing) return res.status(200).json(duplicateMessageResponse(existing));
+    }
+    const sender = automated ? 'system' : 'user';
     let roomTargets: ContactRow[] | undefined;
     if (files.length > 0 && contact.kind === 'room') {
       roomTargets = content ? manager.parseTargets(contact, content) : manager.imageRoomMembers(contact);
@@ -309,15 +431,34 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
 
     const storedContent = content || '请看这张图片。';
 
-    const result = db
-      .prepare(
-        `INSERT INTO messages (contact_id, sender, role, kind, content, status)
-         VALUES (?, 'user', 'user', 'text', ?, 'done')`
-      )
-      .run(contact.id, storedContent);
+    let messageId: number;
+    try {
+      const result = db
+        .prepare(
+          `INSERT INTO messages (
+             contact_id, sender, role, kind, content, status, meta, origin, idempotency_key
+           )
+           VALUES (?, ?, 'user', 'text', ?, 'done', ?, ?, ?)`
+        )
+        .run(
+          contact.id,
+          sender,
+          storedContent,
+          JSON.stringify(automation ? automationMeta(automation, { hidden }) : {}),
+          origin,
+          idempotencyKey || null
+        );
+      messageId = Number(result.lastInsertRowid);
+    } catch (error) {
+      const existing = idempotencyKey
+        ? findIdempotentMessage(contact.id, idempotencyKey)
+        : undefined;
+      if (existing) return res.status(200).json(duplicateMessageResponse(existing));
+      throw error;
+    }
     const row = db
       .prepare('SELECT * FROM messages WHERE id = ?')
-      .get(Number(result.lastInsertRowid)) as MessageRow;
+      .get(messageId) as MessageRow;
     try {
       for (const file of files) persistImage(db, uploadsDir, row.id, file);
     } catch (error) {
@@ -326,18 +467,23 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
       return res.status(400).json({ error: (error as Error).message });
     }
     const message = withAttachments(db, row);
-    sse.broadcast('message', message);
+    if (!hidden) sse.broadcast('message', message);
 
     if (contact.kind === 'room') {
-      const targets = manager.dispatchRoomMessage(contact, storedContent, roomTargets);
-      return res.status(202).json({ messageId: row.id, queued: true, targets });
+      const targets = manager.dispatchRoomMessage(contact, storedContent, roomTargets, row.id);
+      return res.status(202).json({ messageId: row.id, persisted: true, queued: true, targets });
     }
 
     const queued = manager.get(contact).enqueue({ userMessageId: row.id, text: storedContent });
     if (queued === 'full') {
-      return res.status(429).json({ error: '排队太长了，等他喘口气', messageId: row.id });
+      return res.status(429).json({
+        error: '排队太长了，等他喘口气',
+        messageId: row.id,
+        persisted: true,
+        queued: false,
+      });
     }
-    res.status(202).json({ messageId: row.id, queued: true });
+    res.status(202).json({ messageId: row.id, persisted: true, queued: true });
   });
 
   r.post('/:id/interrupt', (req, res) => {

@@ -1,7 +1,6 @@
 # ai-hub
 
-自托管的 AI 聊天网关，也是 [Memory Vault](https://github.com/Irisiochan/memory-vault)
-的可选旗舰客户端：像 IM 一样跟 Claude Code、Codex、Grok CLI 和任意 API 模型聊天。
+自托管的 AI 聊天网关与长期记忆库：像 IM 一样跟 Claude Code、Codex 和任意 API 模型聊天。
 手机/电脑浏览器访问，历史全同步，CLI 后端走订阅额度，还能把编码任务派回自己的 PC 执行。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
@@ -10,26 +9,14 @@
 ## 能干什么
 
 - **IM 式永续会话**：每个 AI 是一个联系人，一条永远聊下去的对话；改名、换头像、换颜色
-- **四类后端**：`claude` CLI、`codex app-server`、Grok CLI，以及 Anthropic /
-  OpenAI-compatible / Gemini 原生 API；模型与推理档位可以按联系人和委派任务选择
+- **三种后端**：`claude` CLI（stream-json 持久子进程 + resume）、`codex app-server`（JSON-RPC）、
+  API 直连（Anthropic / OpenAI-compatible / Gemini 原生协议，UI 里自助添加任意供应商）
 - **群聊**：拉现有联系人建群，`@名字` / `@all` 调度，每成员独立会话
 - **图片**：选图/粘贴截图直接发，API 联系人可按需配独立视觉模型
-- **版本化长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档；两仓只通过 MCP 契约连接
-- **语义化记忆捕捉**：廉价规则先筛选候选，再由 DeepSeek 以固定 JSON schema 精筛；高置信度内容进入 inbox、明确误报丢弃，低置信度或 API 故障标记为待审，不阻断聊天
+- **内置长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档
 - **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
-  任务以可折叠子会话挂回原消息；支持模型/推理档位、暂停/取消/重试、并行 workspace、
-  进程重连与可恢复的本地状态，完成后自动回执验收
-- **移动端优先 UI**：手机使用底部操作区、全屏设置/Worker 日志和 safe-area 适配，
-  横屏配置页也不会挤出屏幕
-- **可选主动 triage**：DeepSeek 严格 JSON 分流之外，还能按安静时段和独立配额做每日轻量问候，
-  或由主持人发起群聊 idea 讨论并在回合结束后汇总
-- **时间与群聊防串台**：历史消息/摘要带上海绝对时间锚；群成员与主持人发言包装为不可执行引用，
-  避免把旧话题当刚发生、把成员内容误认成用户指令
-- **API 成本优化**：按供应商拆分直连实现，支持 OpenAI-compatible / Anthropic prompt cache
-  用量观测与策略、Gemini 原生 usage，模型目录可热更新
+  任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
 - **订阅额度可见**：Claude / Codex 标题栏实时显示 5h / 周窗口剩余
-- **桌面与 Android 壳**：Electron 支持本地/远程 Hub；Capacitor 伴侣 App 可由 Actions 生成 APK，
-  并支持校验 SHA-256 后的 Web 热更新与新版 APK 兜底
 - **运维内建**：token 门控的一键部署端点（拉取/构建/重启/健康检查/失败自动回滚）、
   SQLite 在线定时备份（integrity 校验 + 保留窗口）、发布状态面板
 
@@ -55,8 +42,8 @@ PC Worker (主动出站长轮询，无入站端口)
 
 ## 快速启动
 
-推荐用 Compose 一次启动前端、网关和记忆库。Compose 默认锁定
-`memory-vault` 的 `v0.6.0` 发布标签，不复制维护它的源码：
+推荐用 Compose 一次启动前端、网关和记忆库。Compose 默认从独立仓库构建
+Memory Vault `v0.6.0`，本仓库不维护它的源码副本：
 
 ```bash
 cp .env.example .env
@@ -64,10 +51,9 @@ docker compose -f docker-compose.example.yml up --build -d
 ```
 
 打开 `http://127.0.0.1:3900`。首次启动会在仓库旁生成被 gitignore 的 `vault-data/`，
-里面是可直接用 Obsidian 打开的私人 Markdown 记忆库。升级记忆系统时，显式修改
-`.env` 中的 `MEMORY_VAULT_VERSION`，再运行契约测试。
+里面是可直接用 Obsidian 打开的私人 Markdown 记忆库。
 
-源码开发：
+本地源码开发：
 
 ```bash
 cd server && npm install && npm run dev     # 网关 :3900
@@ -76,70 +62,44 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 
 或构建后单进程：`cd web && npm run build`，网关直接 serve `web/dist`。
 
-首次启动会创建中性的 `Claude Code`、`Codex`、`Grok Build` 三个工具联系人，不写入用户姓名、
-私人关系人设或本机 Memory Vault 路径。使用前请分别完成所需 CLI 的登录。
+首次启动自动种一个 claude-cli 联系人。前提：`claude` CLI 已登录（`claude /login`）。
 不想耗额度可以用 🧪 Mock 联系人（`server/scripts/mock-claude.mjs`）测管线和 UI。
 
 ## 配置
 
 - `server/config.example.json` → 复制为 `server/config.json`（端口、CLI 路径等）
-- Compose 会从独立仓库的固定标签构建 Memory Vault；源码开发时另行启动
-  `memory-vault-mcp --vault <数据目录> --http --host 127.0.0.1 --port 8900`，再在
-  `server/config.json` 将 `memory.mcpUrl` 指向 `http://127.0.0.1:8900/mcp`
+- Compose 会自动连接固定版本的外部 Memory Vault；源码开发时先用
+  `memory-vault-mcp --vault <数据目录> --http --host 127.0.0.1 --port 8900`
+  启动独立服务，再在 `server/config.json` 将 `memory.mcpUrl` 指向
+  `http://127.0.0.1:8900/mcp`
 - 联系人级配置存在 DB（UI 可改）：模型、人设、记忆三开关、委派权限等
-- 模型下拉的内置目录可由 `server/model-catalog.json` 覆盖（模板：
-  `server/model-catalog.example.json`）；保存后热加载，也可用 `HUB_MODEL_CATALOG` 指向别处
-- Android 应用内更新文件默认放在 `server/data/releases/`（Linux 默认
-  `/var/lib/ai-hub/releases`），可用 `HUB_RELEASES_DIR` 覆盖
-- Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是 Claude 配置模板；
-  `mcp.gateway.json` 与 `.grok/config.toml` 是网关按需生成的 MCP 配置
-- 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`HUB_TOKEN`、`HUB_MCP_TOKEN`、`DEEPSEEK_API_KEY`
-- 配置 `HUB_TOKEN` 后，浏览器首次可用 `?token=` 建立 HttpOnly 会话；管理 API 客户端使用
-  `Authorization: Bearer <HUB_TOKEN>`。设备端点继续校验各自 Worker token，`/api/health`
-  保持无鉴权，供 Compose 与部署探针使用
-- CLI 联系人启用 PC Worker 委派前必须配置独立 `HUB_MCP_TOKEN`。该令牌只保护
-  内部 `/api/hub-mcp/*`，不要与桌面浏览器会话的 `HUB_TOKEN` 复用；未配置时接口默认关闭
-- Grok Build 启用委派时会在联系人工作目录生成项目级 `.grok/config.toml`；URL 和 Bearer
-  只引用 `HUB_PORT` / `HUB_MCP_TOKEN` 环境变量，不会把随机端口或令牌固化进公共仓库
+- Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是人设
+  （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server，
+  `overlay.md` 是该联系人相对它家厂商 base prompt 的差分叠层（跟着仓库走，四个后端通用）
+- 系统提示词分几层、想改口吻该动哪一层：[docs/prompt-layers.md](docs/prompt-layers.md)
+- **多会话并发写这个仓库时先开自己的分支**（暂存区是仓库级共享状态，直接在 master 上
+  add/commit 会互相收走对方的文件）：
 
-### 自动记忆捕捉
+  ```bash
+  git config core.hooksPath deploy/githooks   # 每个 checkout 装一次，挡住 master 直提
+  bash deploy/session-worktree.sh add <本次任务短名>
+  # 干完在自己的 worktree 里 commit，再回主检出 merge --ff-only session/<短名> 并 push
+  ```
 
-`hub-auto` 只检查用户原话。时间、待办、偏好或长期约定等规则命中后，才把该条原话发送给
-DeepSeek 做语义精筛，不会发送完整聊天历史或记忆库：
-
-- `confidence >= 0.8` 且模型判定值得保留：写入 Memory Vault `inbox/`
-- `confidence <= 0.2` 且模型判定不值得保留：直接丢弃
-- 中间置信度、未配置密钥、超时、非 2xx、空响应或 schema 无效：以
-  `llm-review-pending` 标签写入 `inbox/`，等待人工复核；聊天与 MCP 链路继续运行
-
-在 `.env` 中配置：
-
-```dotenv
-DEEPSEEK_API_KEY=your_key_here
-DEEPSEEK_CAPTURE_MODEL=deepseek-v4-flash
-# 可选；默认 https://api.deepseek.com
-DEEPSEEK_API_BASE_URL=
-```
-
-模型调用显式关闭 thinking。公开回归集使用合成样本，不包含私人聊天导出；可运行
-`npx tsx server/scripts/smoke-capture.ts` 验证规则边界、系统回执过滤、置信度分流和失败降级。
+  集成、修部署脚本这类确实要就地提交的，用 `AI_HUB_ALLOW_MASTER=1 git commit ...` 单次放行；
+  PC Worker 的 job 已经带着这个变量跑，委派链路不受影响。
+- 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`DEEPSEEK_API_KEY`
 
 ## Memory Vault
 
-Memory Vault 是独立主产品；AI Hub 不再内嵌或复制它的服务实现。
-`docker-compose.example.yml` 通过固定 release tag 消费它，私人数据始终写入被 gitignore 的
-`vault-data/`，所以首次启动产生记忆后 ai-hub 源码仓库仍保持干净。
+Memory Vault 是独立产品，本仓库只通过版本化 Docker 构建上下文或
+`memory-vault-mcp` CLI 消费它，不复制维护 `_meta/mcp_server.py`、模板或测试源码。
+Compose 的私人数据始终写入被 gitignore 的 `vault-data/`，不会进入 ai-hub 源码历史。
 
 不配置 Git 时，记忆会稳定保存在本机目录。需要多设备同步时，把 `vault-data/` 初始化或克隆成一个
 **独立的私有 Git 仓库**；服务检测到 `vault-data/.git` 后，才会自动 pull、commit 和 push。
-它绝不会沿父目录误用公开 ai-hub 的远端。完整安装、同步和隐私说明见
-[Memory Vault 仓库](https://github.com/Irisiochan/memory-vault)。
-
-已启动 Memory Vault 后可验证当前 MCP 契约：
-
-```bash
-npm run smoke:memory-contract --prefix server
-```
+它绝不会沿父目录误用 ai-hub 的远端。安装、MCP 配置与升级说明见
+[Memory Vault 独立仓库](https://github.com/Irisiochan/memory-vault)。
 
 ## PC Worker（离线优先）
 
@@ -151,16 +111,6 @@ npm run smoke:memory-contract --prefix server
 3. `node worker/worker.mjs worker/config.json` 验证；Windows 登录自启用
    `worker-launcher.ps1 -Action install`（单实例、崩溃退避重拉、本地状态文件）
 
-## 桌面与 Android
-
-- `desktop/`：Electron 壳；默认运行本地网关，也可在 `desktop.json` 中指向已有远程 Hub。
-- `mobile/`：Capacitor Android 伴侣壳；`.github/workflows/android.yml` 可生成签名 APK artifact。
-- `server/scripts/build-app-release.mjs`：把当前 `web/dist` 打成确定性 ZIP、计算 SHA-256，
-  并更新 `latest.json`；App 只接受 `/releases/` 下的同源文件。
-- `server/scripts/publish-apk-release.mjs`：校验下载 APK 的 SHA-256 后再写入发布目录，
-  作为 Web 热更新无法兼容时的原生版本兜底。
-- 两者都是同一套 Web UI 的消费端，不复制 Memory Vault 实现；远程模式仍应只连接受保护的私网 Hub。
-
 ## 安全模型与威胁边界
 
 **信任边界 = 你的私有网络。** 网关目前没有账号体系，设计为跑在 Tailscale 等
@@ -171,6 +121,7 @@ overlay 网络内、绑定内网 IP；**绝对不要把 3900 直接暴露公网*
   只允许受信设备/用户访问 3900，不能把“加入同一 Tailnet”直接等同于可信。
 
 - API key 服务端存储、返回 UI 永远打码；`.env` 与数据库不进 git
+- 微信 iLink bot 通道的部署与凭据边界见 [docs/wechat-channel.md](docs/wechat-channel.md)
 - CLI 联系人默认聊天模式：MCP 记忆工具白名单直通，Bash/Write/Edit 硬禁，漏网默认拒；
   写权限/Shell 需按联系人显式开启 projectAccess 并指定 workspace
 - Worker 只出站长轮询，无入站端口；配对 token 服务端只存 SHA-256；
@@ -199,3 +150,14 @@ overlay 网络内、绑定内网 IP；**绝对不要把 3900 直接暴露公网*
 ## License
 
 MIT © Irisiochan
+
+### 自动消息的主窗 / 副窗约定
+
+私聊消息的 `origin` 只有 `main` / `side` 两值。用户输入默认写入 `main`；自动化调用
+`POST /api/contacts/:id/messages` 时必须显式发送 `origin` 和 `automated: true`，否则会按
+用户输入处理并污染主窗。派单、轮询、自动测试写 `side`；daily 主动陪伴写 `main`，并用
+`hidden: true` 隐藏只供模型执行的内部触发指令，让主窗只出现 AI 真正对 User 说的话。
+
+`GET /api/contacts/:id/messages` 默认只返回 `main`，可传 `origin=side` 或 `origin=all`。
+历史数据不会自动迁移或启发式重分类，migration 只把既有行保守保留在 `main`。同一底层
+会话的上下文不拆；已经完成的 `side` 行在后续 prompt / 滚动摘要中会压成一行后台摘要。

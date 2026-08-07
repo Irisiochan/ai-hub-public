@@ -105,7 +105,7 @@ export default function MobileGate({ children }: { children: ReactNode }) {
       <input
         value={input}
         onChange={(e) => setInput(e.target.value)}
-        placeholder="http://<hub-tailnet-ip>:3900"
+        placeholder="http://100.x.y.z:3900"
         autoCapitalize="none"
         autoCorrect="off"
         spellCheck={false}

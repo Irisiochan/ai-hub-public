@@ -3,6 +3,7 @@ import {
   DEFAULT_DAILY_RECIPIENTS,
   estimateCostCny,
   isDailyMode,
+  parseDiaryEntries,
   parseTriageJson,
   validateTriageMode,
 } from './triage-core.mjs';
@@ -39,6 +40,8 @@ async function jsonRequest(url, init, timeoutMs = 30_000) {
   return body;
 }
 
+const RAW_SNIPPET_CHARS = 500;
+
 function parseJsonObject(raw, label) {
   if (typeof raw !== 'string') throw new Error(`${label} response must be text`);
   let text = raw.trim();
@@ -48,7 +51,16 @@ function parseJsonObject(raw, label) {
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
   if (start < 0 || end <= start) throw new Error(`${label} response did not contain a JSON object`);
-  return JSON.parse(text.slice(start, end + 1));
+  const candidate = text.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    // 原始正文以前直接丢了，只剩一句「position 563」，事后只能靠报错形状猜成因
+    // （未转义引号？截断？多余逗号？）。留一段原文，下次是实锤而不是推理。
+    const snippet = candidate.slice(0, RAW_SNIPPET_CHARS);
+    const suffix = candidate.length > RAW_SNIPPET_CHARS ? `…(共 ${candidate.length} 字)` : '';
+    throw new Error(`${label}: ${error.message} | raw: ${snippet}${suffix}`);
+  }
 }
 
 export class DeepSeekClient {
@@ -66,7 +78,7 @@ export class DeepSeekClient {
       : { type: 'disabled' };
   }
 
-  async callJson(model, system, user, pricing = {}, maxTokens = 400) {
+  async callJson(model, system, user, pricing = {}, maxTokens = 400, { temperature = 0 } = {}) {
     if (!this.key) throw new Error('DeepSeek API key environment variable is missing');
     const startedAt = performance.now();
     const body = await jsonRequest(`${this.baseUrl}/chat/completions`, {
@@ -77,7 +89,7 @@ export class DeepSeekClient {
       },
       body: JSON.stringify({
         model,
-        temperature: 0,
+        temperature,
         max_tokens: maxTokens,
         thinking: this.thinking,
         // DeepSeek's OpenAI-compatible endpoint supports JSON mode. The worker
@@ -106,6 +118,33 @@ export class DeepSeekClient {
     };
   }
 
+  /**
+   * Cheap flash extract for temporary-absence followups.
+   * Only call after local keyword coarse screen hits.
+   */
+  async extractTemporaryAbsence(messageText) {
+    const system = [
+      'You extract temporary-absence intents from a single chat message by User.',
+      'Return exactly one JSON object:',
+      '{"intent":"temporary-absence"|"none","activity":"short label or null","expectedMinutes":number|null,"returnCommitment":"what User plans to do after returning or null"}',
+      'intent=temporary-absence only when User is stepping away briefly (bath, out, work meeting, meal, sleep, back later).',
+      'activity: short Chinese/English label of what she is doing (e.g. 洗澡, 出门, 开会).',
+      'expectedMinutes: best estimate of when to check back (5–180). For games/entertainment default to 90–120; use 30 if otherwise unsure.',
+      'returnCommitment: the concrete thing User says she will do after returning (e.g. 验收 toy); null when absent.',
+      'Messages like “玩完之后验收 toy 我再来” are temporary absences with both an activity and a return commitment.',
+      'If the message is not a temporary absence, intent must be none and the other fields null.',
+      'No prose outside JSON.',
+    ].join('\n');
+    const response = await this.callJson(
+      this.flashModel,
+      system,
+      JSON.stringify({ message: String(messageText ?? '').slice(0, 1000) }),
+      this.pricing.flash,
+      120,
+    );
+    return response;
+  }
+
   async triage(event, backlogSummary, options = {}) {
     const daily = isDailyMode(event) || options.mode === 'daily';
     const dailyRecipients = Array.isArray(options.dailyRecipients) && options.dailyRecipients.length
@@ -116,16 +155,17 @@ export class DeepSeekClient {
     const system = daily
       ? [
         'You are the L1 proactive daily-companion gate for an autonomous AI hub.',
-        'Decide whether the AI Hub user should receive a proactive message right now.',
+        'Decide whether User should receive a proactive message right now.',
         'Allowed content: care/health/routine nudges, practical reminders, light chat openers, affectionate check-ins.',
         forceActionable
           ? 'This is the guaranteed daily slot. Choose one natural, low-pressure proactive message; actionable must be true.'
           : 'Stay selective — prefer NO_OP when nothing natural fits the current Shanghai time context.',
         'Return exactly one JSON object with this contract:',
         forceActionable
-          ? `{"actionable":true,"category":"daily","priority":1,"suggestedRecipient":"${dailyRecipients[0]}","rationale":"brief reason"}`
-          : '{"actionable":false,"category":"daily","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
-        'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
+          ? `{"actionable":true,"needsLocalExec":false,"category":"daily","priority":1,"suggestedRecipient":"${dailyRecipients[0]}","rationale":"brief reason"}`
+          : '{"actionable":false,"needsLocalExec":false,"category":"daily","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
+        'actionable and needsLocalExec must be JSON booleans, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
+        'Daily companion messages never require local execution: needsLocalExec must be false.',
         'When actionable is true: category must be "daily" and suggestedRecipient must be exactly one of '
           + `${dailyRecipients.join(', ')}.`,
         forceActionable
@@ -138,8 +178,12 @@ export class DeepSeekClient {
         'You are the cheap L1 event triage gate for an autonomous AI hub.',
         'Most events are not actionable. Be conservative.',
         'Return exactly one JSON object with this contract:',
-        '{"actionable":false,"category":"other","priority":1,"suggestedRecipient":null,"rationale":"brief reason"}',
-        'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
+        '{"actionable":false,"needsLocalExec":false,"category":"other","priority":1,"suggestedRecipient":null,"rationale":"brief reason","taskPath":null}',
+        'actionable and needsLocalExec must be JSON booleans, priority must be a JSON integer, and suggestedRecipient must be a JSON string or null.',
+        'Set needsLocalExec=true only when the action requires real repository state, tests, code/file changes, shell access, or deployment.',
+        'Keep needsLocalExec=false for conversation, companionship, reminders, memory writes, and discussion that a contact can complete from chat context.',
+        'For a backlog sweep, actionable=true requires taskPath to be copied exactly from recentBacklog.',
+        'Never choose worker-tail/deploy-tail entries. A missing eligible task means NO_OP with taskPath=null.',
         `Allowed categories: ${taskCategories.join(', ')}.`,
         'Priority 1 is routine, 2 is important, 3 is urgent.',
         'suggestedRecipient is a configured routing key, or null when rules should decide.',
@@ -178,6 +222,10 @@ export class DeepSeekClient {
       ? new Set(options.allowedRecipientKeys.map((item) => String(item).trim().toLowerCase()))
       : null;
     const recipients = contacts
+      .filter((contact) => (
+        triageResult.needsLocalExec !== true
+        || contact.config?.delegation?.enabled === true
+      ))
       .map((contact) => ({
         recipientKey: contact.config?.routing?.recipientKey ?? contact.id,
         id: contact.id,
@@ -193,17 +241,17 @@ export class DeepSeekClient {
     const system = [
       'Choose exactly one recipient for an actionable event.',
       'Return exactly one JSON object with this contract:',
-      '{"actionable":true,"category":"other","priority":1,"suggestedRecipient":"recipient-key","rationale":"brief reason"}',
-      'actionable must be a JSON boolean, priority must be a JSON integer, and suggestedRecipient must be a JSON string.',
+      '{"actionable":true,"needsLocalExec":false,"category":"other","priority":1,"suggestedRecipient":"recipient-key","rationale":"brief reason"}',
+      'actionable and needsLocalExec must be JSON booleans, priority must be a JSON integer, and suggestedRecipient must be a JSON string.',
       'Set suggestedRecipient to one recipientKey from the provided list.',
-      'Do not change actionable/category/priority.',
+      'Do not change actionable/needsLocalExec/category/priority.',
     ].join('\n');
     const user = JSON.stringify({
       event: { source: event.source, summary: event.summary },
       triage: triageResult,
       recipients,
     });
-    return this.call(this.proModel, system, user, this.pricing.pro);
+    return this.call(this.flashModel, system, user, this.pricing.flash);
   }
 
   async ideaTopic({ room, members, recentTopics }) {
@@ -224,10 +272,10 @@ export class DeepSeekClient {
       recentTopics,
     });
     const response = await this.callJson(
-      this.proModel,
+      this.flashModel,
       system,
       user,
-      this.pricing.pro,
+      this.pricing.flash,
       600,
     );
     const value = response.result;
@@ -250,6 +298,50 @@ export class DeepSeekClient {
     return { ...response, result: { topic, category, targetIds, rationale } };
   }
 
+  /**
+   * 日终 rollup 的抽取步骤：把一天的真实对话压成几条日记流水。
+   * 只允许复述 User 自己说过的事——AI 的回复只是上下文，不是事实来源。
+   */
+  async diaryEntries({ date, weekday, transcript, maxEntries = 8, attempt = 1 }) {
+    const system = [
+      'You extract diary bullet points for User from one day of her real chat logs.',
+      'Write in Chinese, in User 的第三人称视角（例如「User 上午洗了两只大型犬」），一条一句话。',
+      '',
+      '判断标准：一年后回看这一天，这条还算「她那天经历过的事」吗？不算就别记。',
+      '记：生活事件、身体与情绪状态、宠物、出门与见人、吃睡、关系里真实发生的事、',
+      '  以及工作上她实际做了什么、什么感受。',
+      '不记：派单指令与回归测试指令、commit hash 与文件名、技术方案与实现结论、',
+      '  待办与计划、AI 说的话或建议、系统通知、单独一句玩笑或表情动作。',
+      '一整天只有工程派单和调试往来时，正确答案是空数组，不要为了凑数把派单写成流水。',
+      '',
+      '同一场景里连续几分钟的往来合成一条，不要一条消息一条流水。',
+      'Only record what User herself stated in lines marked role=user.',
+      'Lines marked role=assistant are context only — never turn an AI reply, suggestion, or plan into an entry.',
+      'Never invent or infer beyond the text.',
+      'time must be the HH:MM of the message the entry came from.',
+      `Return at most ${maxEntries} entries, ordered by time. 宁可少记也不要凑数。`,
+      'Return exactly one JSON object: {"entries":[{"time":"HH:MM","text":"一句话流水"}]}',
+      'text 里出现的引号必须按 JSON 规则转义；不要输出 JSON 之外的任何字符。',
+    ].join('\n');
+    const user = JSON.stringify({
+      date,
+      weekday: weekday ?? null,
+      transcript,
+    });
+    // 首次跑 temperature 0 求稳定复现。重试必须换一次采样——同 prompt + 同 transcript
+    // + temperature 0 基本会原样再吐一遍同一份坏 JSON，那种「重试」等于没重试。
+    const retry = attempt > 1;
+    const response = await this.callJson(
+      this.flashModel,
+      system,
+      user,
+      this.pricing.flash,
+      retry ? 1800 : 1200,
+      { temperature: retry ? 0.3 : 0 },
+    );
+    return { ...response, result: parseDiaryEntries(response.result, { maxEntries }) };
+  }
+
   async ideaSummary({ topic, transcript }) {
     const system = [
       'You are closing a private multi-AI room discussion.',
@@ -259,10 +351,10 @@ export class DeepSeekClient {
     ].join('\n');
     const user = JSON.stringify({ topic, transcript: transcript.slice(0, 30_000) });
     const response = await this.callJson(
-      this.proModel,
+      this.flashModel,
       system,
       user,
-      this.pricing.pro,
+      this.pricing.flash,
       1000,
     );
     const summary = typeof response.result.summary === 'string'
@@ -295,11 +387,24 @@ export class HubClient {
     return body.contacts ?? [];
   }
 
-  async dispatch(contactId, content) {
+  async dispatch(contactId, content, {
+    origin = 'side',
+    hidden = false,
+    automation = null,
+    idempotencyKey = null,
+  } = {}) {
+    const key = String(idempotencyKey ?? '').trim();
     return jsonRequest(`${this.baseUrl}/api/contacts/${encodeURIComponent(contactId)}/messages`, {
       method: 'POST',
       headers: this.headers(),
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({
+        content,
+        origin,
+        automated: true,
+        hidden,
+        automation,
+        ...(key ? { idempotencyKey: key } : {}),
+      }),
     }, this.timeoutMs);
   }
 
@@ -336,8 +441,27 @@ export class HubClient {
     throw new Error(`room round timed out after ${timeoutMs}ms`);
   }
 
-  async messages(contactId, after, limit = 200) {
-    const query = new URLSearchParams({ after: String(after), limit: String(limit) });
+  /** 某个上海日历日的全部 DM 文本对话，供日记 rollup 使用。 */
+  async journalDay(date, limit = 400) {
+    const query = new URLSearchParams({ date: String(date), limit: String(limit) });
+    const body = await jsonRequest(
+      `${this.baseUrl}/api/journal/day?${query}`,
+      { headers: this.headers() },
+      this.timeoutMs,
+    );
+    return {
+      date: body.date ?? date,
+      truncated: body.truncated === true,
+      messages: body.messages ?? [],
+    };
+  }
+
+  async messages(contactId, after, limit = 200, origin = 'main') {
+    const query = new URLSearchParams({
+      after: String(after),
+      limit: String(limit),
+      origin: String(origin),
+    });
     const body = await jsonRequest(
       `${this.baseUrl}/api/contacts/${encodeURIComponent(contactId)}/messages?${query}`,
       { headers: this.headers() },
@@ -352,9 +476,28 @@ export class VaultClient {
     this.url = config.url ?? '';
     this.token = secretFromEnv(config.tokenEnv ?? 'VAULT_TOKEN');
     this.sourceTag = config.sourceTag ?? 'codex';
+    // Facts change rarely; default 1h. Config `vault.cacheMs` was declared but unused.
+    const rawCache = Number(config.cacheMs);
+    this.cacheMs = Number.isFinite(rawCache) && rawCache >= 0 ? rawCache : 3_600_000;
+    this.cache = new Map();
     this.sessionId = null;
     this.requestId = 0;
     this.connecting = null;
+  }
+
+  cached(key, loader) {
+    if (this.cacheMs <= 0) return loader();
+    const hit = this.cache.get(key);
+    const now = Date.now();
+    if (hit && now - hit.at < this.cacheMs) return Promise.resolve(hit.value);
+    return Promise.resolve(loader()).then((value) => {
+      this.cache.set(key, { at: Date.now(), value });
+      return value;
+    });
+  }
+
+  clearCache() {
+    this.cache.clear();
   }
 
   get enabled() {
@@ -459,6 +602,28 @@ export class VaultClient {
 
   async taskContext() {
     return this.call('get_task_context');
+  }
+
+  /**
+   * Structured facts snapshot. domain '' = all domains.
+   * Cached via vault.cacheMs (default 1h) — date-events only need occasional refresh.
+   */
+  async facts(domain = '') {
+    const key = `facts:${domain || '*'}`;
+    return this.cached(key, () => this.call('get_facts', { domain: domain || '' }));
+  }
+
+  async readFile(path) {
+    return this.call('read_file', { path });
+  }
+
+  /** 写一条日记流水。date/time 留空即今天/此刻；rollup 与 backfill 都显式传。 */
+  async logDaily({ content, date = '', time = '', source = this.sourceTag }) {
+    return this.call('log_daily', { content, date, time, source });
+  }
+
+  async writeDiary({ slug, title, content, tags, source = this.sourceTag }) {
+    return this.call('write_diary', { slug, title, content, tags, source });
   }
 
   async park(event, result, reason) {

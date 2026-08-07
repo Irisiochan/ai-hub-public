@@ -1,11 +1,13 @@
 import type { MemoryConfig } from '../config.js';
-import type { ContactRow } from '../db.js';
+import type { ContactRow, MessageOrigin } from '../db.js';
 import { maybeCapture } from '../memory/capture.js';
+import { maybeWriteBackTask } from '../memory/taskWriteback.js';
 import { contactConfig, openContact } from './configSchemas.js';
 import { Debouncer } from './debouncer.js';
 import { AgentRuntime, type AgentDeps, type RoomTurnOutcome } from './runtime.js';
 import { SessionRepo } from './sessionRepo.js';
 import { parseRoomTargets } from './roomTargets.js';
+import { dispatchCoordinationRoomHost } from './coordinationRoom.js';
 
 export { AgentRuntime } from './runtime.js';
 export type { RoomTurnOutcome } from './runtime.js';
@@ -24,6 +26,7 @@ export interface RoomDispatchOptions {
   targetOverride?: ContactRow[];
   capture?: boolean;
   reactionRounds?: number;
+  userMessageId?: number;
 }
 
 export interface TrackedRoomDispatch {
@@ -38,6 +41,12 @@ export class AgentManager {
   private readonly invalidations: Debouncer<string, InvalidationPayload>;
 
   constructor(private deps: AgentDeps) {
+    this.deps.dispatchCoordinationRoomHost = (input) => dispatchCoordinationRoomHost({
+      db: this.deps.db,
+      sse: this.deps.sse,
+      manager: this,
+      logger: this.deps.logger,
+    }, input);
     this.sessions = new SessionRepo(deps.db);
     this.invalidations = new Debouncer(
       300,
@@ -99,13 +108,18 @@ export class AgentManager {
   private roomChains = new Map<string, Promise<void>>();
 
   /** 用户在群里发言 → 顺序点名轮 + 接话轮（输出不互相触发，轮数硬上限）。
-   *  记忆捕捉在这里做且只做一次：只看用户原话，成员发言永不参与。 */
+   *  记忆捕捉在这里做且只做一次：只看 User 的原话，成员发言永不参与。 */
   imageRoomMembers(room: ContactRow): ContactRow[] {
     return this.roomMembers(room);
   }
 
-  dispatchRoomMessage(room: ContactRow, content: string, targetOverride?: ContactRow[]): string[] {
-    return this.dispatchRoomMessageTracked(room, content, { targetOverride }).targets;
+  dispatchRoomMessage(
+    room: ContactRow,
+    content: string,
+    targetOverride?: ContactRow[],
+    userMessageId?: number
+  ): string[] {
+    return this.dispatchRoomMessageTracked(room, content, { targetOverride, userMessageId }).targets;
   }
 
   dispatchRoomMessageTracked(
@@ -118,13 +132,27 @@ export class AgentManager {
     const roomCfg = contactConfig(room);
     const mem: MemoryConfig = { ...this.deps.config.memory, ...(roomCfg.memory ?? {}) };
     if (options.capture !== false && this.deps.vault && mem.capture) {
-      void maybeCapture(
-        this.deps.vault,
-        { id: room.id, name: room.name },
-        content,
-        '',
-        (message) => this.deps.logger?.info({ component: 'memory.capture', roomId: room.id }, message)
-      ).catch(() => {});
+      const contact = { id: room.id, name: room.name };
+      const log = (message: string) => this.deps.logger?.info(
+        { component: 'memory.capture', roomId: room.id },
+        message
+      );
+      const writeback = typeof options.userMessageId === 'number'
+        ? maybeWriteBackTask(
+            this.deps.db,
+            this.deps.vault,
+            contact,
+            options.userMessageId,
+            content,
+            log
+          )
+        : Promise.resolve({ status: 'ignored' as const });
+      void writeback.then((outcome) => {
+        if (!['ignored', 'rejected', 'ambiguous'].includes(outcome.status)) return;
+        return maybeCapture(this.deps.vault!, contact, content, '', log);
+      }).catch((error) => log(
+        `task writeback pipeline failed: ${error instanceof Error ? error.message : String(error)}`
+      ));
     }
     if (targets.length === 0) {
       return {
@@ -225,9 +253,9 @@ export class AgentManager {
    * Full status for a contact/room, including which room member is busy.
    * Clients must use `member` for room typing labels — never the room title.
    */
-  statusOf(contactId: string): { state: string; member?: string } {
+  statusOf(contactId: string): { state: string; member?: string; origin?: MessageOrigin } {
     const dm = this.runtimes.get(contactId);
-    if (dm) return { state: dm.state };
+    if (dm) return { state: dm.state, origin: dm.stateOrigin };
 
     let best: { state: string; member?: string; rank: number } = { state: 'idle', rank: 0 };
     const rankOf = (state: string): number => {
@@ -252,16 +280,16 @@ export class AgentManager {
    * Snapshot of non-idle runtimes for SSE reconnect. Room rows include member name
    * so a mid-turn resync does not fall back to the room title.
    */
-  activeStatuses(): Array<{ contactId: string; state: string; member?: string }> {
+  activeStatuses(): Array<{ contactId: string; state: string; member?: string; origin?: MessageOrigin }> {
     const roomIds = new Set<string>();
-    const out: Array<{ contactId: string; state: string; member?: string }> = [];
+    const out: Array<{ contactId: string; state: string; member?: string; origin?: MessageOrigin }> = [];
     for (const [key, rt] of this.runtimes) {
       if (rt.state === 'idle') continue;
       const sep = key.indexOf(':');
       if (sep > 0) {
         roomIds.add(key.slice(0, sep));
       } else {
-        out.push({ contactId: key, state: rt.state });
+        out.push({ contactId: key, state: rt.state, origin: rt.stateOrigin });
       }
     }
     for (const roomId of roomIds) {

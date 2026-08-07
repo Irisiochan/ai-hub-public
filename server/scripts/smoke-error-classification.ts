@@ -34,13 +34,13 @@ const port = await new Promise<number>((resolve) =>
 const db = openDb(dbPath);
 try {
   db.prepare(`INSERT INTO contacts (id, name, backend, kind, config) VALUES ('room', 'AI群', 'room', 'room', '{}')`).run();
-  db.prepare(`INSERT INTO contacts (id, name, backend, kind, config) VALUES ('member-a', 'Member A', 'api', 'dm', '{}')`).run();
+  db.prepare(`INSERT INTO contacts (id, name, backend, kind, config) VALUES ('jingwan', '鲸晚', 'api', 'dm', '{}')`).run();
   const add = db.prepare(
     `INSERT INTO messages (contact_id, sender, role, kind, content, status) VALUES ('room', ?, ?, 'text', ?, 'done')`
   );
-  add.run('user', 'user', '@Member A 看一下');
-  add.run('member-a', 'assistant', '   ');
-  add.run('user', 'user', '@Member A 再看一下');
+  add.run('user', 'user', '@鲸晚 看一下');
+  add.run('jingwan', 'assistant', '   ');
+  add.run('user', 'user', '@鲸晚 再看一下');
 
   const backend = new DirectApiBackend({
     provider: 'anthropic',
@@ -57,9 +57,9 @@ try {
     db,
     uploadsDir,
     contactId: 'room',
-    memberId: 'member-a',
+    memberId: 'jingwan',
     log: () => {},
-    roomMode: { selfId: 'member-a', nameOf: (sender) => sender === 'user' ? 'User' : 'Member A' },
+    roomMode: { selfId: 'jingwan', nameOf: (sender) => sender === 'user' ? 'User' : '鲸晚' },
   });
   await backend.start(null);
   const events = [];

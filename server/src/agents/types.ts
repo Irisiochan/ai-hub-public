@@ -15,6 +15,8 @@ export interface TokenUsage {
    */
   input: number;
   output: number;
+  /** Provider terminal reason for the final upstream round. */
+  finishReason?: string;
   cacheCreation?: number;
   cacheRead?: number;
   /**

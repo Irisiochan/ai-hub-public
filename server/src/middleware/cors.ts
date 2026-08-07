@@ -11,6 +11,7 @@ export function localCors(originsRaw = process.env.HUB_CORS_ORIGINS): RequestHan
     const origin = req.headers.origin;
     if (typeof origin === 'string' && origins.has(origin)) {
       res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Vary', 'Origin');
       if (req.method === 'OPTIONS') {
         res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');

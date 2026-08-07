@@ -21,15 +21,30 @@ export interface GrokCliBackendOpts {
    *  Chat-only contacts should deny search_replace + run_terminal_command
    *  so the model never triggers a headless confirmation wall. */
   disallowedTools?: string[];
+  /** Auto-approve whatever survived `disallowedTools`（--always-approve）。
+   *  headless 没有人能点确认：任何落到 prompt policy 的调用都会让整轮
+   *  stop_reason=cancelled。`--allow MCPTool(...)` 只能覆盖 MCP 调用本身，
+   *  grok 内置的 search_tool / use_tool 既不在只读免提示清单里，也没有可写的
+   *  规则名（规则只认 Bash/Read/Edit/Grep/MCPTool/WebFetch/WebSearch），
+   *  所以「先查 schema 再调 MCP」这个正确动作反而必然撞墙。 */
+  alwaysApprove?: boolean;
   /** 人设 + 记忆前缀，经 `--rules` 追加进 system prompt（每轮进程都带，resume 也不丢人设）。 */
   preamble?: string;
-  /** Per-process environment overrides for managed project integrations. */
-  env?: Record<string, string>;
   turnTimeoutMs: number;
   log: (msg: string) => void;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** 工具入参/出参只留一小段做展示，别把整份 MCP 结果灌进事件流。 */
+function summarize(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  try {
+    return (typeof value === 'string' ? value : JSON.stringify(value)).slice(0, 200);
+  } catch {
+    return '';
+  }
+}
 
 function imageMimeType(file: string): string {
   const ext = path.extname(file).toLowerCase();
@@ -117,6 +132,9 @@ export class GrokCliBackend implements AgentBackend {
   private stopReason: string | null = null;
   private usage: TokenUsage | undefined;
   private stderrTail: string[] = [];
+  private toolNames = new Map<string, string>(); // toolCallId → toolName
+  /** 还没收到终态更新的工具调用；一轮被 cancel 时它就是卡住的那个。 */
+  private pendingTool: string | null = null;
 
   constructor(private opts: GrokCliBackendOpts) {}
 
@@ -198,6 +216,8 @@ export class GrokCliBackend implements AgentBackend {
     this.usage = undefined;
     this.interrupted = false;
     this.stderrTail = [];
+    this.toolNames.clear();
+    this.pendingTool = null;
 
     const args = [this.sessionFlag, this.sessionId!];
     if (this.turnImagePaths.length > 0) {
@@ -210,6 +230,9 @@ export class GrokCliBackend implements AgentBackend {
     for (const rule of this.opts.allowRules ?? []) args.push('--allow', rule);
     const denied = this.opts.disallowedTools ?? [];
     if (denied.length) args.push('--disallowed-tools', denied.join(','));
+    // --disallowed-tools 是"整个摘掉"，always-approve 变不出被摘掉的工具，
+    // 所以两者叠加后可自动批准的面只剩只读工具与已声明的 MCP server。
+    if (this.opts.alwaysApprove) args.push('--always-approve');
     // 实测 headless 下 --rules 会进 system prompt；每轮都带，resume 轮人设/记忆不掉
     if (this.opts.preamble) args.push('--rules', this.opts.preamble);
 
@@ -221,7 +244,7 @@ export class GrokCliBackend implements AgentBackend {
       command,
       args: finalArgs,
       cwd: this.opts.cwd,
-      env: { ...process.env, ...this.opts.env },
+      env: { ...process.env },
     });
     this.proc = proc;
 
@@ -267,6 +290,30 @@ export class GrokCliBackend implements AgentBackend {
           this.turn.push({ type: 'delta', text: line.data });
         }
         return;
+      // tool_call / tool_call_update 是 0.2.10x 之后才有的行；旧版本没有，
+      // 缺了只是少了工具可见性，不影响 thought/text/end 三种主线。
+      case 'tool_call': {
+        const name = typeof line.toolName === 'string' && line.toolName
+          ? line.toolName
+          : typeof line.title === 'string' && line.title ? line.title : 'tool';
+        if (typeof line.toolCallId === 'string') this.toolNames.set(line.toolCallId, name);
+        this.pendingTool = name;
+        this.turn.push({ type: 'tool_use', name, inputSummary: summarize(line.rawInput) });
+        return;
+      }
+      case 'tool_call_update': {
+        const status = typeof line.status === 'string' ? line.status : '';
+        if (status === 'in_progress' || status === 'pending') return;
+        const name = this.toolNames.get(line.toolCallId) ?? this.pendingTool ?? 'tool';
+        this.pendingTool = null;
+        this.turn.push({
+          type: 'tool_result',
+          name,
+          ok: status === 'completed',
+          summary: summarize(line.rawOutput) || status,
+        });
+        return;
+      }
       case 'end': {
         this.sawEnd = true;
         const stopReason = line.stopReason ?? line.stop_reason;
@@ -317,10 +364,13 @@ export class GrokCliBackend implements AgentBackend {
         (this.stopReason ?? '').toLowerCase()
       );
       if (abnormalStop) {
+        // 卡住的那个工具名是排查起点：MCP 调用被 --allow 覆盖，而 search_tool /
+        // use_tool 这类内置元工具只能靠 --always-approve 放行。
+        const stuck = this.pendingTool ? `卡在工具 ${this.pendingTool}。` : '';
         this.turn.push({
           type: 'error',
           message:
-            `Grok 回合未完成（stop_reason=${this.stopReason}）。` +
+            `Grok 回合未完成（stop_reason=${this.stopReason}）。${stuck}` +
             '通常是 headless 模式下工具调用需要确认但没有获批；上方文字只是半成品，不作为最终结论。',
           fatal: false,
         });

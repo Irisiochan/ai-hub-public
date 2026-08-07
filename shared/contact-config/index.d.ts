@@ -31,6 +31,17 @@ export interface DelegationConfig {
   [key: string]: unknown;
 }
 
+export interface RoutingConfig {
+  enabled: boolean;
+  recipientKey?: string;
+  categories: string[];
+  minPriority: 1 | 2 | 3;
+  dailyLimit: number;
+  cooldownMinutes: number;
+  fallback: boolean;
+  [key: string]: unknown;
+}
+
 export interface ContactConfig {
   cliPath?: string;
   cwd?: string;
@@ -39,7 +50,10 @@ export interface ContactConfig {
   effort: string;
   memory: ContactMemoryConfig;
   delegation: DelegationConfig;
+  routing: RoutingConfig;
   projectAccess: ProjectAccessConfig;
+  affect: 'on' | 'off';
+  affectBaseline: { valence: number; arousal: number };
   maxSessionInputTokens: number;
   roomDeliveryMaxChars: number;
   roomDeliveryMaxMessages: number;
@@ -74,6 +88,7 @@ export interface ContactConfig {
 export const MemoryConfigSchema: z.ZodType<ContactMemoryConfig>;
 export const ProjectAccessSchema: z.ZodType<ProjectAccessConfig>;
 export const DelegationConfigSchema: z.ZodType<DelegationConfig>;
+export const RoutingConfigSchema: z.ZodType<RoutingConfig>;
 export const ClaudeContactConfigSchema: z.ZodType<ContactConfig>;
 export const CodexContactConfigSchema: z.ZodType<ContactConfig>;
 export const GrokContactConfigSchema: z.ZodType<ContactConfig>;

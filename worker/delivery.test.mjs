@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   classifyDelivery,
+  deliveryCompletesJob,
   DEFAULT_RECONCILE_GRACE_MS,
   extractDeliveryDeclaration,
   reconciliationDecision,
@@ -132,6 +133,58 @@ test('delivery declarations are extracted from raw objects and final message JSO
   assert.equal(
     extractDeliveryDeclaration('{"delivery":{"committed":false,"pushed":true}}'),
     null
+  );
+});
+
+test('delivery declarations survive fenced multiline, prefixes, and provider content arrays', () => {
+  const pretty = [
+    '交付证据如下：',
+    '```json',
+    '{',
+    '  "delivery": {',
+    '    "committed": true,',
+    '    "pushed": true,',
+    '    "stage": "closed_loop"',
+    '  }',
+    '}',
+    '```',
+  ].join('\n');
+  assert.equal(extractDeliveryDeclaration(pretty)?.stage, 'closed_loop');
+  assert.deepEqual(
+    extractDeliveryDeclaration({ content: [{ type: 'text', text: pretty }] }),
+    { committed: true, pushed: true, stage: 'closed_loop' },
+  );
+});
+
+test('a valid delivery declaration is retained when runner cleanup exits nonzero', () => {
+  const delivery = classifyDelivery(clean('a'), clean('b', 0), 7, {
+    declaration: { committed: true, pushed: true, stage: 'delivered_waiting_deploy' },
+  });
+  assert.equal(delivery.state, 'delivered');
+  assert.equal(delivery.source, 'cli');
+  assert.equal(delivery.runnerExitCode, 7);
+  assert.equal(deliveryCompletesJob(delivery, 7), true);
+  assert.equal(deliveryCompletesJob({ state: 'failed_clean', source: 'git' }, 7), false);
+});
+
+test('delivery declarations preserve the human delivery milestone evidence', () => {
+  assert.deepEqual(
+    extractDeliveryDeclaration({
+      delivery: {
+        committed: true,
+        pushed: true,
+        stage: 'online_waiting_validation',
+        summary: '已上线，等待真实入口验收。',
+        next_owner: 'Codex',
+      },
+    }),
+    {
+      committed: true,
+      pushed: true,
+      stage: 'online_waiting_validation',
+      summary: '已上线，等待真实入口验收。',
+      nextOwner: 'Codex',
+    },
   );
 });
 

@@ -9,6 +9,8 @@ import {
   normalizeWorkspace,
   workspaceAllowed,
 } from '../workers/jobStore.js';
+import { publicJob } from '../workers/deliveryStatus.js';
+import type { HubLogger } from '../logger.js';
 
 // jobs.deleted = 1 is presentation soft-delete; claim/list hide those rows.
 
@@ -26,12 +28,15 @@ const WORKER_PROTOCOL_VERSION = 2;
 const DELIVERY_CONTRACT = [
   'Delivery is not complete merely because the agent process exits successfully.',
   'For write tasks, run the requested validation and commit/push only when it passes.',
-  'When validation passes you are pre-authorized to commit, push, deploy, restart, and run post-deploy verification in one pass. Do not stop to ask for confirmation, and do not file a deploy-tail task instead of deploying.',
+  'When the job has SSH permission and validation passes, the dispatch pre-authorizes commit, push, deploy, target-service restart, and post-deploy verification in one pass.',
+  'Do not file a deploy-tail instead of performing an in-scope deployment that this job can safely complete.',
   'Still require explicit owner approval for: skipped or failing validation, irreversible data actions (data deletion, destructive migrations, production rollback, history rewrite, force push), creating or switching branches, credential or access expansion, product-scope decisions, and outbound messages to third parties.',
   'Never restart the process hosting this job (the PC worker service or the ai-hub gateway this job depends on) before the outcome is reported; file a deploy-tail for that instead.',
-  'If your host has its own safety policy that asks you to confirm an exact push or deploy target, that is not a failure and not a blocker: list the full target (repo URL, branch, deploy host) in one request, and finish the chain once confirmed. Do not report the task as blocked or file a tail for it.',
+  'If SSH permission is absent but remote deployment is required, file one deploy-tail with the exact host, checkout, service, and verification steps.',
+  'If your host safety policy asks for an exact push or deploy target, list the full repo URL, branch, deploy host, and service in one request and continue after confirmation. If the job must end while confirmation is pending, file one deploy-tail marked awaiting_exact_target_approval; do not misreport it as a code or validation failure.',
   'If validation, commit, push, or deploy is blocked, leave a precise handoff: changed files, checks passed/failed, blocker, and next step.',
-  'For a write task, finish with one standalone JSON line: {"delivery":{"committed":true|false,"pushed":true|false}}.',
+  'For a write task, finish with a machine-readable JSON object: {"delivery":{"committed":true|false,"pushed":true|false,"stage":"delivered_waiting_deploy|online_waiting_validation|closed_loop|user_decision","summary":"one human sentence","nextOwner":"unique owner"}}. It may be a standalone line or a fenced/multiline JSON block.',
+  'Use stage closed_loop only when every required validation including production post-deploy evidence is complete; otherwise choose the exact earlier stage. Use user_decision only for a real authorization or product choice and include blocker when useful.',
   'Use false/false only when requested changes remain uncommitted; omit this line for read-only tasks.',
 ].join(' ');
 
@@ -72,15 +77,6 @@ function publicWorker(row: WorkerRow) {
   };
 }
 
-function publicJob(row: JobRow) {
-  return {
-    ...row,
-    permissions: json(row.permissions, {}),
-    options: json(row.options ?? '{}', {}),
-    delivery_meta: row.delivery_meta ? json(row.delivery_meta, {}) : null,
-  };
-}
-
 function workerFrom(req: Request, db: Db): WorkerRow | null {
   const auth = req.header('authorization') ?? '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
@@ -94,8 +90,15 @@ function workerFrom(req: Request, db: Db): WorkerRow | null {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected) ? worker : null;
 }
 
-export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
+export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubLogger): Router {
   const r = Router();
+  const logAcceptance = (workerId: string, from: number, to: number, actor: string, reason: string): void => {
+    if (from === to) return;
+    logger?.info(
+      { component: 'workers', workerId, actor, from: from === 1, to: to === 1 },
+      `worker ${workerId} accepting_jobs ${from === 1 ? 'on' : 'off'} → ${to === 1 ? 'on' : 'off'} (${reason})`
+    );
+  };
   const activeRows = (workerId: string): JobRow[] => db.prepare(
     `SELECT * FROM jobs
      WHERE worker_id = ? AND status IN ('claimed','running','recovering','pause_requested','cancel_requested')`
@@ -121,11 +124,15 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
     if (!id || !name) return res.status(400).json({ error: 'worker id/name required' });
     const token = `${id}.${crypto.randomBytes(32).toString('base64url')}`;
+    const prior = db.prepare('SELECT accepting_jobs FROM workers WHERE id = ?').get(id) as
+      | Pick<WorkerRow, 'accepting_jobs'>
+      | undefined;
     db.prepare(
       `INSERT INTO workers (id, name, token_hash) VALUES (?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET name = excluded.name, token_hash = excluded.token_hash,
        status = 'offline', accepting_jobs = 1, boot_id = NULL, last_seen_at = NULL`
     ).run(id, name, hash(token));
+    if (prior) logAcceptance(id, prior.accepting_jobs, 1, 'User', 're-pair reset');
     const worker = db.prepare('SELECT * FROM workers WHERE id = ?').get(id) as WorkerRow;
     res.status(201).json({ worker: publicWorker(worker), token });
   });
@@ -155,6 +162,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     const enabled = req.body.enabled === true;
     db.prepare('UPDATE workers SET accepting_jobs = ? WHERE id = ?')
       .run(enabled ? 1 : 0, worker.id);
+    logAcceptance(worker.id, worker.accepting_jobs, enabled ? 1 : 0, 'User', 'panel control');
     updateWorkerRuntimeStatus(worker.id, false);
     const updated = db.prepare('SELECT * FROM workers WHERE id = ?').get(worker.id) as WorkerRow;
     const payload = publicWorker(updated);
@@ -187,7 +195,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       req.body?.force === true ||
       req.query.force === '1' ||
       req.query.force === 'true';
-    const outcome = jobs.softDelete(req.params.id, 'user', { force });
+    const outcome = jobs.softDelete(req.params.id, 'User', { force });
     if ('error' in outcome) {
       return res.status(outcome.code).json({ error: outcome.error });
     }
@@ -198,7 +206,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     const runner = ['claude', 'codex', 'grok'].includes(req.body?.runner) ? req.body.runner : '';
     if (!runner) return res.status(400).json({ error: 'runner/workspace/prompt required' });
     const created = jobs.create({
-      requestedBy: typeof req.body?.requestedBy === 'string' ? req.body.requestedBy : 'user',
+      requestedBy: typeof req.body?.requestedBy === 'string' ? req.body.requestedBy : 'User',
       runner,
       workspace: typeof req.body?.workspace === 'string' ? req.body.workspace : '',
       prompt: typeof req.body?.prompt === 'string' ? req.body.prompt : '',
@@ -214,6 +222,14 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
         shell: req.body?.permissions?.shell === true,
         ssh: req.body?.permissions?.ssh === true,
       },
+      originContactId:
+        typeof req.body?.originContactId === 'string' && req.body.originContactId
+          ? req.body.originContactId
+          : null,
+      originAnchorId:
+        Number.isSafeInteger(req.body?.originAnchorId) && req.body.originAnchorId > 0
+          ? req.body.originAnchorId
+          : null,
     });
     if ('error' in created) {
       const code = created.error === 'duplicate idempotency key' ? 409 : 400;
@@ -227,11 +243,37 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     if (!existing || existing.deleted === 1) {
       return res.status(404).json({ error: 'job not found' });
     }
-    const outcome = jobs.action(req.params.id, req.body?.action, 'user');
+    const outcome = jobs.action(req.params.id, req.body?.action, 'User');
     if ('error' in outcome) {
       return res.status(outcome.error === 'job not found' ? 404 : 409).json({ error: outcome.error });
     }
     res.json({ ok: true, status: outcome.status });
+  });
+
+  r.post('/jobs/:id/resolve-out-of-band', (req, res) => {
+    const job = jobs.get(req.params.id);
+    if (!job || job.deleted === 1) return res.status(404).json({ error: 'job not found' });
+    const outcome = jobs.resolveBlockedOutOfBand(job, 'User', { mode: 'manual' });
+    if ('error' in outcome) return res.status(409).json({ error: outcome.error });
+    res.json({ ok: true, job: publicJob(outcome.job) });
+  });
+
+  r.patch('/jobs/:id/delivery', (req, res) => {
+    const existing = jobs.get(req.params.id);
+    if (!existing || existing.deleted === 1) {
+      return res.status(404).json({ error: 'job not found' });
+    }
+    const stage = typeof req.body?.stage === 'string' ? req.body.stage : '';
+    const outcome = jobs.updateDelivery(existing.id, 'User', {
+      stage,
+      summary: typeof req.body?.summary === 'string' ? req.body.summary : undefined,
+      nextOwner: typeof req.body?.nextOwner === 'string' ? req.body.nextOwner : undefined,
+      blocker: typeof req.body?.blocker === 'string' ? req.body.blocker : undefined,
+    });
+    if ('error' in outcome) {
+      return res.status(outcome.error === 'job not found' ? 404 : 409).json({ error: outcome.error });
+    }
+    res.json({ ok: true, job: publicJob(outcome.job) });
   });
 
   r.post('/worker/connect', (req, res) => {
@@ -239,14 +281,22 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
     if (!worker) return res.status(401).json({ error: 'invalid worker token' });
     const caps = req.body?.capabilities && typeof req.body.capabilities === 'object' ? req.body.capabilities : {};
     const bootId = typeof req.body?.bootId === 'string' ? req.body.bootId.trim().slice(0, 200) : '';
-    // A manual pause survives reconnects and child-process crashes in the same
-    // Windows boot. A genuinely new boot restores the normal auto-start state.
-    const newBoot = !!bootId && bootId !== worker.boot_id;
-    const acceptingJobs = newBoot ? 1 : worker.accepting_jobs;
+    // A manual pause is durable user intent: reconnects, child restarts, and even
+    // a new Windows boot must NOT silently resume claiming. Only the panel's
+    // explicit resume (/workers/:id/control) turns acceptance back on.
+    // boot_id is kept for diagnostics only: a bootId that keeps flipping between
+    // two values means two worker processes are alive against one worker row
+    // (the 2026-08-06 pause-doesn't-stick incident).
+    if (!!bootId && !!worker.boot_id && bootId !== worker.boot_id) {
+      logger?.info(
+        { component: 'workers', workerId: worker.id, from: worker.boot_id, to: bootId },
+        `worker ${worker.id} bootId changed; if this repeats every few seconds, two worker processes are running`
+      );
+    }
     db.prepare(
-      `UPDATE workers SET capabilities = ?, accepting_jobs = ?,
+      `UPDATE workers SET capabilities = ?,
        boot_id = CASE WHEN ? <> '' THEN ? ELSE boot_id END, last_seen_at = datetime('now') WHERE id = ?`
-    ).run(JSON.stringify(caps), acceptingJobs, bootId, bootId, worker.id);
+    ).run(JSON.stringify(caps), bootId, bootId, worker.id);
     updateWorkerRuntimeStatus(worker.id);
     const updated = db.prepare('SELECT * FROM workers WHERE id = ?').get(worker.id) as WorkerRow;
     sse.broadcast('worker', publicWorker(updated));
@@ -353,6 +403,11 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       return res.status(400).json({ error: 'clean synchronized git evidence required' });
     }
     const previous = json<Record<string, unknown>>(job.delivery_meta ?? '', {});
+    const previousDeclared = previous.declared && typeof previous.declared === 'object'
+      && !Array.isArray(previous.declared)
+      ? previous.declared as Record<string, unknown>
+      : {};
+    const permissions = json<{ write?: boolean }>(job.permissions, {});
     const blockedHead = typeof previous.head === 'string' ? previous.head : '';
     if (
       !/^[0-9a-f]{7,64}$/i.test(blockedHead)
@@ -369,6 +424,14 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
         head,
         serverBlockedForMs,
         mode: staleFallback ? 'clean-timeout-fallback' : 'git-history',
+      },
+      declared: {
+        ...previousDeclared,
+        stage: permissions.write === false ? 'closed_loop' : 'delivered_waiting_deploy',
+        summary: permissions.write === false
+          ? '只读任务已完成，结论与证据已经交付。'
+          : '外部续接已完成提交和推送，尚未收到部署完成证据。',
+        nextOwner: permissions.write === false ? '无需后续动作' : '部署负责人',
       },
     }).slice(0, 100_000);
     const outcome = jobs.reconcileBlocked(job, worker.id, deliveryMeta, head);
@@ -488,9 +551,10 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore): Router {
       ? String(delivery.state)
       : null;
     const deliveryMeta = delivery ? JSON.stringify(delivery).slice(0, 100_000) : null;
-    const status = jobs.complete(job, req.body?.status, result, error, deliveryState, deliveryMeta);
+    const outcome = jobs.complete(job, req.body?.status, result, error, deliveryState, deliveryMeta);
+    if ('error' in outcome) return res.status(409).json({ error: outcome.error });
     updateWorkerRuntimeStatus(worker.id);
-    res.json({ ok: true, status });
+    res.json({ ok: true, status: outcome.status });
   });
 
   return r;

@@ -33,6 +33,16 @@ export const DelegationConfigSchema = z.object({
   maxOpenJobs: z.coerce.number().int().min(1).max(10).default(3),
 }).passthrough().default({});
 
+export const RoutingConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  recipientKey: trimmed(200).optional(),
+  categories: z.array(trimmed(80).min(1)).max(100).default([]),
+  minPriority: z.coerce.number().int().min(1).max(3).default(1),
+  dailyLimit: z.coerce.number().int().min(1).max(1000).default(10),
+  cooldownMinutes: z.coerce.number().int().min(0).max(24 * 60).default(30),
+  fallback: z.boolean().default(false),
+}).passthrough().default({});
+
 const modelOption = z.union([
   trimmed(200).min(1),
   z.object({ id: trimmed(200).min(1), label: trimmed(300).optional() }).passthrough(),
@@ -46,7 +56,13 @@ const commonShape = {
   effort: z.string().trim().max(40).default(''),
   memory: MemoryConfigSchema,
   delegation: DelegationConfigSchema,
+  routing: RoutingConfigSchema,
   projectAccess: ProjectAccessSchema,
+  affect: z.enum(['on', 'off']).default('off'),
+  affectBaseline: z.object({
+    valence: z.coerce.number().min(-0.6).max(1).default(0),
+    arousal: z.coerce.number().min(0).max(1).default(0.15),
+  }).default({}),
   maxSessionInputTokens: positiveInt(120_000, 10_000_000),
   roomDeliveryMaxChars: positiveInt(12_000, 200_000),
   roomDeliveryMaxMessages: positiveInt(40, 200),
@@ -87,7 +103,7 @@ export const ApiContactConfigSchema = z.object({
   historySummaryStrategy: z.enum(['extractive', 'off', 'external']).default('extractive'),
   memoryPreambleMode: z.enum(['full', 'compact', 'off']).default('compact'),
   promptCache: z.enum(['auto', 'off']).default('auto'),
-  maxTokens: positiveInt(4096, 1_000_000),
+  maxTokens: positiveInt(8192, 1_000_000),
   contextWindowTokens: z.coerce.number().int().min(0).max(10_000_000).default(128_000),
 }).passthrough();
 
@@ -96,6 +112,7 @@ export const RoomContactConfigSchema = z.object({
   reactionRounds: z.coerce.number().int().min(0).max(3).default(1),
   respondAllByDefault: z.boolean().default(false),
   memory: MemoryConfigSchema,
+  routing: RoutingConfigSchema,
 }).passthrough();
 
 export const ContactConfigSchemas = {

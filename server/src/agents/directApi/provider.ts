@@ -50,6 +50,7 @@ export interface ProviderToolResult extends ProviderToolCall {
 export interface ProviderRoundUsage {
   input: number;
   output: number;
+  finishReason?: string;
   cacheCreation?: number;
   cacheRead?: number;
 }
@@ -60,6 +61,8 @@ export interface ProviderRoundResult {
   calls: ProviderToolCall[];
   response: unknown;
   usage: ProviderRoundUsage;
+  /** Visible natural-language text produced by this provider round. */
+  text: string;
 }
 
 export type ProviderStreamEvent =

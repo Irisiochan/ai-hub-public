@@ -3,7 +3,6 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { Router } from 'express';
 import { z } from 'zod';
 import { buildDelegateTools, type DelegationCfg } from '../agents/gatewayTools.js';
-import { bearerMatches } from '../auth.js';
 import { contactConfig } from '../agents/configSchemas.js';
 import type { ContactRow, Db } from '../db.js';
 import type { JobStore } from '../workers/jobStore.js';
@@ -13,9 +12,9 @@ import type { JobStore } from '../workers/jobStore.js';
  * delegate tools to CLI backends. Claude CLI contacts get it merged into
  * their --mcp-config by the manager; Codex app-server gets per-process
  * mcp_servers.hub overrides, so no global config.toml edit is needed.
- * Stateless streamable-http: one server+transport per POST. The contact id in
- * the URL selects delegation policy; an independent HUB_MCP_TOKEN authenticates
- * the internal CLI client before that identity is accepted.
+ * Stateless streamable-http: one server+transport per POST, identity comes
+ * from the URL (gateway binds the tailnet, same trust level as the rest of
+ * the HTTP API).
  */
 
 const INPUT_SHAPES = {
@@ -23,12 +22,16 @@ const INPUT_SHAPES = {
     runner: z.enum(['claude', 'codex', 'grok']).describe('本机执行方'),
     workspace: z.string().describe('PC 上的项目路径，必须在白名单内'),
     prompt: z.string().describe('自包含的任务描述（目标/约束/验收标准）'),
-    shell: z.boolean().optional().describe('是否允许执行 shell 命令（codex 必须 true）'),
+    write: z.boolean().optional().describe('是否允许修改文件；默认 true，只读任务必须显式 false'),
+    shell: z.boolean().optional().describe(
+      '是否允许执行 shell 命令。codex 自动为 true；claude 不填就完全拿不到 Bash，只要 prompt 里含构建、测试、git 或部署任何一项就必须显式传 true'
+    ),
+    ssh: z.boolean().optional().describe('是否允许 SSH/VPS 操作；联系人 delegation.allowSsh 也必须开启'),
     priority: z.number().optional().describe('-10~10，默认 0'),
     model: z.string().optional().describe(
-      '覆盖 Worker 默认模型。Claude 固定版本写 Opus 4.6 或 claude-opus-4-6；指定版本时禁止用 opus/sonnet 泛化。Codex 如 gpt-5.6-sol'
+      '覆盖默认模型（不填时 claude=claude-opus-5、codex=gpt-5.6-sol）。Claude 固定版本写 Opus 4.6 或 claude-opus-4-6；指定版本时禁止用 opus/sonnet 泛化。Codex 如 gpt-5.6-sol'
     ),
-    effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional().describe('推理强度'),
+    effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional().describe('推理强度；不填时 claude/codex 默认 high'),
   },
   worker_job_status: {
     job_id: z.string().describe('delegate_to_worker 返回的任务 id'),
@@ -36,21 +39,23 @@ const INPUT_SHAPES = {
   worker_job_cancel: {
     job_id: z.string().describe('要取消的任务 id'),
   },
+  worker_job_update_delivery: {
+    job_id: z.string().describe('delegate_to_worker 返回的任务 id'),
+    stage: z.enum([
+      'delivered_waiting_deploy',
+      'online_waiting_validation',
+      'closed_loop',
+      'user_decision',
+      'rework_required',
+    ]).describe('新的交付结论'),
+    summary: z.string().optional().describe('给人看的交付结论'),
+    next_owner: z.string().optional().describe('下一步唯一负责人'),
+    blocker: z.string().optional().describe('可选阻塞原因'),
+  },
 } as Record<string, z.ZodRawShape>;
 
-export function hubMcpRouter(
-  db: Db,
-  jobs: JobStore,
-  internalToken: string | undefined = process.env.HUB_MCP_TOKEN
-): Router {
+export function hubMcpRouter(db: Db, jobs: JobStore): Router {
   const r = Router();
-
-  r.use('/hub-mcp/:contactId', (req, res, next) => {
-    const expected = internalToken?.trim() ?? '';
-    if (!expected) return res.status(503).json({ error: 'hub MCP authentication is not configured' });
-    if (!bearerMatches(req, expected)) return res.status(401).json({ error: 'invalid hub MCP token' });
-    next();
-  });
 
   r.post('/hub-mcp/:contactId', async (req, res) => {
     const contact = db

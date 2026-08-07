@@ -17,20 +17,58 @@ export interface RepoPublishStatus {
   error?: string;
 }
 
+function readSnapshot(
+  id: RepoPublishStatus['id'],
+  name: string,
+  snapshotPath: string | null
+): RepoPublishStatus | null {
+  if (!snapshotPath || !fs.existsSync(snapshotPath)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(snapshotPath, 'utf8')) as Partial<RepoPublishStatus>;
+    if (
+      parsed.available !== true
+      || typeof parsed.branch !== 'string'
+      || typeof parsed.currentCommit !== 'string'
+      || typeof parsed.remoteCommit !== 'string'
+      || typeof parsed.matchesRemote !== 'boolean'
+      || typeof parsed.dirty !== 'boolean'
+    ) return null;
+    return {
+      id,
+      name,
+      available: true,
+      branch: parsed.branch,
+      currentCommit: parsed.currentCommit,
+      remoteCommit: parsed.remoteCommit,
+      matchesRemote: parsed.matchesRemote,
+      dirty: parsed.dirty,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function git(repoPath: string, args: string[], timeout = 5_000): Promise<string> {
-  const { stdout } = await execFileAsync('git', ['-C', repoPath, ...args], {
-    encoding: 'utf8',
-    timeout,
-    windowsHide: true,
-  });
+  const { stdout } = await execFileAsync(
+    'git',
+    ['-c', `safe.directory=${path.resolve(repoPath)}`, '-C', repoPath, ...args],
+    {
+      encoding: 'utf8',
+      timeout,
+      windowsHide: true,
+    }
+  );
   return stdout.trim();
 }
 
 export async function inspectRepo(
   id: RepoPublishStatus['id'],
   name: string,
-  repoPath: string | null
+  repoPath: string | null,
+  snapshotPath: string | null = null
 ): Promise<RepoPublishStatus> {
+  const snapshot = readSnapshot(id, name, snapshotPath);
+  if (snapshot) return snapshot;
   if (!repoPath) return { id, name, available: false, error: '未配置仓库路径' };
   if (!fs.existsSync(path.join(repoPath, '.git'))) {
     return { id, name, available: false, error: '仓库路径不可用' };

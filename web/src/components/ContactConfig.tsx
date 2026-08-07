@@ -5,6 +5,7 @@ import ApiFields from './contact-config/ApiFields';
 import CliFields from './contact-config/CliFields';
 import DelegationFields from './contact-config/DelegationFields';
 import RoomFields from './contact-config/RoomFields';
+import { useConfirm } from './ConfirmDialog';
 
 interface Props {
   contact: Contact | null; // null = create new
@@ -12,7 +13,21 @@ interface Props {
   onClose(): void;
 }
 
+type TabId = 'basic' | 'api' | 'room' | 'history' | 'deleg' | 'json';
+
+const TAB_DEFS: Record<TabId, { label: string; title: string; hint: string }> = {
+  basic: { label: '基本 · 项目', title: '基本 · 项目访问', hint: '身份、workspace、会话上限' },
+  api: { label: '基本 · 接入', title: '基本 · 接入', hint: '身份、provider、key、模型' },
+  room: { label: '成员与规则', title: '成员与规则', hint: '拉人、发言顺序、接话轮数' },
+  history: { label: '历史与记忆', title: '历史与记忆', hint: '记忆注入、历史预算、摘要' },
+  deleg: { label: '派单到 PC', title: '派单到 PC', hint: 'runner / workspace 白名单与限额' },
+  json: { label: '高级 JSON', title: '高级 JSON', hint: '完整 config，保存前做 schema 校验' },
+};
+
+const SWATCHES = ['#9d8cf5', '#6fd39a', '#5fc2c9', '#e0a05e', '#e56a6a', '#8b8c99'];
+
 export default function ContactConfig({ contact, contacts, onClose }: Props) {
+  const confirm = useConfirm();
   const creating = contact === null;
   const cfg = (contact?.config ?? {}) as Record<string, any>;
   const mem = (cfg.memory ?? {}) as Record<string, any>;
@@ -29,7 +44,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
 
   const [name, setName] = useState(contact?.name ?? '');
   const [avatar, setAvatar] = useState(contact?.avatar ?? '🤖');
-  const [color, setColor] = useState(contact?.color ?? '#8888aa');
+  const [color, setColor] = useState(contact?.color ?? SWATCHES[0]);
 
   const [provider, setProvider] = useState<string>(cfg.provider ?? 'openai-compat');
   const [baseUrl, setBaseUrl] = useState<string>(cfg.baseUrl ?? '');
@@ -41,6 +56,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
     typeof cfg.supportsImages === 'boolean' ? (cfg.supportsImages ? 'on' : 'off') : 'auto'
   );
   const [systemPrompt, setSystemPrompt] = useState<string>(cfg.systemPrompt ?? '');
+  const [maxTokens, setMaxTokens] = useState<number>(cfg.maxTokens ?? 8192);
   const [maxHistory, setMaxHistory] = useState<number>(cfg.maxHistoryMessages ?? 60);
   // 与 server manager.ts API 默认一致：未配置时 compact + 8k 历史预算
   const [historyTokenBudget, setHistoryTokenBudget] = useState<number>(cfg.historyTokenBudget ?? 8000);
@@ -79,10 +95,16 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
   const [projectShell, setProjectShell] = useState<boolean>(project.allowShell ?? false);
   const [sessionTokenLimit, setSessionTokenLimit] = useState<number>(cfg.maxSessionInputTokens ?? 120000);
 
-  const [advanced, setAdvanced] = useState(false);
   const [rawJson, setRawJson] = useState(() => JSON.stringify(cfg, null, 2));
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // 三类联系人的 tab 集合不同：CLI 由服务端配置只能改项目访问；
+  // API 是唯一能新建的普通联系人；群聊没有自己的记忆和派单。
+  const tabs: TabId[] = isRoom ? ['room', 'json'] : isApi ? ['api', 'history', 'deleg', 'json'] : ['basic', 'history', 'deleg', 'json'];
+  const [tab, setTab] = useState<TabId>(tabs[0]);
+  const activeTab: TabId = tabs.includes(tab) ? tab : tabs[0];
+  const advanced = activeTab === 'json';
 
   const buildConfig = (): Record<string, unknown> => {
     if (advanced) return JSON.parse(rawJson);
@@ -96,16 +118,13 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
       allowShell: delegShell,
       maxOpenJobs: delegMaxJobs,
     };
-    if (!isApi) return {
-      ...cfg,
-      projectAccess: {
-        enabled: projectEnabled,
-        workspace: projectWorkspace.trim(),
-        allowShell: projectShell,
-      },
-      maxSessionInputTokens: sessionTokenLimit,
-      delegation: delegationCfg,
-    };
+    if (!isApi)
+      return {
+        ...cfg,
+        projectAccess: { enabled: projectEnabled, workspace: projectWorkspace.trim(), allowShell: projectShell },
+        maxSessionInputTokens: sessionTokenLimit,
+        delegation: delegationCfg,
+      };
     return {
       ...cfg,
       delegation: delegationCfg,
@@ -116,6 +135,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
       visionModel: visionModel.trim() || undefined,
       supportsImages: imageSupport === 'auto' ? undefined : imageSupport === 'on',
       systemPrompt: systemPrompt.trim() || undefined,
+      maxTokens,
       maxHistoryMessages: maxHistory,
       historyTokenBudget,
       minRecentTurns,
@@ -160,7 +180,14 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
 
   const remove = async () => {
     if (!contact) return;
-    if (!window.confirm(`确定删除 ${contact.name}？聊天记录保留在库里，联系人从列表消失。`)) return;
+    if (!(await confirm({
+      title: '删除联系人',
+      message: `确定删除 ${contact.name}？聊天记录保留在库里，联系人从列表消失。`,
+      confirmLabel: '删除联系人',
+      danger: true,
+    }))) {
+      return;
+    }
     try {
       await api.deleteContact(contact.id);
       onClose();
@@ -169,167 +196,252 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
     }
   };
 
+  const footNote = isRoom
+    ? '群聊 v1 不支持成员级别的模型覆盖'
+    : isApi
+      ? 'API Key 留空表示不改，服务端保留旧值'
+      : 'CLI 联系人的深层字段（workerId / allowSsh）只能在高级 JSON 里改';
+
+  const identity = (
+    <div className="cfg-group">
+      <h3>身份</h3>
+      <div className="cfg-row">
+        <label className="cfg-field">
+          <span>{isRoom ? '群名' : '名称'}</span>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder={isRoom ? '比如 三人组' : '比如 GLM'} />
+        </label>
+        <label className="cfg-field cfg-field-narrow">
+          <span>头像</span>
+          <input className="cfg-emoji" value={avatar} onChange={(e) => setAvatar(e.target.value)} placeholder="🤖" />
+        </label>
+      </div>
+      <div className="cfg-field">
+        <span>主题色 · 只用在头像描边和群聊名字上</span>
+        <div className="swatches">
+          {SWATCHES.map((c) => (
+            <button
+              key={c}
+              type="button"
+              aria-label={`主题色 ${c}`}
+              aria-pressed={c === color}
+              className={'swatch' + (c === color ? ' selected' : '')}
+              style={{ background: c }}
+              onClick={() => setColor(c)}
+            />
+          ))}
+          <label className="swatch swatch-custom" title="自定义颜色">
+            <input type="color" value={color} onChange={(e) => setColor(e.target.value)} />
+          </label>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div
-        className={`modal contact-config-modal${isApi && !advanced ? ' contact-config-modal-api' : ''}`}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <header className="modal-header">
-          <h2>{creating ? (isRoom ? '建群聊' : '新联系人（API 接入）') : `设置 · ${contact!.name}`}</h2>
-          <button className="modal-close" onClick={onClose}>
-            ✕
-          </button>
-        </header>
-
-        <div className="modal-body contact-config-body">
-          <div className="contact-config-basics">
-            {creating && (
-              <label className="field">
-                类型
-                <select value={createKind} onChange={(e) => setCreateKind(e.target.value as 'api' | 'room')}>
-                  <option value="api">API 联系人</option>
-                  <option value="room">群聊（拉现有联系人）</option>
-                </select>
-              </label>
-            )}
-            <label className="field field-wide">
-              名称
-              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="比如 GLM" />
-            </label>
-            <label className="field">
-              头像
-              <input value={avatar} onChange={(e) => setAvatar(e.target.value)} placeholder="🤖" />
-            </label>
-            <label className="field">
-              颜色
-              <input type="color" value={color} onChange={(e) => setColor(e.target.value)} />
-            </label>
+      <div className="modal cfg-modal" onClick={(e) => e.stopPropagation()}>
+        <nav className="cfg-nav">
+          <div className="cfg-nav-head">
+            <span className="avatar" style={{ boxShadow: `inset 0 0 0 1.5px ${color}88` }}>
+              {avatar}
+            </span>
+            <span className="cfg-nav-id">
+              <b>{name || (creating ? '新联系人' : contact!.name)}</b>
+              <small>{isRoom ? 'room' : creating ? 'api · 新建' : contact!.backend}</small>
+            </span>
           </div>
 
-          {!creating && (
-            <p className="field-hint">
-              后端：<code>{contact!.backend}</code>
-              {!isApi && ' — CLI 联系人的深层配置用下面的「高级 JSON」改'}
-            </p>
+          {creating && (
+            <div className="cfg-kind">
+              <span className="cfg-kind-label">类型</span>
+              <div className="seg">
+                <button
+                  type="button"
+                  className={'seg-btn' + (createKind === 'api' ? ' selected' : '')}
+                  onClick={() => {
+                    setCreateKind('api');
+                    setTab('api');
+                  }}
+                >
+                  API 联系人
+                </button>
+                <button
+                  type="button"
+                  className={'seg-btn' + (createKind === 'room' ? ' selected' : '')}
+                  onClick={() => {
+                    setCreateKind('room');
+                    setTab('room');
+                  }}
+                >
+                  群聊
+                </button>
+              </div>
+            </div>
           )}
 
-          {isRoom && !advanced && (
-            <RoomFields
-              contacts={dmContacts}
-              members={members}
-              reactionRounds={reactionRounds}
-              respondAllByDefault={respondAllByDefault}
-              onToggleMember={toggleMember}
-              onReactionRounds={setReactionRounds}
-              onRespondAll={setRespondAllByDefault}
-            />
-          )}
+          <div className="cfg-tabs">
+            {tabs.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={'cfg-tab' + (id === activeTab ? ' selected' : '')}
+                onClick={() => setTab(id)}
+              >
+                {TAB_DEFS[id].label}
+                {id === 'deleg' && delegEnabled && <span className="cfg-tab-dot" />}
+              </button>
+            ))}
+          </div>
 
-          {isApi && !advanced && (
-            <ApiFields
-              provider={provider}
-              model={model}
-              visionModel={visionModel}
-              imageSupport={imageSupport}
-              baseUrl={baseUrl}
-              apiKey={apiKey}
-              apiKeyPlaceholder={cfg.apiKey ? `已设置（${cfg.apiKey}），留空不改` : 'sk-…'}
-              systemPrompt={systemPrompt}
-              maxHistory={maxHistory}
-              historyTokenBudget={historyTokenBudget}
-              minRecentTurns={minRecentTurns}
-              summaryMaxTokens={summaryMaxTokens}
-              memoryPreambleMode={memoryPreambleMode}
-              promptCache={promptCache}
-              historySummary={historySummary}
-              memInject={memInject}
-              memSearch={memSearch}
-              memCapture={memCapture}
-              onProvider={setProvider}
-              onModel={setModel}
-              onVisionModel={setVisionModel}
-              onImageSupport={setImageSupport}
-              onBaseUrl={setBaseUrl}
-              onApiKey={setApiKey}
-              onSystemPrompt={setSystemPrompt}
-              onMaxHistory={setMaxHistory}
-              onHistoryTokenBudget={setHistoryTokenBudget}
-              onMinRecentTurns={setMinRecentTurns}
-              onSummaryMaxTokens={setSummaryMaxTokens}
-              onMemoryPreambleMode={setMemoryPreambleMode}
-              onPromptCache={setPromptCache}
-              onHistorySummary={setHistorySummary}
-              onMemInject={setMemInject}
-              onMemSearch={setMemSearch}
-              onMemCapture={setMemCapture}
-            />
-          )}
+          <div className="cfg-nav-foot">
+            {creating ? (
+              <p className="cfg-note">只有 API 联系人和群聊能新建，CLI 联系人由服务端配置。</p>
+            ) : (
+              <button type="button" className="danger-btn" onClick={() => void remove()}>
+                删除联系人
+              </button>
+            )}
+          </div>
+        </nav>
 
-          {!isRoom && !isApi && !advanced && (
-            <CliFields
-              contact={contact!}
-              projectEnabled={projectEnabled}
-              projectWorkspace={projectWorkspace}
-              projectShell={projectShell}
-              sessionTokenLimit={sessionTokenLimit}
-              onProjectEnabled={setProjectEnabled}
-              onProjectWorkspace={setProjectWorkspace}
-              onProjectShell={setProjectShell}
-              onSessionTokenLimit={setSessionTokenLimit}
-            />
-          )}
-
-          {!isRoom && !advanced && (
-            <DelegationFields
-              contact={contact}
-              enabled={delegEnabled}
-              workspaces={delegWorkspaces}
-              runners={delegRunners}
-              workspaceDraft={delegWorkspaceDraft}
-              allowShell={delegShell}
-              maxOpenJobs={delegMaxJobs}
-              onEnabled={setDelegEnabled}
-              onWorkspaces={setDelegWorkspaces}
-              onRunners={setDelegRunners}
-              onWorkspaceDraft={setDelegWorkspaceDraft}
-              onAddWorkspace={addDelegWorkspace}
-              onAllowShell={setDelegShell}
-              onMaxOpenJobs={setDelegMaxJobs}
-            />
-          )}
-
-          <label className="advanced-toggle">
-            <input type="checkbox" checked={advanced} onChange={(e) => setAdvanced(e.target.checked)} />
-            高级 JSON（直接编辑完整 config）
-          </label>
-          {advanced && (
-            <textarea
-              className="json-editor"
-              rows={10}
-              value={rawJson}
-              onChange={(e) => setRawJson(e.target.value)}
-              spellCheck={false}
-            />
-          )}
-
-          {error && <div className="modal-error">⚠ {error}</div>}
-        </div>
-
-        <footer className="modal-footer">
-          {!creating && (
-            <button className="danger-btn" onClick={() => void remove()}>
-              删除联系人
+        <div className="cfg-main">
+          <header className="cfg-head">
+            <b>{TAB_DEFS[activeTab].title}</b>
+            <small>{TAB_DEFS[activeTab].hint}</small>
+            <span className="spacer" />
+            <button type="button" className="modal-close" onClick={onClose}>
+              ✕
             </button>
-          )}
-          <span style={{ flex: 1 }} />
-          <button className="ghost-btn" onClick={onClose}>
-            取消
-          </button>
-          <button className="primary-btn" disabled={saving} onClick={() => void save()}>
-            {saving ? '保存中…' : '保存'}
-          </button>
-        </footer>
+          </header>
+
+          <div className="cfg-body">
+            {activeTab === 'room' && (
+              <>
+                {identity}
+                <RoomFields
+                  contacts={dmContacts}
+                  members={members}
+                  reactionRounds={reactionRounds}
+                  respondAllByDefault={respondAllByDefault}
+                  onToggleMember={toggleMember}
+                  onReactionRounds={setReactionRounds}
+                  onRespondAll={setRespondAllByDefault}
+                />
+              </>
+            )}
+
+            {activeTab === 'basic' && (
+              <>
+                {identity}
+                <CliFields
+                  contact={contact!}
+                  projectEnabled={projectEnabled}
+                  projectWorkspace={projectWorkspace}
+                  projectShell={projectShell}
+                  sessionTokenLimit={sessionTokenLimit}
+                  onProjectEnabled={setProjectEnabled}
+                  onProjectWorkspace={setProjectWorkspace}
+                  onProjectShell={setProjectShell}
+                  onSessionTokenLimit={setSessionTokenLimit}
+                />
+              </>
+            )}
+
+            {(activeTab === 'api' || activeTab === 'history') && (
+              <>
+                {activeTab === 'api' && identity}
+                <ApiFields
+                  section={activeTab === 'api' ? 'connection' : 'context'}
+                  readOnlyConnection={!isApi}
+                  provider={provider}
+                  model={model}
+                  visionModel={visionModel}
+                  imageSupport={imageSupport}
+                  baseUrl={baseUrl}
+                  apiKey={apiKey}
+                  apiKeyPlaceholder={cfg.apiKey ? `已设置（${cfg.apiKey}），留空不改` : 'sk-…'}
+                  systemPrompt={systemPrompt}
+                  maxTokens={maxTokens}
+                  maxHistory={maxHistory}
+                  historyTokenBudget={historyTokenBudget}
+                  minRecentTurns={minRecentTurns}
+                  summaryMaxTokens={summaryMaxTokens}
+                  memoryPreambleMode={memoryPreambleMode}
+                  promptCache={promptCache}
+                  historySummary={historySummary}
+                  memInject={memInject}
+                  memSearch={memSearch}
+                  memCapture={memCapture}
+                  onProvider={setProvider}
+                  onModel={setModel}
+                  onVisionModel={setVisionModel}
+                  onImageSupport={setImageSupport}
+                  onBaseUrl={setBaseUrl}
+                  onApiKey={setApiKey}
+                  onSystemPrompt={setSystemPrompt}
+                  onMaxTokens={setMaxTokens}
+                  onMaxHistory={setMaxHistory}
+                  onHistoryTokenBudget={setHistoryTokenBudget}
+                  onMinRecentTurns={setMinRecentTurns}
+                  onSummaryMaxTokens={setSummaryMaxTokens}
+                  onMemoryPreambleMode={setMemoryPreambleMode}
+                  onPromptCache={setPromptCache}
+                  onHistorySummary={setHistorySummary}
+                  onMemInject={setMemInject}
+                  onMemSearch={setMemSearch}
+                  onMemCapture={setMemCapture}
+                />
+              </>
+            )}
+
+            {activeTab === 'deleg' && (
+              <DelegationFields
+                contact={contact}
+                enabled={delegEnabled}
+                workspaces={delegWorkspaces}
+                runners={delegRunners}
+                workspaceDraft={delegWorkspaceDraft}
+                allowShell={delegShell}
+                maxOpenJobs={delegMaxJobs}
+                onEnabled={setDelegEnabled}
+                onWorkspaces={setDelegWorkspaces}
+                onRunners={setDelegRunners}
+                onWorkspaceDraft={setDelegWorkspaceDraft}
+                onAddWorkspace={addDelegWorkspace}
+                onAllowShell={setDelegShell}
+                onMaxOpenJobs={setDelegMaxJobs}
+              />
+            )}
+
+            {activeTab === 'json' && (
+              <div className="cfg-group">
+                <p className="cfg-warn">
+                  ⚠ 直接编辑整份 config，保存前会做一次 schema 校验；上面各页的改动会被这里覆盖。
+                </p>
+                <textarea
+                  className="json-editor"
+                  rows={16}
+                  value={rawJson}
+                  onChange={(e) => setRawJson(e.target.value)}
+                  spellCheck={false}
+                />
+              </div>
+            )}
+
+            {error && <div className="modal-error">⚠ {error}</div>}
+          </div>
+
+          <footer className="cfg-foot">
+            <span className="cfg-note">{footNote}</span>
+            <span className="spacer" />
+            <button className="ghost-btn" onClick={onClose}>
+              取消
+            </button>
+            <button className="primary-btn" disabled={saving} onClick={() => void save()}>
+              {saving ? '保存中…' : '保存'}
+            </button>
+          </footer>
+        </div>
       </div>
     </div>
   );

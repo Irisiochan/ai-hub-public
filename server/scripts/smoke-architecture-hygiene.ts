@@ -16,15 +16,15 @@ assert.equal(chooseKeepFrom(candidates, 2, 3, 100, unitTokenizer), 2, 'hard max 
 assert.equal(chooseKeepFrom(candidates, 2, 5, 18, unitTokenizer), 3, 'budget applies after minimum');
 
 const members = [
-  { id: 'alpha', name: 'Agent Alpha' },
+  { id: 'claude', name: 'Claude' },
   { id: 'gem', name: 'Gem' },
-  { id: 'gamma', name: 'Agent Gamma' },
+  { id: 'aye', name: '阿野' },
 ] as any[];
-assert.deepEqual(parseRoomTargets(members, '@alpha @gem 来一下', {}).map((row) => row.id), ['alpha', 'gem']);
-assert.deepEqual(parseRoomTargets(members, '@all 集合', {}).map((row) => row.id), ['alpha', 'gem', 'gamma']);
+assert.deepEqual(parseRoomTargets(members, '@Claude @gem 来一下', {}).map((row) => row.id), ['claude', 'gem']);
+assert.deepEqual(parseRoomTargets(members, '@all 集合', {}).map((row) => row.id), ['claude', 'gem', 'aye']);
 assert.deepEqual(parseRoomTargets(members, '无点名', {}).map((row) => row.id), []);
 assert.deepEqual(parseRoomTargets(members, '无点名', { respondAllByDefault: true }).map((row) => row.id),
-  ['alpha', 'gem', 'gamma']);
+  ['claude', 'gem', 'aye']);
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.architecture-hygiene.db');

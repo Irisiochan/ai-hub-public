@@ -12,6 +12,7 @@ import {
   openContact,
   validateContactConfig,
 } from '../agents/configSchemas.js';
+import { readStatesForContact } from '../readState.js';
 
 /** apiKey never leaves the server in clear — mask to ••••+last4 for the UI. */
 function maskConfig(config: Record<string, any>): Record<string, any> {
@@ -95,6 +96,7 @@ export function contactsRouter(
       ...c,
       config: maskConfig(c.configParsed!),
       state: status.state,
+      origin: status.origin,
       // Room busy member display name (undefined for DM / idle). Used by resync
       // so thinking labels stay on the contact, not the room title.
       member: status.member,
@@ -106,14 +108,21 @@ export function contactsRouter(
       .prepare(
         `SELECT c.*,
            (SELECT content FROM messages m WHERE m.contact_id = c.id AND m.kind = 'text'
-              AND m.deleted = 0 ORDER BY m.id DESC LIMIT 1) AS last_content,
+              AND m.deleted = 0 AND m.origin = 'main'
+              AND COALESCE(json_extract(m.meta, '$.uiHidden'), 0) != 1 ORDER BY m.id DESC LIMIT 1) AS last_content,
            (SELECT created_at FROM messages m WHERE m.contact_id = c.id AND m.deleted = 0
+              AND m.origin = 'main' AND COALESCE(json_extract(m.meta, '$.uiHidden'), 0) != 1
               ORDER BY m.id DESC LIMIT 1) AS last_at
          FROM contacts c WHERE c.enabled = 1 ORDER BY c.sort_order, c.created_at`
       )
       .all() as (ContactRow & { last_content: string | null; last_at: string | null })[];
 
-    res.json({ contacts: rows.map((c) => publicRow(c)) });
+    res.json({
+      contacts: rows.map((c) => ({
+        ...publicRow(c),
+        readStates: readStatesForContact(db, c.id),
+      })),
+    });
   });
 
   r.get('/:id/models', async (req, res) => {
@@ -195,8 +204,8 @@ export function contactsRouter(
     const label = (value: string) => value || '默认模型';
     const result = db
       .prepare(
-        `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta)
-         VALUES (?, 'system', 'system', 'text', ?, 'done', ?)`
+        `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta, origin)
+         VALUES (?, 'system', 'system', 'text', ?, 'done', ?, 'side')`
       )
       .run(
         contact.id,
@@ -258,8 +267,8 @@ export function contactsRouter(
     const label = (value: string) => value || '默认强度';
     const result = db
       .prepare(
-        `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta)
-         VALUES (?, 'system', 'system', 'text', ?, 'done', ?)`
+        `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta, origin)
+         VALUES (?, 'system', 'system', 'text', ?, 'done', ?, 'side')`
       )
       .run(
         contact.id,

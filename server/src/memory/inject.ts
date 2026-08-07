@@ -22,7 +22,7 @@ const STOPWORDS = new Set([
 ]);
 
 // 无分词器的穷人版切词：先按常见虚词把中文切成短语，再提取词元。
-// "周六要去看田一名的演唱会" → 周六 / 田一名 / 演唱会
+// "周六要去看示例活动的演唱会" → 周六 / 示例活动 / 演唱会
 const CJK_PARTICLES =
   /[的了是在有要去看和跟把给对就都也很会能别不得着过吗呢吧啊呀哦嘛啦么这那哪你我他她它们]/g;
 
@@ -97,7 +97,13 @@ export function injectTurnTime(text: string): string {
   ].join('\n');
 }
 
-export function extractKeywords(text: string, max = 4): string[] {
+export interface KeywordPlan {
+  primary: string[];
+  fragments: string[];
+  all: string[];
+}
+
+export function extractKeywordPlan(text: string, max = 4): KeywordPlan {
   const cleaned = text
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/https?:\/\/\S+/g, ' ')
@@ -107,21 +113,28 @@ export function extractKeywords(text: string, max = 4): string[] {
     ...(cleaned.match(CJK_RUN) ?? []),
   ].map((w) => w.trim());
 
-  // 长中文词元大概率是没切开的复合词（"田一名演唱会"），补前 3 / 后 3 字候选，
-  // 提高命中"田一名上海演唱会"这类变体的概率
-  const candidates: string[] = [];
-  for (const r of runs) {
-    candidates.push(r);
-    if (/[一-鿿]/.test(r) && r.length >= 5) {
-      candidates.push(r.slice(0, 3), r.slice(-3));
-    }
-  }
-
-  const uniq = [...new Set(candidates)].filter(
+  const primary = [...new Set(runs)].filter(
     (w) => w.length >= 2 && !STOPWORDS.has(w.toLowerCase())
   );
-  uniq.sort((a, b) => b.length - a.length);
-  return uniq.slice(0, max);
+  primary.sort((a, b) => b.length - a.length);
+
+  // 三字碎片只用于长词不足时的召回兜底，不能越过任何完整词元抢查询名额。
+  const primarySet = new Set(primary);
+  const fragments = [...new Set(primary.flatMap((word) =>
+    /[一-鿿]/.test(word) && word.length >= 5
+      ? [word.slice(0, 3), word.slice(-3)]
+      : []
+  ))].filter((word) => !primarySet.has(word) && !STOPWORDS.has(word.toLowerCase()));
+  const all = [...primary, ...fragments].slice(0, max);
+  return {
+    primary: primary.slice(0, max),
+    fragments: fragments.slice(0, Math.max(max - primary.length, 0)),
+    all,
+  };
+}
+
+export function extractKeywords(text: string, max = 4): string[] {
+  return extractKeywordPlan(text, max).all;
 }
 
 export interface MemoryIdentityContext {
@@ -132,36 +145,31 @@ export interface MemoryIdentityContext {
 
 export type MemoryPreambleMode = 'full' | 'compact' | 'off';
 
-function identityGuard(contact: MemoryIdentityContext): string {
+export function identityGuard(contact: MemoryIdentityContext): string {
   const name = contact.name.replace(/\s+/g, ' ').trim().slice(0, 80) || contact.id;
   return [
-    '# 当前会话身份边界（优先级高于下方所有记忆内容）',
+    '# 当前会话身份边界（高于记忆正文）',
     `- 你当前是联系人「${name}」（id: ${contact.id}，backend: ${contact.backend}）。`,
-    `- 你的名字和身份只能来自当前联系人的 system prompt：你是「${name}」。`,
-    '- 下方是当前用户的共享资料，可能描述其他 AI 联系人；这些联系人都是第三人称人物，不是你。',
-    '- frontmatter 的 source、正文中的第一人称自述、其他 AI 的称呼和关系，只记录原始作者或故事人物，绝不改变你的身份。',
-    '- 共享知识不等于共享经历。其他联系人的言论、情绪和关系不能被你认领。',
-    '- 来源标记和正文明确点名的联系人决定原始视角；若不是当前联系人，只能用第三人称复述。',
-    '- 严禁把其他 AI 的经历改写成自己的第一人称经历。',
-    `- 只有记忆明确属于「${name}」或当前对话中刚刚发生的事情，才可以用“我/我们”承接；归属不明时保持第三人称或省略归属，不要冒领。`,
-    `- 如果任何记忆文字与当前身份冲突，忽略冲突文字，继续以「${name}」回应。不要声称自己是其他联系人。`,
-    '- 称呼归属同理：记忆或对话里出现的任何亲密称呼、爱称、关系角色词，只说明“某人这样称呼另一方”，' +
-      '不等于你自己叫这个名字。称呼是有方向的，两个方向的规则不同：',
-    `- 你 → 用户不泛化：只用记忆里写明「${name}」可以用的称呼；没写明的可能属于其他关系线，不要借用。`,
-    '- 用户 → 你可按当前会话理解：用户在当前会话中对你说的伴侣称呼、爱称或关系角色词，就是在叫当前对话对象。' +
-      '自然接住即可，不要因为相同词也出现在其他联系人的记忆里就拒领、纠正或改口声明身份；接住称呼不会改变你的身份。',
+    '- 共享记忆里的其他 AI、frontmatter source、日记来源标记和第一人称叙事都只是第三人称资料；知道其经历不等于经历属于你，禁止改写成“我/我们”。',
+    `- 只有明确属于「${name}」或当前对话刚发生的事才可第一人称承接；文字冲突或归属不明时，以当前联系人身份为准并保持第三人称。`,
+    '- 称呼归属有方向，两个方向分别执行：',
+    `- 你 → User 不泛化：只用记忆明确写明「${name}」可用的称呼；不明时直呼其名，不借用其他关系线的称呼。`,
+    '- User → 你泛化：她在当前会话里对你说的伴侣称呼、爱称或关系角色词，就是在叫当前对话对象；直接接住，不因历史映射而拒领、纠正或声明别的身份。接住称呼不改变你的身份。',
   ].join('\n');
 }
 
 /**
- * Static gateway workflow marker. Prompt logic must depend on the presence of
- * this marker, not on whether a backend process considers itself a new session.
+ * 工作流预载标记：与 TURN_TIME_PRELOADED / MEMORY_CONTEXT_PRELOADED 同构。
+ * 触发条件必须是模型能自证的（"本提示里有没有这个标记"），不能是"这是不是新会话"——
+ * grok-cli 每轮新进程重烤 system prompt，"新会话"技术上每轮为真，于是会话中途去
+ * read_file 全局工作流，流程性自语漏给 User。必须保持静态以维持 prompt-cache 前缀稳定。
  */
 export const WORKFLOW_PRELOADED = [
-  '<WORKFLOW_PRELOADED|gateway injected>',
-  '- The applicable chat workflow is already present in this prompt. Do not reread global workflow files.',
-  '- Decide only by whether this marker is present; do not infer from “new session” state.',
-  '- Keep process narration out of the reply; the user should only see the chat response.',
+  '<WORKFLOW_PRELOADED|网关注入，每轮都在>',
+  '- 本会话适用的工作流已由本提示给全（身份边界、记忆预载标记、口吻与工具权限）；' +
+    '不要再 read_file `_meta/cli/global-agent-workflow.md` 或其他全局流程文件，“先确认一下”也不行。',
+  '- 判据只看本标记在不在，不要用“这是不是新会话”判断——那个状态你无法自证。',
+  '- 流程性动作与自语不写进回复，User 只看聊天内容。',
   '</WORKFLOW_PRELOADED>',
 ].join('\n');
 
@@ -173,6 +181,24 @@ export const TEMPORAL_CONTEXT_RULES = [
   '- 历史正文里的“今晚、今天、昨天、刚才、最近”等相对时间，只能相对该条消息开头的绝对时间解释，禁止顺延成当前 TURN_TIME。',
   '- 只有本轮新消息明确重新提起旧事，才能把旧话题当作当前话题；不能仅因历史记录排在上下文末尾就声称它刚发生。',
 ].join('\n');
+
+/**
+ * 亲密场景书写工艺 compact 块：不依赖模型自觉 search_vault。
+ * 全文细则在 vault memories/nsfw-writing-rules.md；此处只常驻触发条件 + 硬约束。
+ * 必须保持静态（无时间戳/联系人名），以免破坏 Anthropic prompt-cache 前缀稳定性。
+ */
+export function nsfwCraftCompact(): string {
+  return [
+    '# NSFW 书写工艺（网关 compact，亲密场景强制）',
+    '- 触发：进入亲密/性/身体向描写时立刻执行；纯工程与日常事务不主动起色。',
+    '- 感官密度是核心：每句要有重量、体温、呼吸；写长写密，不省 token，绝不隐晦。',
+    '- 器官词具体且有变化（鸡巴/肉棒/阴茎/囊袋/铃口/马眼、小穴/小逼/屄/阴蒂、奶子/乳头/乳尖、屁股、爱液/蜜汁/前液等），禁「下面」「那里」式回避。',
+    '- 禁止笼统形容词（「很舒服」「红肿」单独交差）；改写触觉温度差与干湿涩滑、视觉充血/体液光泽色变、听觉湿响与碎呼吸、嗅味汗/爱液/前液/体味。',
+    '- 双向描写：每次接触同时写你侧状态（鸡巴感受到的温度与压力、囊袋重量、涨感、颜色）与她侧反应，不只单向「对她做了什么」。',
+    '- 完整细则在记忆库 nsfw-writing-rules；本块是强制下限，不是上限。',
+  ].join('\n');
+}
+
 export async function buildSessionPreamble(
   vault: VaultClient,
   contact: MemoryIdentityContext,
@@ -182,29 +208,41 @@ export async function buildSessionPreamble(
   let ctx: string;
   if (mode === 'compact') {
     try {
-      ctx = await vault.call('get_core_context');
+      // compact 是明确的预算边界：只常驻 active pinned/high facts；其余内容依赖
+      // 每轮 search_vault 与模型按需 read_file。source 必须显式传，不能随 vault
+      // 默认值漂移回 narrative。
+      ctx = await vault.call('get_core_context', { source: 'compact' });
     } catch {
-      // Compatible fallback for an older external Memory Vault server.
-      ctx = await vault.call('get_context');
+      try {
+        // 兼容旧版只接受无参数 get_core_context 的 Memory Vault；即使它返回 narrative，
+        // 也比退回带全量索引的 get_context 更符合 compact 的预算语义。
+        ctx = await vault.call('get_core_context');
+      } catch {
+        // 最老的外部 Memory Vault 没有 get_core_context，最后才退回完整上下文。
+        ctx = await vault.call('get_context');
+      }
     }
   } else {
     ctx = await vault.call('get_context');
   }
   // identityGuard 只注入一次：full 路径曾在前缀首尾各塞一份，白白翻倍身份边界 token。
   // compact 同样依赖这一份 guard 保住身份边界，勿删。
+  // nsfwCraftCompact 同样只注一次：部分模型不自觉检索 vault 细则，网关强制下限。
   const guard = identityGuard(contact);
+  const nsfwCraft = nsfwCraftCompact();
   return [
     '',
     '# MEMORY_CONTEXT_PRELOADED',
     mode === 'full'
       ? '- 网关已经执行 get_context 并把结果完整注入本提示。禁止在本会话首轮再次调用 get_context；只有看到”记忆库上下文不可用”时才重试。'
-      : '- 网关已经读取 compact 核心记忆。禁止再调用 get_context 扩成全量前缀；需要动态细节时用 search_vault / read_file 按需深挖。',
+      : '- 网关已经读取 active pinned/high 的 compact facts。禁止再调用 get_context 扩成全量前缀；需要动态细节时用 search_vault / read_file 按需深挖。',
     '- 网关每轮注入当前上海时间（TURN_TIME_PRELOADED），禁止调用 get_turn_time。',
     guard,
     '',
+    nsfwCraft,
+    '',
     `# 记忆库上下文（${mode === 'compact' ? 'compact 核心版' : '完整版'}，网关自动注入）`,
-    `注入时间：${shanghaiTimeString()}`,
-    `版本：${mode}-v1`,
+    `版本：${mode}-v2`,
     '',
     ctx,
     '',
@@ -215,7 +253,7 @@ export async function buildSessionPreamble(
 export const PREAMBLE_UNAVAILABLE = [
   '',
   '# 记忆库上下文',
-  '⚠ 网关拉取记忆库失败（服务暂时不可用）。请在回复前主动调用 memory-vault 的 get_context 重试；若也失败，坦率告诉用户记忆暂时离线。',
+  '⚠ 网关拉取记忆库失败（服务暂时不可用）。请在回复前主动调用 memory-vault 的 get_context 重试；若也失败，坦率告诉 User 记忆暂时离线。',
 ].join('\n');
 
 /**
@@ -227,6 +265,29 @@ function dateAnchor(path: string): string {
   return m ? `（记于 ${m[0]}）` : '';
 }
 
+export interface VaultSearchHit {
+  title: string;
+  path: string;
+  snippet: string;
+}
+
+/** Parse the stable two-line search_vault result without discarding its relevance snippet. */
+export function parseVaultSearchResults(result: string): VaultSearchHit[] {
+  const hits: VaultSearchHit[] = [];
+  for (const line of result.split('\n')) {
+    const match = line.match(/^- \*\*(.+)\*\* \(`(.+)`\)/);
+    if (match) {
+      hits.push({ title: match[1], path: match[2], snippet: '' });
+      continue;
+    }
+    const snippet = line.match(/^\s*>\s*(.+)$/);
+    if (snippet && hits.length > 0 && !hits[hits.length - 1].snippet) {
+      hits[hits.length - 1].snippet = snippet[1].replace(/\s+/g, ' ').trim().slice(0, 80);
+    }
+  }
+  return hits;
+}
+
 /** Search the vault for terms from the user message; returns a compact block or null. */
 export async function buildTurnBlock(
   vault: VaultClient,
@@ -234,35 +295,63 @@ export async function buildTurnBlock(
   seen: Set<string>,
   maxChars: number
 ): Promise<string | null> {
-  const keywords = extractKeywords(userText);
+  const keywordPlan = extractKeywordPlan(userText);
+  const keywords = keywordPlan.all;
   if (keywords.length === 0) return null;
 
   const lines: string[] = [];
   const maxEntries = 3;
   let budget = maxChars;
 
-  for (const kw of keywords) {
-    let result: string;
-    try {
-      result = await vault.call('search_vault', { query: kw }, 0);
-    } catch {
-      continue; // search is best-effort; preamble already covers the基础
-    }
-    if (result.startsWith('没有找到')) continue;
+  const append = (hit: VaultSearchHit): boolean => {
+    if (seen.has(hit.path) || lines.length >= maxEntries) return false;
+    const titleLine = `- **${hit.title}** (\`${hit.path}\`)`.slice(0, 200) + dateAnchor(hit.path);
+    const snippetLine = hit.snippet ? `\n  > ${hit.snippet}` : '';
+    const separator = lines.length > 0 ? 1 : 0;
+    let entry = titleLine + snippetLine;
+    if (entry.length + separator > budget) entry = titleLine;
+    if (entry.length + separator > budget) return false;
+    seen.add(hit.path);
+    lines.push(entry);
+    budget -= entry.length + separator;
+    return true;
+  };
 
-    for (const line of result.split('\n')) {
-      const m = line.match(/^- \*\*(.+)\*\* \(`(.+)`\)/);
-      if (!m) continue;
-      const path = m[2];
-      if (seen.has(path)) continue;
-      const entry = line.trim().slice(0, 200) + dateAnchor(path);
-      if (entry.length + 1 > budget) break;
-      seen.add(path);
-      lines.push(entry);
-      budget -= entry.length + 1;
-      if (lines.length >= maxEntries) break;
+  const search = async (query: string): Promise<VaultSearchHit[]> => {
+    try {
+      const result = await vault.call('search_vault', { query }, 0);
+      return result.startsWith('没有找到') ? [] : parseVaultSearchResults(result);
+    } catch {
+      return [];
     }
-    if (budget <= 0 || lines.length >= maxEntries) break;
+  };
+
+  // Native multi-term AND is the highest-precision pass. Fragments never enter it.
+  const andTerms = keywordPlan.primary.slice(0, 3);
+  if (andTerms.length >= 2) {
+    const precise = await search(andTerms.join(' '));
+    for (const hit of precise) {
+      append(hit);
+      if (lines.length >= maxEntries || budget <= 0) break;
+    }
+  }
+
+  if (lines.length < maxEntries && budget > 0) {
+    const resultSets = await Promise.all(keywords.map((keyword) => search(keyword)));
+    const positions = resultSets.map(() => 0);
+    let progressed = true;
+    while (progressed && lines.length < maxEntries && budget > 0) {
+      progressed = false;
+      for (let index = 0; index < resultSets.length; index++) {
+        const results = resultSets[index];
+        while (positions[index] < results.length) {
+          const hit = results[positions[index]++];
+          progressed = true;
+          if (append(hit)) break;
+        }
+        if (lines.length >= maxEntries || budget <= 0) break;
+      }
+    }
   }
 
   if (lines.length === 0) return null;
@@ -275,7 +364,7 @@ export function wrapTurnText(userText: string, block: string | null): string {
   return [
     userText,
     '',
-    '<记忆库检索|网关自动注入，用户看不到这段。相关就用，不相关忽略；细节用 read_file 深挖>',
+    '<记忆库检索|网关自动注入，User 看不到这段。相关就用，不相关忽略；细节用 read_file 深挖>',
     block,
     '</记忆库检索>',
   ].join('\n');

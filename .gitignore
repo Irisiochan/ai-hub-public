@@ -21,10 +21,14 @@ worker/worker.log
 server/agents/*/mcp.hub.json
 mobile/apk-out/
 
-# First-boot contact workdirs are runtime state. Keep only the generic template tracked.
+# First-boot contact workdirs are runtime state. Keep the generic template and the
+# per-contact prompt overlays tracked — overlays are source, not runtime state.
 server/agents/*
 !server/agents/example/
 !server/agents/example/**
+!server/agents/*/
+server/agents/*/*
+!server/agents/*/overlay.md
 
 # Private Memory Vault runtime data. It may be its own private git repository.
 vault-data/

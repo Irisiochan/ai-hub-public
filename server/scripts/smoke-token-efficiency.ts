@@ -182,10 +182,17 @@ try {
     compactCalls.some((c) => c.startsWith('get_core_context:')),
     'compact 应调用 get_core_context'
   );
-  assert(compact.includes('compact-v1'), 'compact 前缀应携带可辨识版本');
+  assert(compact.includes('compact-v2'), 'compact 前缀应携带可辨识版本');
+  assert(!compact.includes('注入时间：'), 'session preamble 不得带动态时间戳破坏 prompt cache');
   assert(compact.includes('当前会话身份边界'), 'compact 必须保留 identityGuard');
   const compactGuardHits = compact.split('当前会话身份边界').length - 1;
   assert.equal(compactGuardHits, 1, 'compact 的 identityGuard 应只出现一次');
+  assert(compact.includes('NSFW 书写工艺（网关 compact'), 'compact 必须注入 NSFW 工艺块');
+  assert.equal(
+    compact.split('NSFW 书写工艺（网关 compact').length - 1,
+    1,
+    'compact 的 nsfwCraftCompact 应只出现一次'
+  );
 
   // --- full preamble：identityGuard 不得双份 ---
   const full = await buildSessionPreamble(
@@ -198,10 +205,16 @@ try {
     { id: 'gem', name: 'Gem', backend: 'api' },
     'full'
   );
-  assert(full.includes('full-v1'), 'full 前缀应携带可辨识版本');
+  assert(full.includes('full-v2'), 'full 前缀应携带可辨识版本');
   assert(full.includes('FULL_CTX'), 'full 应注入 get_context 结果');
   const fullGuardHits = full.split('当前会话身份边界').length - 1;
   assert.equal(fullGuardHits, 1, 'full 的 identityGuard 不得重复注入');
+  assert(full.includes('NSFW 书写工艺（网关 compact'), 'full 也必须注入 NSFW 工艺块');
+  assert.equal(
+    full.split('NSFW 书写工艺（网关 compact').length - 1,
+    1,
+    'full 的 nsfwCraftCompact 不得重复注入'
+  );
 
   // --- tool result 截断 ---
   const longText = 'X'.repeat(TOOL_RESULT_MAX_CHARS + 2500);

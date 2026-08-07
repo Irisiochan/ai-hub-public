@@ -12,6 +12,7 @@ import { chooseKeepFrom } from '../historyPolicy.js';
 import { ConversationSummaryRepo } from '../conversationSummaryRepo.js';
 import { MessageRepo } from '../messageRepo.js';
 import { quotedRoomMessage } from '../roomPrompt.js';
+import { historicalMessageText } from '../sideChannel.js';
 import {
   AsyncQueue,
   type AgentBackend,
@@ -91,6 +92,13 @@ export const MAX_TOOL_ROUNDS = 4;
  * / 检索片段，截断后模型可继续用 search_vault / read_file 按需深挖。
  */
 export const TOOL_RESULT_MAX_CHARS = 5_000;
+
+/**
+ * 摘要触发后一次压到低水位，给后续 turn 留出 headroom。
+ * 这样 rolling summary 不会在达到 maxHistoryMessages 后每轮改写，API provider
+ * 才能连续复用 system + summary + recent history 的相同前缀。
+ */
+export const SUMMARY_ROLLOVER_KEEP_RATIO = 0.8;
 
 /** 图片被剥离后留给纯文字模型的占位，保留“这里本来有图”的语义，但不外发 base64/url。 */
 export const IMAGE_OMITTED_PLACEHOLDER = '[图片已省略，该模型不支持图片]';
@@ -236,7 +244,7 @@ const MEMORY_TOOLS: { name: string; description: string; schema: Record<string, 
   {
     name: 'search_vault',
     description:
-      '在当前用户的共享记忆库中按关键词搜索（多个词空格分隔，AND 逻辑），返回匹配的文件清单。',
+      '在 User 的共享记忆库中按关键词搜索（多个词空格分隔，AND 逻辑），返回匹配的文件清单。',
     schema: {
       type: 'object',
       properties: { query: { type: 'string', description: '搜索关键词' } },
@@ -245,7 +253,7 @@ const MEMORY_TOOLS: { name: string; description: string; schema: Record<string, 
   },
   {
     name: 'read_file',
-    description: '读取记忆库中某个文件的全文。path 是相对路径，例如 "memories/user-profile.md"。',
+    description: '读取记忆库中某个文件的全文。path 是相对路径，例如 "memories/User-core.md"。',
     schema: {
       type: 'object',
       properties: { path: { type: 'string', description: '相对于记忆库根目录的路径' } },
@@ -263,6 +271,7 @@ const MEMORY_TOOLS: { name: string; description: string; schema: Record<string, 
 export class DirectApiBackend implements AgentBackend {
   readonly kind = 'api' as const;
   private stopped = false;
+  private readonly activeTurns = new Map<AbortController, Promise<void>>();
   private readonly summaries: ConversationSummaryRepo;
   private readonly messages: MessageRepo;
   private historyCache: {
@@ -284,6 +293,7 @@ export class DirectApiBackend implements AgentBackend {
   async start(_resumeToken: string | null): Promise<void> {
     if (!this.opts.apiKey) throw new Error('这个联系人还没配 API key（联系人设置里填）');
     if (!this.opts.model) throw new Error('这个联系人还没配 model');
+    this.stopped = false;
   }
 
   alive(): boolean {
@@ -292,6 +302,9 @@ export class DirectApiBackend implements AgentBackend {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    const turns = [...this.activeTurns.entries()];
+    for (const [controller] of turns) controller.abort();
+    await Promise.allSettled(turns.map(([, turn]) => turn));
   }
 
   private compactSummary(existing: string, rows: MessageRow[]): string {
@@ -434,18 +447,16 @@ export class DirectApiBackend implements AgentBackend {
     );
 
     const room = this.opts.roomMode;
-    const currentRoomIds = new Set(roomMessageIds);
     const serializedRowText = (row: MessageRow): string => {
-      if (!room) return timestampedMessage(row.content, row.created_at, '历史消息');
-      const label = currentRoomIds.has(row.id) ? '本轮新消息' : '历史消息';
+      if (!room) return timestampedMessage(historicalMessageText(row), row.created_at, '历史消息');
       return row.sender === room.selfId
-        ? timestampedMessage(row.content, row.created_at, label)
+        ? timestampedMessage(row.content, row.created_at, '历史消息')
         : quotedRoomMessage({
           senderId: row.sender,
           senderName: room.nameOf(row.sender),
           content: row.content,
           createdAt: row.created_at,
-          temporal: label,
+          temporal: '历史消息',
         });
     };
 
@@ -460,23 +471,43 @@ export class DirectApiBackend implements AgentBackend {
       hardMax
     );
 
-    const selectKeepFrom = () => {
+    const selectKeepFrom = (maxMessages = hardMax, budgetRatio = 1) => {
       const summaryBlock = summary
         ? `# 对话滚动摘要（覆盖更早消息）\n${summary}`
         : '';
       const rawBudget = this.effectiveHistoryBudget(summaryBlock);
+      const tokenBudget = Math.max(512, Math.floor(rawBudget * budgetRatio));
       return chooseKeepFrom(
         rows.map((row) => ({ content: serializedRowText(row) })),
         minimum,
-        hardMax,
-        rawBudget
+        maxMessages,
+        tokenBudget
       );
     };
 
     keepFrom = selectKeepFrom();
     // extractive / external 都走本地滚动摘要；external 仅表示「允许将来接 LLM」，当前不外发
     while (this.opts.historySummaryStrategy !== 'off' && keepFrom > 0) {
-      const dropped = rows.splice(0, keepFrom);
+      // 高水位触发后不要只丢本轮溢出的 1–2 条，否则 summary/version 会每轮变化，
+      // 把 Gemini/Anthropic 可复用的 request prefix 逐轮打碎。一次压到 80% 的消息/预算
+      // 低水位；群聊仍以 currentRoomCount 为下限，本轮消息一条不丢。
+      const lowWaterMax = Math.max(
+        minimum,
+        currentRoomCount,
+        Math.floor(hardMax * SUMMARY_ROLLOVER_KEEP_RATIO)
+      );
+      const batchedKeepFrom = selectKeepFrom(
+        lowWaterMax,
+        SUMMARY_ROLLOVER_KEEP_RATIO
+      );
+      const dropCount = Math.max(keepFrom, batchedKeepFrom);
+      if (dropCount > keepFrom) {
+        this.opts.log(
+          `history summary rollover triggerDrop=${keepFrom} batchDrop=${dropCount} ` +
+          `targetMessages=${lowWaterMax} keepRatio=${SUMMARY_ROLLOVER_KEEP_RATIO}`
+        );
+      }
+      const dropped = rows.splice(0, dropCount);
       summary = this.compactSummary(summary, dropped);
       const through = dropped[dropped.length - 1].id;
       this.summaries.upsert(this.opts.contactId, memberId, summary, through);
@@ -567,7 +598,7 @@ export class DirectApiBackend implements AgentBackend {
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), this.opts.turnTimeoutMs);
 
-    void (async () => {
+    const turn = (async () => {
       try {
         const history = this.history(input.text, input.userMessageId, input.roomMessageIds);
         const historyHasImages = this.hasImages(history);
@@ -607,6 +638,8 @@ export class DirectApiBackend implements AgentBackend {
         queue.end();
       }
     })();
+    this.activeTurns.set(abort, turn);
+    void turn.finally(() => this.activeTurns.delete(abort));
 
     return {
       events: queue,
@@ -682,6 +715,7 @@ export class DirectApiBackend implements AgentBackend {
     const usage = provider.createUsage();
     let finalText = '';
     let toolRounds = 0;
+    let finalRoundText = '';
 
     try {
       while (true) {
@@ -702,6 +736,7 @@ export class DirectApiBackend implements AgentBackend {
           }
         }
         if (!round) throw new Error('上游流结束但没有返回轮次结果');
+        finalRoundText = round.text;
         provider.mergeUsage(usage, round.usage);
         if (!allowCalls || round.calls.length === 0) break;
 
@@ -724,6 +759,10 @@ export class DirectApiBackend implements AgentBackend {
 
     const usageLog = provider.usageLog?.(usage);
     if (usageLog) this.opts.log(usageLog);
+    if (!finalRoundText.trim()) {
+      const suffix = usage.finishReason === 'length' ? '（输出预算已耗尽）' : '';
+      throw new Error(`上游只返回了思考/工具过程，没有可显示的正文${suffix}`);
+    }
     queue.push({ type: 'done', finalText, usage: { ...usage, estimate } });
   }
 }

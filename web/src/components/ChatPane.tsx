@@ -5,6 +5,8 @@ import {
   type ContactStatus,
   type Message,
   type UserProfile,
+  type MessageOrigin,
+  type MessageReadStates,
   type WorkerJob,
 } from '../api';
 import { usePendingImages } from './ImageComposer';
@@ -13,8 +15,23 @@ import ExternalLinkViewer from './ExternalLinkViewer';
 import { JOB_ACTIVE } from './JobThread';
 import ChatHeader from './chat/ChatHeader';
 import Composer from './chat/Composer';
+import RuntimeDrawer from './chat/RuntimeDrawer';
 import MessageList, { type MessageEdit } from './chat/MessageList';
+import { useConfirm } from './ConfirmDialog';
 import { useModelCatalog, useUsagePoll } from './chat/useChatMetadata';
+import { messagesForChannel } from '../sideChannel';
+import { appendQuoteToDraft, buildSideQuote, type QuoteMode } from '../sideQuote';
+import {
+  buildFollowupPrompt,
+  buildReworkPrompt,
+  followupIdempotencyKey,
+  reworkIdempotencyKey,
+  type FollowupJobInput,
+} from '../sideJobActions';
+import {
+  prepareMessageSendAttempt,
+  type MessageSendAttempt,
+} from '../sendIdempotency';
 
 interface Props {
   contact: Contact;
@@ -23,12 +40,24 @@ interface Props {
   status: ContactStatus;
   user: UserProfile;
   onBack(): void;
-  onLoadEarlier(): void;
+  sideUnread: boolean;
+  readStates: MessageReadStates;
+  onChannelChange(channel: MessageOrigin): void;
+  onMarkRead(channel: MessageOrigin, throughMessageId: number): void;
+  onLoadEarlier(channel: MessageOrigin): void;
   onSettings(): void;
 }
 
-export default function ChatPane({ contact, contacts, messages, status, user, onBack, onLoadEarlier, onSettings }: Props) {
+export default function ChatPane({ contact, contacts, messages, status, user, onBack, readStates, sideUnread, onChannelChange, onMarkRead, onLoadEarlier, onSettings }: Props) {
+  const confirm = useConfirm();
   const isRoom = contact.kind === 'room';
+  const [channel, setChannel] = useState<MessageOrigin>('main');
+  const channelMessages = useMemo(
+    () => messagesForChannel(messages, channel),
+    [channel, messages]
+  );
+  const channelStatus: ContactStatus = status.origin && status.origin !== channel
+    ? { state: 'idle', origin: channel } : status;
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -40,12 +69,30 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [editing, setEditing] = useState<MessageEdit | null>(null);
   const [jobs, setJobs] = useState<WorkerJob[]>([]);
+  const [composerFocus, setComposerFocus] = useState(0);
   const [externalLink, setExternalLink] = useState<ExternalLinkView | null>(null);
+  // 方案 1b：运行时抽屉。桌面默认常驻，窄屏默认收起（是标题下的下拉卡）
+  const [runtimeOpen, setRuntimeOpen] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
+  const positionedChannelsRef = useRef(new Set<string>());
+  const boundaryContactRef = useRef(contact.id);
+  const unreadBoundariesRef = useRef<Record<MessageOrigin, number | null | undefined>>({ main: readStates.main.firstUnreadId, side: undefined });
   const stickToBottom = useRef(true);
   const jobsRef = useRef<WorkerJob[]>([]);
+  const sendAttemptRef = useRef<MessageSendAttempt | null>(null);
   jobsRef.current = jobs;
 
+  if (boundaryContactRef.current !== contact.id) {
+    boundaryContactRef.current = contact.id;
+    positionedChannelsRef.current.clear();
+    unreadBoundariesRef.current = { main: readStates.main.firstUnreadId, side: undefined };
+  }
+  if (unreadBoundariesRef.current[channel] === undefined) {
+    unreadBoundariesRef.current[channel] = readStates[channel].firstUnreadId;
+  }
+  const firstUnreadId = unreadBoundariesRef.current[channel] ?? null;
   const delegationEnabled = !!(contact.config.delegation as { enabled?: boolean } | undefined)?.enabled;
   const closeExternalView = useCallback(() => {
     setExternalLink(closeExternalLink());
@@ -103,8 +150,9 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
   const jobAnchors = useMemo(() => {
     const byMessage = new Map<number, WorkerJob[]>();
     const loose: WorkerJob[] = [];
-    const ids = messages.map((m) => m.id);
-    for (const job of [...jobs].sort((a, b) => a.created_at.localeCompare(b.created_at))) {
+    const ids = channelMessages.map((m) => m.id);
+    const channelJobs = channel === 'main' ? jobs : [];
+    for (const job of [...channelJobs].sort((a, b) => a.created_at.localeCompare(b.created_at))) {
       let target: number | null = null;
       if (job.origin_anchor_id != null) {
         for (const id of ids) {
@@ -117,11 +165,11 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
       else byMessage.set(target, [...(byMessage.get(target) ?? []), job]);
     }
     return { byMessage, loose };
-  }, [jobs, messages]);
+  }, [channel, channelMessages, jobs]);
 
   const bulkMessages = useMemo(
-    () => messages.filter((m) => m.kind !== 'thinking' || Boolean(m.content) || m.status === 'streaming'),
-    [messages]
+    () => channelMessages.filter((m) => m.kind !== 'thinking' || Boolean(m.content) || m.status === 'streaming'),
+    [channelMessages]
   );
   const bulkSelectedMessageIds = useMemo(
     () => bulkMessages.filter((m) => bulkMessageIds.has(m.id)).map((m) => m.id),
@@ -148,17 +196,43 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages, contact.id]);
+    if (!el) return;
+    const positionKey = `${contact.id}:${channel}`;
+    if (!positionedChannelsRef.current.has(positionKey)) {
+      if (firstUnreadId !== null && !channelMessages.some((message) => message.id === firstUnreadId)) {
+        return;
+      }
+      const frame = requestAnimationFrame(() => {
+        const divider = firstUnreadId === null
+          ? null
+          : el.querySelector<HTMLElement>(`[data-unread-divider="${firstUnreadId}"]`);
+        if (divider) divider.scrollIntoView({ block: 'start' });
+        else el.scrollTop = el.scrollHeight;
+        stickToBottom.current = firstUnreadId === null;
+        positionedChannelsRef.current.add(positionKey);
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+    if (stickToBottom.current) el.scrollTop = el.scrollHeight;
+  }, [channel, channelMessages, contact.id, firstUnreadId]);
 
   useEffect(() => {
     setSelectedMsg(null);
+    setChannel('main');
     setBulkMessageMode(false);
     setBulkMessageIds(new Set());
     setEditing(null);
     clearImages();
     setDraft('');
   }, [contact.id, clearImages]);
+
+  useEffect(() => {
+    setSelectedMsg(null);
+    setBulkMessageMode(false);
+    setBulkMessageIds(new Set());
+    setEditing(null);
+    stickToBottom.current = unreadBoundariesRef.current[channel] === null;
+  }, [channel]);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -172,10 +246,28 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
     setSendError(null);
     setSending(true);
     stickToBottom.current = true;
+    const attempt = prepareMessageSendAttempt(
+      sendAttemptRef.current,
+      contact.id,
+      content,
+      pendingFiles
+    );
+    sendAttemptRef.current = attempt;
     try {
-      await api.send(contact.id, content, pendingFiles);
+      const result = await api.send(
+        contact.id,
+        content,
+        pendingFiles,
+        attempt.idempotencyKey
+      );
+      sendAttemptRef.current = null;
       setDraft('');
       clearImages();
+      if (result.queued === false) {
+        setSendError(`${result.error ?? '当前排队已满'}；消息已保存，不会重复发送。`);
+      } else if (result.duplicate) {
+        setSendError('消息已保存；这次重试已去重。');
+      }
     } catch (e) {
       setSendError((e as Error).message);
     } finally {
@@ -241,7 +333,14 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
   const deleteSelectedMessages = async () => {
     const ids = bulkSelectedMessageIds;
     if (ids.length === 0 || bulkDeleting) return;
-    if (!window.confirm('删除选中的 ' + ids.length + ' 个消息气泡？未选中的消息不会受影响。')) return;
+    if (!(await confirm({
+      title: '删除消息',
+      message: `删除选中的 ${ids.length} 个消息气泡？未选中的消息不会受影响。`,
+      confirmLabel: '删除消息',
+      danger: true,
+    }))) {
+      return;
+    }
     setSendError(null);
     setSelectedMsg(null);
     setBulkDeleting(true);
@@ -256,26 +355,131 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
     }
   };
 
+  const toggleChannel = () => {
+    const next: MessageOrigin = channel === 'main' ? 'side' : 'main';
+    setChannel(next);
+    setSendError(null);
+    onChannelChange(next);
+  };
+
+  // 副窗那条原样带进主窗草稿：主窗历史里 origin=main + sender=user 不会被折叠，
+  // 模型因此拿得到完整验收正文，而不是 server 侧折出来的一行摘要。
+  const quoteToMain = (message: Message, mode: QuoteMode) => {
+    setDraft((current) => appendQuoteToDraft(current, buildSideQuote(message, mode)));
+    setSendError(null);
+    setChannel('main');
+    onChannelChange('main');
+    setComposerFocus((n) => n + 1);
+  };
+
+  const reworkJob = async (message: Message, hintedJob: WorkerJob): Promise<WorkerJob> => {
+    setSendError(null);
+    try {
+      const { job } = await api.job(hintedJob.id);
+      const created = await api.createJob({
+        runner: job.runner,
+        workspace: job.workspace,
+        prompt: buildReworkPrompt(job, message),
+        workerId: job.worker_id || undefined,
+        permissions: job.permissions,
+        requestedBy: job.requested_by || contact.id,
+        originContactId: job.origin_contact_id || contact.id,
+        originAnchorId: job.origin_anchor_id || undefined,
+        idempotencyKey: reworkIdempotencyKey(job.id, message.id),
+      });
+      loadJobs();
+      return created;
+    } catch (error) {
+      setSendError((error as Error).message);
+      throw error;
+    }
+  };
+
+  const followupJob = async (
+    message: Message,
+    hintedJob: WorkerJob,
+    input: FollowupJobInput
+  ): Promise<WorkerJob> => {
+    setSendError(null);
+    try {
+      const { job } = await api.job(hintedJob.id);
+      const created = await api.createJob({
+        runner: input.runner,
+        workspace: input.workspace.trim(),
+        prompt: buildFollowupPrompt(input, message),
+        workerId: job.worker_id || undefined,
+        permissions: job.permissions,
+        requestedBy: job.requested_by || contact.id,
+        originContactId: job.origin_contact_id || contact.id,
+        originAnchorId: job.origin_anchor_id || undefined,
+        idempotencyKey: followupIdempotencyKey(job.id, message.id, input),
+      });
+      loadJobs();
+      return created;
+    } catch (error) {
+      setSendError((error as Error).message);
+      throw error;
+    }
+  };
+
+  const markTaskDone = async (message: Message, job: WorkerJob, taskPath: string): Promise<void> => {
+    setSendError(null);
+    try {
+      await api.setVaultTaskStatus({
+        path: taskPath,
+        status: 'done',
+        note: [
+          `User 通过 AI Hub 副窗验收 Worker job \`${job.id}\` 并点击「置 done」。`,
+          `回执 message id：\`${message.id}\`。`,
+          '',
+          '### 验收回执',
+          message.content.slice(0, 2000),
+        ].join('\n'),
+      });
+    } catch (error) {
+      setSendError((error as Error).message);
+      throw error;
+    }
+  };
+
+  const turnBusy =
+    channelStatus.state === 'thinking' ||
+    channelStatus.state === 'streaming' ||
+    channelStatus.state.startsWith('tool:');
+
   return (
-    <main className="chat-pane">
+    <main className={'chat-pane' + (runtimeOpen ? ' runtime-open' : '')}>
       <ChatHeader
         contact={contact}
-        status={status}
-        usage={usage}
-        quota={quota}
-        codexQuota={codexQuota}
-        grokQuota={grokQuota}
-        modelCatalog={modelCatalog}
-        switchingModel={switchingModel}
-        bulkMode={bulkMessageMode}
-        bulkDeleting={bulkDeleting}
-        bulkCount={bulkMessages.length}
+        status={channelStatus}
+        channel={channel}
+        sideUnread={sideUnread}
+        runtimeOpen={runtimeOpen}
         onBack={onBack}
-        onSettings={onSettings}
-        onToggleBulk={toggleBulkMessageMode}
-        onSwitchModel={(value) => void switchModel(value)}
-        onSwitchEffort={(value) => void switchEffort(value)}
+        onToggleChannel={toggleChannel}
+        onToggleRuntime={() => setRuntimeOpen((open) => !open)}
       />
+
+      {runtimeOpen && (
+        <RuntimeDrawer
+          contact={contact}
+          status={channelStatus}
+          usage={usage}
+          quota={quota}
+          codexQuota={codexQuota}
+          grokQuota={grokQuota}
+          modelCatalog={modelCatalog}
+          switchingModel={switchingModel}
+          bulkMode={bulkMessageMode}
+          bulkCount={bulkMessages.length}
+          bulkDeleting={bulkDeleting}
+          onClose={() => setRuntimeOpen(false)}
+          onSettings={onSettings}
+          onToggleBulk={toggleBulkMessageMode}
+          onSwitchModel={(value) => void switchModel(value)}
+          onSwitchEffort={(value) => void switchEffort(value)}
+        />
+      )}
 
       {bulkMessageMode && (
         <div className="bulk-tool-bar">
@@ -295,42 +499,57 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
       <MessageList
         contact={contact}
         contacts={contacts}
-        messages={messages}
-        status={status}
+        messages={channelMessages}
+        channel={channel}
+        status={channelStatus}
         user={user}
         scrollRef={scrollRef}
         selectedMessage={selectedMsg}
         editing={editing}
         bulkMode={bulkMessageMode}
+        firstUnreadId={firstUnreadId}
         bulkIds={bulkMessageIds}
         jobsByMessage={jobAnchors.byMessage}
         looseJobs={jobAnchors.loose}
-        onLoadEarlier={onLoadEarlier}
+        jobs={jobs}
+        onLoadEarlier={() => onLoadEarlier(channel)}
         onScroll={onScroll}
         onSelect={setSelectedMsg}
         onEditing={setEditing}
         onSaveEdit={() => void saveEdit()}
+        onVisibleThrough={(messageId) => onMarkRead(channel, messageId)}
         onBulkToggle={toggleBulkMessage}
         onResend={(message) => void resend(message)}
         onDelete={(message) => void remove(message)}
         onJobsChanged={loadJobs}
         onOpenExternalLink={openExternalView}
+        onQuoteToMain={quoteToMain}
+        onRework={reworkJob}
+        onFollowup={followupJob}
+        onMarkTaskDone={markTaskDone}
       />
 
-      {sendError && <div className="send-error">操作失败：{sendError}</div>}
+      {sendError && <div className="send-error">操作提示：{sendError}</div>}
 
-      <Composer
-        contactName={contact.name}
-        draft={draft}
-        sending={sending}
-        canSendImages={canSendImages}
-        pendingImages={pendingImages}
-        maxImages={maxImages}
-        onDraft={setDraft}
-        onAddImages={addComposerImages}
-        onRemoveImage={removeImage}
-        onSend={() => void send()}
-      />
+      {channel === 'main' ? (
+        <Composer
+          contactName={contact.name}
+          draft={draft}
+          sending={sending}
+          busy={turnBusy}
+          onInterrupt={() => void api.interrupt(contact.id)}
+          canSendImages={canSendImages}
+          pendingImages={pendingImages}
+          maxImages={maxImages}
+          focusSignal={composerFocus}
+          onDraft={setDraft}
+          onAddImages={addComposerImages}
+          onRemoveImage={removeImage}
+          onSend={() => void send()}
+        />
+      ) : (
+        <div className="side-readonly">副窗只读 · 点消息可「引到主窗」再继续对话</div>
+      )}
       {externalLink && <ExternalLinkViewer view={externalLink} onClose={closeExternalView} />}
     </main>
   );

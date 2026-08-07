@@ -4,13 +4,40 @@ After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
+Type=simple
+User=ai-hub
+Group=ai-hub
 WorkingDirectory=/opt/ai-hub/server
 EnvironmentFile=-/opt/ai-hub/.env
+Environment=HOME=/var/lib/ai-hub/home
+Environment=XDG_CONFIG_HOME=/var/lib/ai-hub/home/.config
+Environment=PATH=/var/lib/ai-hub/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/usr/bin/node dist/index.js
 Restart=on-failure
 RestartSec=5
 KillMode=mixed
 TimeoutStopSec=120
+UMask=0077
+StateDirectory=ai-hub
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/opt/ai-hub/server/data /var/lib/ai-hub /var/backups/ai-hub
 
 [Install]
 WantedBy=multi-user.target

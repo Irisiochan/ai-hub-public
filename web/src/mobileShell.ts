@@ -57,6 +57,7 @@ export function getNativePlugins(): NativePlugins | undefined {
 export const isNativeShell = (): boolean => cap()?.isNativePlatform?.() === true;
 
 const BASE_KEY = 'ai-hub.serverBase';
+const SESSION_KEY = 'ai-hub.session';
 let cachedBase: string | null = null;
 
 export function normalizeBase(url: string): string {
@@ -77,6 +78,16 @@ export function setServerBase(url: string): void {
   localStorage.setItem(BASE_KEY, cachedBase);
 }
 
+export function getNativeSession(): string {
+  return isNativeShell() ? localStorage.getItem(SESSION_KEY) ?? '' : '';
+}
+
+export function setNativeSession(token: string): void {
+  if (!isNativeShell()) return;
+  if (token) localStorage.setItem(SESSION_KEY, token);
+  else localStorage.removeItem(SESSION_KEY);
+}
+
 /** 相对路径（/api/...）挂上已保存的服务器地址；Web 部署下原样返回。 */
 export function withBase(path: string): string {
   const base = getServerBase();
@@ -88,7 +99,10 @@ export function withBase(path: string): string {
 export function initNativeShell(): void {
   if (!isNativeShell()) return;
   const plugins = cap()?.Plugins;
-  void plugins?.StatusBar?.setOverlaysWebView({ overlay: true }).catch(() => {});
+  // overlay:false —— WebView 整体在系统状态栏下方布局，不依赖 env(safe-area-inset-top)
+  //（Android WebView 上该 inset 经常为 0，overlay:true + CSS 仍会顶栏压图标）。
+  // CSS 仍保留 --safe-top，作为 iOS 刘海/后续若改回 edge-to-edge 时的双保险。
+  void plugins?.StatusBar?.setOverlaysWebView({ overlay: false }).catch(() => {});
   void plugins?.StatusBar?.setStyle({ style: 'DARK' }).catch(() => {});
   plugins?.App?.addListener('backButton', () => {
     void plugins.App?.minimizeApp();
@@ -106,9 +120,11 @@ export function notifyIncoming(msg: {
   kind: string;
   status: string;
   content: string;
+  origin: 'main' | 'side';
 }): void {
   if (!isNativeShell() || document.visibilityState === 'visible') return;
   if (msg.role !== 'assistant' || msg.kind !== 'text' || msg.status !== 'done') return;
+  if (msg.origin !== 'main') return;
   if (!msg.content.trim() || notified.has(msg.id)) return;
   notified.add(msg.id);
   if (notified.size > 500) {

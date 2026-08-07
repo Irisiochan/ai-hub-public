@@ -42,7 +42,7 @@
     "tokenEnv": "VAULT_TOKEN",
     "sourceTag": "codex",
     "backlogQuery": "triage-backlog",
-    "cacheMs": 300000
+    "cacheMs": 3600000
   },
   "routing": {
     "fuzzyFallback": true,
@@ -60,18 +60,61 @@
     "minimumGapMinutes": 180,
     "silentStartHour": 0,
     "silentEndHour": 9,
-    "recipients": ["claude-code", "codex", "grok-build"]
+    "recipients": ["claude", "codex", "aye"]
+  },
+  "taskReminders": {
+    "enabled": true,
+    "intervalMinutes": 45,
+    "jitterSeconds": 900,
+    "recipient": "claude"
   },
   "idea": {
     "enabled": false,
+    "writeDiary": true,
     "roomId": "room-contact-id",
     "hostName": "DS 主持",
     "dailyDispatchLimit": 1,
-    "reactionRounds": 3,
+    "reactionRounds": 2,
     "recentTopicLimit": 12,
     "maxTopicAttempts": 3,
     "roundPollMs": 2000,
     "roundTimeoutMs": 1200000
+  },
+  "coordination": {
+    "enabled": false,
+    "roomId": "room-contact-id",
+    "hostName": "DS 主持",
+    "tasksDir": "/opt/memory-vault/tasks",
+    "reminderRoomTags": ["ai-hub", "worker", "deploy", "工程"],
+    "dailyLimit": 8,
+    "scanIntervalMinutes": 5
+  },
+  "diary": {
+    "enabled": false,
+    "atHour": 2,
+    "atMinute": 30,
+    "targetOffsetDays": 1,
+    "maxEntries": 8,
+    "extractAttempts": 2,
+    "minMessages": 4,
+    "minUserMessages": 2,
+    "messageLimit": 400,
+    "transcriptMaxChars": 24000,
+    "source": "hub-rollup"
+  },
+  "outcomes": {
+    "enabled": true,
+    "intervalMinutes": 5,
+    "maxAgeDays": 30,
+    "batchSize": 50
+  },
+  "followups": {
+    "enabled": true,
+    "minExpectedMinutes": 5,
+    "maxExpectedMinutes": 180,
+    "defaultExpectedMinutes": 30,
+    "expireAfterMinutes": 360,
+    "scanLimit": 40
   },
   "breakers": {
     "dailyEvents": 2000,
@@ -99,7 +142,7 @@
       "intervalMinutes": 45,
       "jitterSeconds": 900,
       "category": "daily",
-      "summary": "Proactive daily companion check for the AI Hub user. Prefer natural care, reminders, or light openers over empty noise."
+      "summary": "Proactive daily companion check for User. Prefer natural care, reminders, or light openers over empty noise."
     },
     {
       "id": "daily-idea-room",
@@ -109,6 +152,10 @@
       "jitterSeconds": 3600,
       "category": "idea",
       "summary": "Choose one novel free-form topic and host a room discussion."
+    },
+    {
+      "id": "diary-rollup",
+      "type": "diary-rollup"
     },
     {
       "id": "vault-backlog",

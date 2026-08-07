@@ -208,7 +208,19 @@ export class AnthropicProvider implements DirectApiProvider<AnthropicConversatio
           .filter((block): block is Extract<AnthropicBlock, { type: 'tool_use' }> => block.type === 'tool_use')
           .map((block) => ({ id: block.id, name: block.name, input: parseJson(block.inputJson) }))
       : [];
-    yield { type: 'round', result: { calls, response: { ordered } satisfies AnthropicRoundResponse, usage } };
+    if (stopReason) {
+      // Anthropic: max_tokens；与 OpenAI length / Gemini MAX_TOKENS 对齐为 UI 可读标签。
+      usage.finishReason = stopReason === 'max_tokens' ? 'length' : stopReason;
+    }
+    yield {
+      type: 'round',
+      result: {
+        calls,
+        response: { ordered } satisfies AnthropicRoundResponse,
+        usage,
+        text: ordered.flatMap((block) => block.type === 'text' ? [block.text] : []).join(''),
+      },
+    };
   }
 
   appendToolResults(
@@ -249,6 +261,7 @@ export class AnthropicProvider implements DirectApiProvider<AnthropicConversatio
       total.cacheCreation = (total.cacheCreation ?? 0) + (round.cacheCreation ?? 0);
       total.cacheRead = (total.cacheRead ?? 0) + (round.cacheRead ?? 0);
     }
+    if (round.finishReason) total.finishReason = round.finishReason;
   }
 
   usageLog(usage: ProviderUsage): string {

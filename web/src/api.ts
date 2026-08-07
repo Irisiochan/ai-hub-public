@@ -1,6 +1,26 @@
-import { notifyIncoming, withBase } from './mobileShell';
+import { getNativeSession, notifyIncoming, setNativeSession, withBase } from './mobileShell';
 import { SHANGHAI_TZ_OFFSET } from './time';
 import type { ContactBackend, ContactConfig, ContactKind } from '@ai-hub/contact-config';
+import {
+  buildMessageRequestBody,
+  createMessageIdempotencyKey,
+  persistedSendResultFromError,
+  type SendMessageResult,
+} from './sendIdempotency';
+
+export type MessageOrigin = 'main' | 'side';
+
+export interface MessageReadState {
+  origin: MessageOrigin;
+  lastReadMessageId: number;
+  firstUnreadId: number | null;
+  unreadCount: number;
+}
+
+export interface MessageReadStates {
+  main: MessageReadState;
+  side: MessageReadState;
+}
 
 export interface Contact {
   id: string;
@@ -12,14 +32,17 @@ export interface Contact {
   config: ContactConfig;
   state: string;
   /** Busy room member display name from server statusOf (undefined for DM/idle). */
+  origin?: MessageOrigin;
   member?: string;
   last_content: string | null;
   last_at: string | null;
+  readStates?: MessageReadStates;
 }
 
 export interface Message {
   id: number;
   contact_id: string;
+  idempotency_key?: string | null;
   sender: string;
   role: 'user' | 'assistant' | 'system';
   kind: 'text' | 'thinking' | 'tool_use' | 'error';
@@ -27,6 +50,7 @@ export interface Message {
   status: 'streaming' | 'done' | 'error' | 'interrupted';
   turn_id: string | null;
   meta: string;
+  origin: MessageOrigin;
   created_at: string;
   attachments?: Attachment[];
 }
@@ -39,15 +63,34 @@ export interface Attachment {
   url: string;
 }
 
+class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: Record<string, unknown>
+  ) {
+    super(message);
+  }
+}
+
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const isForm = init?.body instanceof FormData;
+  const headers = new Headers(init?.headers);
+  if (!isForm && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  const session = getNativeSession();
+  if (session && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${session}`);
   const res = await fetch(withBase(url), {
-    ...(!isForm ? { headers: { 'Content-Type': 'application/json' } } : {}),
     ...init,
+    headers,
+    credentials: 'include',
   });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error((body as { error?: string }).error ?? `${res.status} ${res.statusText}`);
+    const body = await res.json().catch(() => ({})) as Record<string, unknown>;
+    throw new ApiRequestError(
+      typeof body.error === 'string' ? body.error : `${res.status} ${res.statusText}`,
+      res.status,
+      body
+    );
   }
   return res.json() as Promise<T>;
 }
@@ -115,6 +158,7 @@ export interface ContactPayload {
 
 export interface ContactStatus {
   state: string;
+  origin?: MessageOrigin;
   member?: string;
 }
 
@@ -164,7 +208,23 @@ export interface WorkerJob {
     dirtyFiles?: string[];
     head?: string | null;
     ahead?: number | null;
+    declared?: {
+      stage?: string;
+      summary?: string;
+      nextOwner?: string;
+      needsUserDecision?: boolean;
+      blocker?: string;
+    };
   } | null;
+  delivery_summary?: {
+    state: 'in_progress' | 'completed_not_delivered' | 'delivered_waiting_deploy'
+      | 'online_waiting_validation' | 'closed_loop' | 'user_decision' | 'rework_required'
+      | 'failure_or_blocked';
+    label: string;
+    summary: string;
+    nextOwner: string;
+    needsUserDecision: boolean;
+  };
   origin_contact_id: string | null;
   origin_anchor_id: number | null;
   /** 1 when task window is soft-hidden; list APIs omit these */
@@ -202,6 +262,23 @@ export interface PublishStatus {
 }
 
 export const api = {
+  session: () => req<{ enabled: boolean; authenticated: boolean }>('/api/session'),
+
+  login: async (password: string) => {
+    const result = await req<{ enabled: boolean; authenticated: boolean; sessionToken?: string }>(
+      '/api/session',
+      { method: 'POST', body: JSON.stringify({ password }) }
+    );
+    if (result.sessionToken) setNativeSession(result.sessionToken);
+    return result;
+  },
+
+  logout: async () => {
+    const result = await req<{ enabled: boolean; authenticated: boolean }>('/api/session', { method: 'DELETE' });
+    setNativeSession('');
+    return result;
+  },
+
   contacts: () => req<{ contacts: Contact[] }>('/api/contacts'),
 
   createContact: (data: ContactPayload) =>
@@ -227,26 +304,39 @@ export const api = {
   deleteContact: (id: string) =>
     req<{ ok: boolean }>(`/api/contacts/${id}`, { method: 'DELETE' }),
 
-  messages: (contactId: string, opts: { before?: number; after?: number; limit?: number } = {}) => {
+  messages: (contactId: string, opts: { before?: number; after?: number; limit?: number; origin?: MessageOrigin | 'all' } = {}) => {
     const q = new URLSearchParams();
-    if (opts.before) q.set('before', String(opts.before));
-    if (opts.after) q.set('after', String(opts.after));
+    if (opts.before !== undefined) q.set('before', String(opts.before));
+    if (opts.after !== undefined) q.set('after', String(opts.after));
     if (opts.limit) q.set('limit', String(opts.limit));
-    return req<{ messages: Message[] }>(`/api/contacts/${contactId}/messages?${q}`);
+    if (opts.origin) q.set('origin', opts.origin);
+    return req<{ messages: Message[]; readState: MessageReadState | null }>(`/api/contacts/${contactId}/messages?${q}`);
   },
 
-  send: (contactId: string, content: string, images: File[] = []) => {
-    if (images.length === 0) return req<{ messageId: number }>(`/api/contacts/${contactId}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({ content }),
-    });
-    const body = new FormData();
-    body.set('content', content);
-    for (const image of images) body.append('images', image, image.name);
-    return req<{ messageId: number }>(`/api/contacts/${contactId}/messages`, {
-      method: 'POST',
-      body,
-    });
+  markRead: (contactId: string, origin: MessageOrigin, throughMessageId: number) =>
+    req<{ readState: MessageReadState }>(`/api/contacts/${contactId}/messages/read`, {
+      method: 'PATCH',
+      body: JSON.stringify({ origin, throughMessageId }),
+    }),
+
+  send: async (
+    contactId: string,
+    content: string,
+    images: File[] = [],
+    idempotencyKey = createMessageIdempotencyKey()
+  ): Promise<SendMessageResult> => {
+    try {
+      return await req<SendMessageResult>(`/api/contacts/${contactId}/messages`, {
+        method: 'POST',
+        body: buildMessageRequestBody(content, images, idempotencyKey),
+      });
+    } catch (error) {
+      if (error instanceof ApiRequestError) {
+        const persisted = persistedSendResultFromError(error.body);
+        if (persisted) return persisted;
+      }
+      throw error;
+    }
   },
 
   interrupt: (contactId: string) =>
@@ -304,12 +394,31 @@ export const api = {
   createJob: (data: {
     runner: 'codex' | 'claude' | 'grok'; workspace: string; prompt: string; workerId?: string;
     permissions?: { write?: boolean; shell?: boolean; ssh?: boolean };
+    requestedBy?: string; originContactId?: string; originAnchorId?: number; idempotencyKey?: string;
   }) => req<WorkerJob>('/api/jobs', { method: 'POST', body: JSON.stringify(data) }),
+
+  setVaultTaskStatus: (data: { path: string; status: 'done'; note: string }) =>
+    req<{ ok: true; path: string; status: 'done' }>('/api/vault/task-status', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   jobAction: (id: string, action: 'cancel' | 'pause' | 'resume') =>
     req<{ ok: boolean; status: string }>(`/api/jobs/${id}/action`, {
       method: 'POST', body: JSON.stringify({ action }),
     }),
+
+  resolveJobOutOfBand: (id: string) =>
+    req<{ ok: boolean; job: WorkerJob }>(`/api/jobs/${id}/resolve-out-of-band`, {
+      method: 'POST', body: '{}',
+    }),
+
+  updateJobDelivery: (
+    id: string,
+    data: { stage: string; summary?: string; nextOwner?: string; blocker?: string },
+  ) => req<{ ok: boolean; job: WorkerJob }>(`/api/jobs/${id}/delivery`, {
+    method: 'PATCH', body: JSON.stringify(data),
+  }),
 
   /** Soft-hide a worker task window (not a hard delete; does not touch chat messages). */
   deleteJob: (id: string, opts: { force?: boolean } = {}) =>
@@ -322,10 +431,11 @@ export const api = {
 export interface SseHandlers {
   onMessage(msg: Message): void;
   onDelta(d: { contactId: string; messageId: number; text: string }): void;
-  onStatus(s: { contactId: string; state: string; detail?: string; member?: string }): void;
+  onStatus(s: { contactId: string; state: string; detail?: string; member?: string; origin?: MessageOrigin }): void;
   onContact(c: Contact): void;
   onPrune(p: { contactId: string; ids?: number[]; afterId?: number }): void;
   onUser(u: UserProfile): void;
+  onReadState(s: MessageReadState & { contactId: string }): void;
   onJob?(j: WorkerJob): void;
   onJobMessage?(m: JobMessage): void;
   onWorker?(w: Worker): void;
@@ -344,17 +454,21 @@ export function connectEvents(
   let es: EventSource | null = null;
   let closed = false;
   let hadError = false;
+  let resyncOnOpen = false;
 
-  const open = () => {
+  const open = (reconcileAfterOpen = false) => {
     if (closed) return;
+    if (reconcileAfterOpen) resyncOnOpen = true;
     es?.close();
     const query = new URLSearchParams({ subscribe: subscriptions().join(',') });
-    es = new EventSource(withBase(`/api/events?${query}`));
+    const session = getNativeSession();
+    if (session) query.set('session', session);
+    es = new EventSource(withBase(`/api/events?${query}`), { withCredentials: true });
     es.onopen = () => {
-      if (hadError) {
-        hadError = false;
-        handlers.onReconnect();
-      }
+      const shouldResync = hadError || resyncOnOpen;
+      hadError = false;
+      resyncOnOpen = false;
+      if (shouldResync) handlers.onReconnect();
     };
     es.onerror = () => {
       hadError = true; // EventSource auto-retries; onopen will trigger resync
@@ -369,6 +483,7 @@ export function connectEvents(
     es.addEventListener('contact', (e) => handlers.onContact(JSON.parse(e.data)));
     es.addEventListener('prune', (e) => handlers.onPrune(JSON.parse(e.data)));
     es.addEventListener('user', (e) => handlers.onUser(JSON.parse(e.data)));
+    es.addEventListener('read-state', (e) => handlers.onReadState(JSON.parse(e.data)));
     es.addEventListener('job', (e) => handlers.onJob?.(JSON.parse(e.data)));
     es.addEventListener('job-message', (e) => handlers.onJobMessage?.(JSON.parse(e.data)));
     es.addEventListener('worker', (e) => handlers.onWorker?.(JSON.parse(e.data)));
@@ -379,8 +494,8 @@ export function connectEvents(
   const onVisible = () => {
     if (document.visibilityState !== 'visible') return;
     // phone coming back from lock screen: EventSource may be silently dead
-    if (!es || es.readyState === EventSource.CLOSED) open();
-    handlers.onReconnect();
+    if (!es || es.readyState === EventSource.CLOSED) open(true);
+    else handlers.onReconnect();
   };
   document.addEventListener('visibilitychange', onVisible);
 
@@ -390,6 +505,9 @@ export function connectEvents(
       document.removeEventListener('visibilitychange', onVisible);
       es?.close();
     },
-    refresh: open,
+    // Changing delta subscriptions closes the old EventSource. Always reconcile
+    // after the replacement connection opens so events in that small gap cannot
+    // leave the UI on a stale streaming row.
+    refresh: () => open(true),
   };
 }

@@ -5,6 +5,7 @@ import type { ContactBackend, ContactConfig } from '@ai-hub/contact-config';
 import { loadMigrations } from './migrations.js';
 
 export type Db = Database.Database;
+export type MessageOrigin = 'main' | 'side';
 
 export interface ContactRow {
   id: string;
@@ -24,6 +25,7 @@ export interface ContactRow {
 export interface MessageRow {
   id: number;
   contact_id: string;
+  idempotency_key: string | null;
   sender: string;
   role: 'user' | 'assistant' | 'system';
   kind: 'text' | 'thinking' | 'tool_use' | 'error';
@@ -31,6 +33,7 @@ export interface MessageRow {
   status: 'streaming' | 'done' | 'error' | 'interrupted';
   turn_id: string | null;
   meta: string; // JSON
+  origin: MessageOrigin;
   created_at: string;
   deleted: number;
 }
@@ -51,6 +54,24 @@ export interface ConversationSummaryRow {
   summary: string;
   through_message_id: number;
   version: number;
+  updated_at: string;
+}
+
+export interface TaskWritebackRow {
+  id: number;
+  idempotency_key: string;
+  message_id: number;
+  contact_id: string;
+  contact_name: string;
+  task_path: string | null;
+  action: string | null;
+  confidence: number | null;
+  due: string | null;
+  source_quote: string;
+  source_ref: string;
+  status: 'processing' | 'applied' | 'proposed' | 'rejected' | 'ambiguous' | 'conflict' | 'queued' | 'failed';
+  detail: string | null;
+  created_at: string;
   updated_at: string;
 }
 

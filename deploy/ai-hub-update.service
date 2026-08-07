@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Hub privileged deployment worker
+ConditionPathExists=/var/lib/ai-hub/deploy.request
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/rm -f /var/lib/ai-hub/deploy.request
+ExecStart=/bin/bash /opt/ai-hub/deploy/update.sh
+StandardOutput=append:/var/log/ai-hub-deploy.log
+StandardError=append:/var/log/ai-hub-deploy.log
+# 0077 会让 git pull 出来的源文件变成 600 root:root，非 root 网关读不到自己要读的
+# 人设与 overlay（2026-08-01 阿野的 ③b 叠层就是这样静默失效的）。检出里没有秘密——
+# .env 未跟踪且单独 600——所以源码按 0022 生成。
+UMask=0022
+Nice=5

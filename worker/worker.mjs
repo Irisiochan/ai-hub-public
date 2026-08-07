@@ -5,6 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import {
   classifyDelivery,
+  deliveryCompletesJob,
   DEFAULT_RECONCILE_GRACE_MS,
   extractDeliveryDeclaration,
   isGitAncestor,
@@ -60,6 +61,37 @@ const workspaceEntries = (cfg.workspaces ?? []).flatMap((entry) => {
 });
 
 const auth = { Authorization: `Bearer ${cfg.token}`, 'Content-Type': 'application/json' };
+
+// Two live worker processes against one worker row ping-pong the gateway's
+// boot_id and double-claim capacity, so refuse to start when the state file's
+// lock holder is still alive (2026-08-06 pause-doesn't-stick incident).
+// `${statePath}.lock` is taken by the state-store's short-lived write lease.
+const lockPath = `${statePath}.instance.lock`;
+function acquireSingleInstanceLock() {
+  try {
+    const existing = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    if (existing?.pid && existing.pid !== process.pid) {
+      let alive = false;
+      try { process.kill(existing.pid, 0); alive = true; } catch {}
+      if (alive) {
+        console.error(
+          `another PC Worker (pid ${existing.pid}, since ${existing.startedAt}) already uses ${statePath}; ` +
+          `exiting. If that pid is not a worker, delete ${lockPath} and retry.`
+        );
+        process.exit(3);
+      }
+    }
+  } catch {}
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }), 'utf8');
+}
+function releaseSingleInstanceLock() {
+  try {
+    const existing = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    if (existing?.pid === process.pid) fs.unlinkSync(lockPath);
+  } catch {}
+}
+acquireSingleInstanceLock();
+process.on('exit', releaseSingleInstanceLock);
 const estimatedBootMs = Date.now() - os.uptime() * 1000;
 const bootId = process.env.AI_HUB_WORKER_BOOT_ID
   || `${os.hostname()}:${Math.round(estimatedBootMs / 60_000)}`;
@@ -339,7 +371,10 @@ async function execute(job, options = {}) {
   // Same defense as server claudeCli.ts: settings.json "env" blocks re-inject
   // ANTHROPIC_* when absent, so claude must get explicit overrides
   // (empty key → apiKeySource: none → subscription OAuth).
-  const env = { ...process.env, NO_COLOR: '1' };
+  // AI_HUB_ALLOW_MASTER：ai-hub 的 pre-commit 钩子挡住共享检出上对 master 的直接提交，
+  // 那是给多个交互会话互相收暂存区用的。Worker job 是独立一条串行车道，仍按委派规范
+  // 在 workspace 的当前分支上 commit/push，所以这里显式放行。
+  const env = { ...process.env, NO_COLOR: '1', AI_HUB_ALLOW_MASTER: '1' };
   if (job.runner === 'claude') {
     delete env.CLAUDECODE;
     delete env.CLAUDE_CODE_ENTRYPOINT;
@@ -406,8 +441,14 @@ async function execute(job, options = {}) {
   if (delivery.state === 'blocked_local_changes' || delivery.state === 'blocked_unpushed') {
     return { status: 'blocked', result: state.result || 'runner left unfinished local work', delivery };
   }
-  if (exit.code === 0) {
-    return { status: 'done', result: state.result || 'runner exited successfully', delivery };
+  if (deliveryCompletesJob(delivery, exit.code)) {
+    return {
+      status: 'done',
+      result: state.result || (exit.code === 0
+        ? 'runner exited successfully'
+        : `delivery completed before runner exited code=${exit.code}`),
+      delivery,
+    };
   }
   return {
     status: 'failed',

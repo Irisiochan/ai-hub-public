@@ -11,6 +11,7 @@ import type {
   ProviderUsage,
 } from './provider.js';
 import { parseJson, ProviderHttpError, sseEvents } from './provider.js';
+import { DsmlTextFilter } from './dsml.js';
 
 interface OpenAiConversation {
   messages: Record<string, unknown>[];
@@ -91,6 +92,7 @@ export class OpenAiProvider implements DirectApiProvider<OpenAiConversation> {
     let roundText = '';
     const toolCalls = new Map<number, { id: string; name: string; args: string }>();
     const usage: ProviderRoundUsage = { input: 0, output: 0, cacheRead: 0 };
+    const dsml = new DsmlTextFilter();
 
     for await (const data of sseEvents(res)) {
       if (!data) continue;
@@ -101,10 +103,14 @@ export class OpenAiProvider implements DirectApiProvider<OpenAiConversation> {
       } catch {
         continue;
       }
-      const delta = event.choices?.[0]?.delta;
+      const choice = event.choices?.[0];
+      const delta = choice?.delta;
       if (delta?.content) {
-        roundText += delta.content;
-        yield { type: 'delta', text: delta.content };
+        const visible = dsml.push(delta.content);
+        if (visible) {
+          roundText += visible;
+          yield { type: 'delta', text: visible };
+        }
       }
       if (delta?.reasoning_content) yield { type: 'thinking', text: delta.reasoning_content };
       for (const toolCall of delta?.tool_calls ?? []) {
@@ -115,25 +121,52 @@ export class OpenAiProvider implements DirectApiProvider<OpenAiConversation> {
         if (toolCall.function?.arguments) entry.args += toolCall.function.arguments;
         toolCalls.set(index, entry);
       }
-      if (event.usage) {
-        usage.input += event.usage.prompt_tokens ?? event.usage.input_tokens ?? 0;
-        usage.output += event.usage.completion_tokens ?? event.usage.output_tokens ?? 0;
-        usage.cacheRead! += event.usage.prompt_cache_hit_tokens
-          ?? event.usage.prompt_tokens_details?.cached_tokens
-          ?? 0;
+      // 单次 HTTP 流的 usage 是整请求汇总，不是 delta。OpenAI/DeepSeek 规范只在
+      // 末包带非空 usage；部分中转（openrouter/硅基流动等）会在每个 chunk 重复塞
+      // 同一份 prompt_tokens。这里用 last-write，禁止 +=，否则长文（如 3万 token
+      // 输出 × 每包都带 usage）会把「本轮」吹到百万级。
+      if (event.usage && typeof event.usage === 'object') {
+        const input = event.usage.prompt_tokens ?? event.usage.input_tokens;
+        const output = event.usage.completion_tokens ?? event.usage.output_tokens;
+        const cacheRead = event.usage.prompt_cache_hit_tokens
+          ?? event.usage.prompt_tokens_details?.cached_tokens;
+        if (typeof input === 'number') usage.input = input;
+        if (typeof output === 'number') usage.output = output;
+        if (typeof cacheRead === 'number') usage.cacheRead = cacheRead;
+      }
+      if (typeof choice?.finish_reason === 'string' && choice.finish_reason) {
+        usage.finishReason = choice.finish_reason;
       }
     }
 
-    const calls = [...toolCalls.entries()].sort(([left], [right]) => left - right).map(([, call], index) => ({
+    const tail = dsml.finish();
+    if (tail.visible) {
+      roundText += tail.visible;
+      yield { type: 'delta', text: tail.visible };
+    }
+    if (tail.detected && tail.calls.length === 0) {
+      throw new Error('上游返回了无法解析的 DSML 工具调用标记');
+    }
+
+    const standardCalls = [...toolCalls.entries()].sort(([left], [right]) => left - right).map(([, call], index) => ({
       ...call,
       id: call.id || `call_${conversation.toolRound}_${index}`,
     }));
+    const calls = [...standardCalls];
+    const seen = new Set(calls.map((call) => `${call.name}\u0000${JSON.stringify(parseJson(call.args))}`));
+    for (const call of tail.calls) {
+      const key = `${call.name}\u0000${JSON.stringify(call.input)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      calls.push({ id: `call_${conversation.toolRound}_${calls.length}`, name: call.name, args: JSON.stringify(call.input) });
+    }
     yield {
       type: 'round',
       result: {
         calls: calls.map((call) => ({ id: call.id, name: call.name, input: parseJson(call.args) })),
         response: { text: roundText, calls } satisfies OpenAiRoundResponse,
         usage,
+        text: roundText,
       },
     };
   }
@@ -171,5 +204,6 @@ export class OpenAiProvider implements DirectApiProvider<OpenAiConversation> {
     if (this.config.promptCache !== 'off') {
       total.cacheRead = (total.cacheRead ?? 0) + (round.cacheRead ?? 0);
     }
+    if (round.finishReason) total.finishReason = round.finishReason;
   }
 }

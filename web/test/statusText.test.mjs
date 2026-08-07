@@ -8,8 +8,8 @@ import { statusText } from '../src/statusText.ts';
 
 // Room with member → member name
 assert.equal(
-  statusText({ state: 'thinking', member: 'Member A' }, { isRoom: true, contactName: '会议室' }),
-  'Member A 思考中…'
+  statusText({ state: 'thinking', member: '示例助手' }, { isRoom: true, contactName: '会议室' }),
+  '示例助手 思考中…'
 );
 
 // Room WITHOUT member → must NOT use room title
@@ -28,12 +28,12 @@ assert.equal(
 
 // Streaming / tool paths keep member
 assert.equal(
-  statusText({ state: 'streaming', member: 'Member A' }, { isRoom: true, contactName: '会议室' }),
-  'Member A 正在输入…'
+  statusText({ state: 'streaming', member: '示例助手' }, { isRoom: true, contactName: '会议室' }),
+  '示例助手 正在输入…'
 );
 assert.equal(
-  statusText({ state: 'tool:search_vault', member: 'Member A' }, { isRoom: true, contactName: '会议室' }),
-  'Member A 正在用 search_vault'
+  statusText({ state: 'tool:search_vault', member: '示例助手' }, { isRoom: true, contactName: '会议室' }),
+  '示例助手 正在用 search_vault'
 );
 
 console.log('statusText: ok');

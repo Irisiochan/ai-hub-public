@@ -2,6 +2,7 @@ import type { Db, MessageRow } from '../db.js';
 import { timestampedMessage } from '../memory/inject.js';
 import { estimateTokens } from './tokenEstimate.js';
 import { ConversationSummaryRepo } from './conversationSummaryRepo.js';
+import { historicalMessageText } from './sideChannel.js';
 
 export type SummaryMutationResult =
   | { action: 'none' }
@@ -23,12 +24,15 @@ export function summaryNeedsTimeAnchorUpgrade(summary: string | null | undefined
 }
 
 function summaryLine(row: MessageRow, nameOf?: (sender: string) => string): string {
+  const text = historicalMessageText(row);
   const who = nameOf
     ? nameOf(row.sender)
-    : row.role === 'assistant'
-      ? '助手'
-      : 'User';
-  const compact = row.content.replace(/\s+/g, ' ').trim().slice(0, 240);
+    : text.startsWith('[后台') || text.startsWith('[主动消息触发]')
+      ? '网关'
+      : row.role === 'assistant'
+        ? '助手'
+        : 'User';
+  const compact = text.replace(/\s+/g, ' ').trim().slice(0, 240);
   // 摘要行同样是历史，不带时间锚点会被读成"刚刚"
   return `- ${timestampedMessage(`${who}：${compact}`, row.created_at, '历史摘要')}`;
 }
