@@ -483,3 +483,16 @@ triage 派单原文最多 16000 字（`triage-worker.mjs:106`），worker 回执
    非 assistant 行在 DM 下标成「User：」，也就是滚动摘要**正在把 triage 机器指令和
    worker 回执记成 User 说的话**。这会实打实地污染 AI 对 User 的认知。
    它和本需求同源，Phase 3 一起修。
+
+---
+
+## 已实施约定（2026-08-07 从 README 迁入，当前行为）
+
+私聊消息的 `origin` 只有 `main` / `side` 两值。用户输入默认写入 `main`；自动化调用
+`POST /api/contacts/:id/messages` 时必须显式发送 `origin` 和 `automated: true`，否则会按
+用户输入处理并污染主窗。派单、轮询、自动测试写 `side`；daily 主动陪伴写 `main`，并用
+`hidden: true` 隐藏只供模型执行的内部触发指令，让主窗只出现 AI 真正对 User 说的话。
+
+`GET /api/contacts/:id/messages` 默认只返回 `main`，可传 `origin=side` 或 `origin=all`。
+历史数据不会自动迁移或启发式重分类，migration 只把既有行保守保留在 `main`。同一底层
+会话的上下文不拆；已经完成的 `side` 行在后续 prompt / 滚动摘要中会压成一行后台摘要。

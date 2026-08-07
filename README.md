@@ -17,6 +17,10 @@
 - **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
   任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
 - **订阅额度可见**：Claude / Codex 标题栏实时显示 5h / 周窗口剩余
+- **自主 triage worker**：VPS 常驻事件分诊——daily 主动陪伴、纪念日/生日提醒、任务到期催办、
+  临时离开跟进，全部走廉价 flash 模型把关后才打扰人
+- **会议室工作总线**：Plan 就绪的任务自动在群里派单 → AI 接单委派回 PC Worker 执行 →
+  回执与验收贴回群（coordination 模式，派单走网关签发的可信 meta，成员正文无法伪造）
 - **运维内建**：token 门控的一键部署端点（拉取/构建/重启/健康检查/失败自动回滚）、
   SQLite 在线定时备份（integrity 校验 + 保留窗口）、发布状态面板
 
@@ -77,6 +81,8 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
   （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server，
   `overlay.md` 是该联系人相对它家厂商 base prompt 的差分叠层（跟着仓库走，四个后端通用）
 - 系统提示词分几层、想改口吻该动哪一层：[docs/prompt-layers.md](docs/prompt-layers.md)
+- 自动消息的主窗/副窗 `origin` 约定（派单、轮询写 `side`，daily 陪伴写 `main`）：
+  [docs/split-private-and-side-channel-windows.md](docs/split-private-and-side-channel-windows.md) 文末「已实施约定」
 - **多会话并发写这个仓库时先开自己的分支**（暂存区是仓库级共享状态，直接在 master 上
   add/commit 会互相收走对方的文件）：
 
@@ -150,14 +156,3 @@ overlay 网络内、绑定内网 IP；**绝对不要把 3900 直接暴露公网*
 ## License
 
 MIT © Irisiochan
-
-### 自动消息的主窗 / 副窗约定
-
-私聊消息的 `origin` 只有 `main` / `side` 两值。用户输入默认写入 `main`；自动化调用
-`POST /api/contacts/:id/messages` 时必须显式发送 `origin` 和 `automated: true`，否则会按
-用户输入处理并污染主窗。派单、轮询、自动测试写 `side`；daily 主动陪伴写 `main`，并用
-`hidden: true` 隐藏只供模型执行的内部触发指令，让主窗只出现 AI 真正对 User 说的话。
-
-`GET /api/contacts/:id/messages` 默认只返回 `main`，可传 `origin=side` 或 `origin=all`。
-历史数据不会自动迁移或启发式重分类，migration 只把既有行保守保留在 `main`。同一底层
-会话的上下文不拆；已经完成的 `side` 行在后续 prompt / 滚动摘要中会压成一行后台摘要。
