@@ -112,13 +112,11 @@ test('a successful CLI delivery declaration takes priority over git dirt', () =>
 
 test('snapshotRepo records branch and behind while preserving null without an upstream', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-delivery-snapshot-'));
-  const remote = path.join(root, 'remote.git');
   const first = path.join(root, 'first');
-  const second = path.join(root, 'second');
   const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+  const gitText = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
   try {
     fs.mkdirSync(first);
-    git(root, 'init', '--bare', remote);
     git(first, 'init', '--initial-branch=main');
     git(first, 'config', 'user.email', 'worker-test@example.invalid');
     git(first, 'config', 'user.name', 'Worker Test');
@@ -131,17 +129,18 @@ test('snapshotRepo records branch and behind while preserving null without an up
     assert.equal(withoutUpstream.ahead, null);
     assert.equal(withoutUpstream.behind, null);
 
-    git(first, 'remote', 'add', 'origin', remote);
-    git(first, 'push', '-u', 'origin', 'main');
-    git(remote, 'symbolic-ref', 'HEAD', 'refs/heads/main');
-    git(root, 'clone', remote, second);
-    git(second, 'config', 'user.email', 'worker-test@example.invalid');
-    git(second, 'config', 'user.name', 'Worker Test');
-    fs.writeFileSync(path.join(second, 'tracked.txt'), 'two\n');
-    git(second, 'add', 'tracked.txt');
-    git(second, 'commit', '-m', 'second');
-    git(second, 'push');
-    git(first, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    const base = gitText(first, 'rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(first, 'tracked.txt'), 'two\n');
+    git(first, 'add', 'tracked.txt');
+    git(first, 'commit', '-m', 'upstream-only');
+    const upstream = gitText(first, 'rev-parse', 'HEAD');
+    git(first, 'switch', '--detach', base);
+    git(first, 'branch', '--force', 'main', base);
+    git(first, 'switch', 'main');
+    git(first, 'remote', 'add', 'origin', first);
+    git(first, 'update-ref', 'refs/remotes/origin/main', upstream);
+    git(first, 'config', 'branch.main.remote', 'origin');
+    git(first, 'config', 'branch.main.merge', 'refs/heads/main');
 
     const behind = await snapshotRepo(first);
     assert.equal(behind.branch, 'main');
