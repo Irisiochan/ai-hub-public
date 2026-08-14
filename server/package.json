@@ -7,6 +7,8 @@
     "dev": "tsx watch src/index.ts",
     "test:affect": "tsx test/affect.test.mts",
     "test:receipt": "tsx test/workerReceiptPreview.test.mts",
+    "check:memory-version": "node scripts/check-memory-vault-version.mjs",
+    "smoke:memory-contract": "node scripts/smoke-memory-vault-contract.mjs",
     "pretest": "npm run test:affect && npm run test:receipt",
     "test": "tsx test/wechatChannel.test.mts && tsx test/wechatRuntime.test.mts && tsx test/capture.test.mts && tsx test/codexNativeCompact.test.mts && tsx test/deliveryChecks.test.mts && tsx test/taskWriteback.test.mts && tsx test/deployPermissions.test.mts && tsx test/deployStatus.test.mts && tsx test/deployReceipt.test.mts && tsx test/blockedJobResolution.test.mts && tsx test/sideJobRework.test.mts && tsx test/deliveryStatus.test.mts && tsx test/coordinationJobMutex.test.mts && tsx test/coordinationKeys.test.mts && tsx test/jobOutbox.test.mts && tsx test/hubMcpSecurity.test.mts &&tsx test/memorySearchInjection.test.mts && tsx test/vaultTasks.test.mts && tsx test/backendReliability.test.mts && tsx test/directApiOutputReliability.test.mts && tsx test/messageIdempotency.test.mts && tsx test/messageDelete.test.mts && tsx test/paginationLimit.test.mts && tsx test/readState.test.mts && tsx test/vaultOutbox.test.mts && tsx test/publishStatus.test.mts && tsx scripts/smoke-grok-quota.ts && tsx scripts/smoke-session-preamble-budget.ts && tsx scripts/smoke-gateway-injection-budget.ts && tsx scripts/smoke-prompt-cache-summary-rollover.ts && tsx scripts/smoke-conversation-replay.ts",
     "build": "tsc -p tsconfig.json",
@@ -14,7 +16,7 @@
   },
   "dependencies": {
     "@ai-hub/contact-config": "file:../shared/contact-config",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^11.10.0",
     "express": "^4.21.2",
     "fflate": "^0.8.3",

@@ -1,0 +1,6 @@
+services:
+  memory-vault:
+    ports:
+      - "127.0.0.1:18900:8900"
+    environment:
+      VAULT_ALLOWED_HOSTS: "memory-vault:*,127.0.0.1:*"

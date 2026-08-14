@@ -120,12 +120,13 @@ Compose 的私人数据始终写入被 gitignore 的 `vault-data/`，不会进�
 
 ## 安全模型与威胁边界
 
-**信任边界 = 你的私有网络。** 网关目前没有账号体系，设计为跑在 Tailscale 等
+**信任边界 = 你的私有网络。** 网关目前没有账号或租户体系，设计为跑在 Tailscale 等
 overlay 网络内、绑定内网 IP；**绝对不要把 3900 直接暴露公网**。在此边界内：
 
-- 没有账号、租户或会话级访问控制：任何能访问 Web UI 的人都可能读取聊天记录、管理联系人、
-  生成 Worker 配对令牌，并在已有权限边界内发起委派。Tailnet 里有其他成员时，必须用 ACL
-  只允许受信设备/用户访问 3900，不能把“加入同一 Tailnet”直接等同于可信。
+- 设置 `HUB_TOKEN` 后，Web UI、API 与 SSE 会启用同一套 session 鉴权；CLI 联系人的 Hub MCP
+  Bearer 还会按联系人派生并默认强制校验。它仍是单用户边界，不是多租户权限系统。任何取得
+  session 的人都可能读取聊天记录、管理联系人、生成 Worker 配对令牌，并在已有权限边界内
+  发起委派。Tailnet 里有其他成员时，仍必须用 ACL 只允许受信设备/用户访问 3900。
 
 - API key 服务端存储、返回 UI 永远打码；`.env` 与数据库不进 git
 - 微信 iLink bot 通道的部署与凭据边界见 [docs/wechat-channel.md](docs/wechat-channel.md)

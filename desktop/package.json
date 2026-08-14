@@ -12,14 +12,14 @@
     "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^12.11.1",
     "express": "^4.21.2",
     "multer": "^2.2.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
-    "electron": "^35.0.0",
-    "electron-builder": "^25.1.8"
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3"
   }
 }
