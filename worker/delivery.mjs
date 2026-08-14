@@ -62,6 +62,9 @@ export async function snapshotRepo(cwd) {
     runGit(cwd, ['branch', '--show-current']),
   ]);
   if (head === null || status === null || diff === null) return null;
+  const branch = branchRaw?.trim()
+    || (await runGit(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']))?.trim()
+    || null;
   const fingerprint = crypto
     .createHash('sha256')
     .update(status)
@@ -76,7 +79,7 @@ export async function snapshotRepo(cwd) {
     dirtyFiles: statusFiles(status),
     ahead: aheadRaw === null ? null : Number(aheadRaw.trim()) || 0,
     behind: behindRaw === null ? null : Number(behindRaw.trim()) || 0,
-    branch: branchRaw?.trim() || null,
+    branch,
     fingerprint,
   };
 }
