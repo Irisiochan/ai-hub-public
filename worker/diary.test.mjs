@@ -11,6 +11,7 @@ import {
 } from './triage-core.mjs';
 import { buildTranscript, rollupDay, shanghaiWeekday } from './diary-rollup.mjs';
 import { DeepSeekClient } from './triage-clients.mjs';
+import { listenOnFetchSafePort } from './test-http.mjs';
 
 const HOUR = 60 * 60_000;
 
@@ -260,7 +261,7 @@ test('a broken extraction reports the raw body, not just an offset', async () =>
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ choices: [{ message: { content: broken } }], usage: {} }));
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnFetchSafePort(server);
   process.env.DIARY_TEST_KEY = 'test-only';
   try {
     const client = new DeepSeekClient({
@@ -288,7 +289,7 @@ test('an oversized broken body is clipped and labelled with its real length', as
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ choices: [{ message: { content: broken } }], usage: {} }));
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnFetchSafePort(server);
   process.env.DIARY_TEST_KEY = 'test-only';
   try {
     const client = new DeepSeekClient({

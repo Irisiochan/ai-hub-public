@@ -5,6 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { listenOnFetchSafePort } from './test-http.mjs';
 
 const TERMINATION_TIMEOUT_MS = 5_000;
 
@@ -115,7 +116,7 @@ setTimeout(() => process.exit(0), 500);
     });
   });
 
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnFetchSafePort(server);
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('missing local test server address');
   const config = path.join(dir, 'config.json');

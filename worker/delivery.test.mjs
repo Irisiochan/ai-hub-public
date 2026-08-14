@@ -141,7 +141,7 @@ test('snapshotRepo records branch and behind while preserving null without an up
     git(second, 'add', 'tracked.txt');
     git(second, 'commit', '-m', 'second');
     git(second, 'push');
-    git(first, 'fetch', 'origin');
+    git(first, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main');
 
     const behind = await snapshotRepo(first);
     assert.equal(behind.branch, 'main');

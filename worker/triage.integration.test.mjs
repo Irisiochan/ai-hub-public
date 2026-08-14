@@ -17,14 +17,14 @@ import {
   shanghaiDateAt,
   TriageStore,
 } from './triage-core.mjs';
+import { listenOnFetchSafePort } from './test-http.mjs';
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 
-function listen(handler) {
+async function listen(handler) {
   const server = http.createServer(handler);
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve(server));
-  });
+  await listenOnFetchSafePort(server);
+  return server;
 }
 
 function portOf(server) {
