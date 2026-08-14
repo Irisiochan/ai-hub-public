@@ -11,6 +11,7 @@ worker/worker-state.json
 worker/worker-state.json.tmp
 worker/worker-state.json.lock
 worker/worker-state.json.*.tmp
+worker/*.instance.lock
 worker/launcher-state.json
 worker/launcher-state.json.tmp
 worker/launcher.stop

@@ -111,6 +111,48 @@ export function isUserMessage(message) {
   return Boolean(String(message.content ?? '').trim());
 }
 
+/**
+ * Deterministic User-presence signal from a message list.
+ * Only User (user) messages count; AI output is never presence.
+ * Fail-open: returns active=false when evidence is incomplete.
+ */
+export function irisPresenceFromMessages(messages, {
+  now = Date.now(),
+  idleMinutes = 30,
+  messageTimestampMs = null,
+} = {}) {
+  const minutes = Number(idleMinutes);
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return { active: false, reason: 'disabled', lastUserMessageAt: null };
+  }
+  const thresholdMs = minutes * 60_000;
+  const tsOf = typeof messageTimestampMs === 'function'
+    ? messageTimestampMs
+    : (message) => {
+      const raw = message?.created_at ?? message?.createdAt ?? message?.timestamp ?? null;
+      if (raw == null || raw === '') return null;
+      if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+      const asNumber = Number(raw);
+      if (Number.isFinite(asNumber) && !/[-T:]/.test(String(raw))) return asNumber;
+      const parsed = Date.parse(String(raw));
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+  let latest = null;
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!isUserMessage(message)) continue;
+    const ts = tsOf(message);
+    if (ts == null) continue;
+    if (latest === null || ts > latest) latest = ts;
+  }
+  if (latest === null) {
+    return { active: false, reason: 'no-user-message', lastUserMessageAt: null };
+  }
+  if (now - latest <= thresholdMs) {
+    return { active: true, reason: 'recent-user-message', lastUserMessageAt: latest };
+  }
+  return { active: false, reason: 'idle', lastUserMessageAt: latest };
+}
+
 export function messageNumericId(message) {
   const id = Number(message?.id ?? message?.message_id);
   return Number.isFinite(id) ? id : null;

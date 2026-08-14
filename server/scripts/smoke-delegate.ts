@@ -60,12 +60,163 @@ const tools = buildDelegateTools(store, db, 'glm', {
 });
 const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
 
+// route_class 服务端硬闸（实现单验收 a-g）
+const routeTools = buildDelegateTools(store, db, 'route-smoke', {
+  enabled: true,
+  workspaces: [ws],
+  allowShell: true,
+  maxOpenJobs: 10,
+});
+const routeDelegate = routeTools.find((tool) => tool.name === 'delegate_to_worker')!;
+const routeStatus = routeTools.find((tool) => tool.name === 'worker_job_status')!;
+const jobFrom = (text: string) => {
+  const id = text.match(/任务 ([0-9a-f-]{36})/)?.[1] ?? '';
+  return db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined;
+};
+
+let routeOut = await routeDelegate.exec({ route_class: 'implement', workspace: ws, prompt: 'route a' });
+let routeJob = jobFrom(routeOut.text);
+let routeOptions = JSON.parse(routeJob?.options || '{}');
+check(
+  'a) implement 不填 runner → codex + policy',
+  routeOut.ok && routeJob?.runner === 'codex'
+    && routeOptions.routeClass === 'implement' && routeOptions.runnerSource === 'policy',
+  `${routeOut.text}\n${JSON.stringify(routeOptions)}`
+);
+
+routeOut = await routeDelegate.exec({
+  route_class: 'implement',
+  runner: 'grok',
+  workspace: ws,
+  prompt: 'route b',
+});
+check(
+  'b) implement + grok 无 override → 拒绝并给正确默认',
+  !routeOut.ok && routeOut.text.includes('route_class=implement')
+    && routeOut.text.includes('runner=grok') && routeOut.text.includes('正确默认是 codex'),
+  routeOut.text
+);
+
+const reviewOut = await routeDelegate.exec({
+  route_class: 'review', runner: 'grok', workspace: ws, prompt: 'route c review',
+});
+const mechanicalExplicitOut = await routeDelegate.exec({
+  route_class: 'mechanical', runner: 'grok', workspace: ws, prompt: 'route c mechanical',
+});
+check('c) review / mechanical + grok → 放行', reviewOut.ok && mechanicalExplicitOut.ok,
+  `${reviewOut.text}\n${mechanicalExplicitOut.text}`);
+
+routeOut = await routeDelegate.exec({ route_class: 'mechanical', workspace: ws, prompt: 'route d' });
+routeJob = jobFrom(routeOut.text);
+routeOptions = JSON.parse(routeJob?.options || '{}');
+check(
+  'd) mechanical 不填 runner → grok + policy',
+  routeOut.ok && routeJob?.runner === 'grok'
+    && routeOptions.routeClass === 'mechanical' && routeOptions.runnerSource === 'policy',
+  `${routeOut.text}\n${JSON.stringify(routeOptions)}`
+);
+
+routeOut = await routeDelegate.exec({
+  route_class: 'implement',
+  runner: 'grok',
+  runner_override_reason: '专项兼容性复现',
+  workspace: ws,
+  prompt: 'route e',
+});
+routeJob = jobFrom(routeOut.text);
+routeOptions = JSON.parse(routeJob?.options || '{}');
+const overrideStatus = await routeStatus.exec({ job_id: routeJob?.id ?? '' });
+check(
+  'e) implement + grok + override → 放行，持久化并由 status 返回 reason',
+  routeOut.ok && routeJob?.runner === 'grok'
+    && routeOptions.runnerSource === 'override'
+    && routeOptions.runnerOverrideReason === '专项兼容性复现'
+    && overrideStatus.ok && overrideStatus.text.includes('runnerOverrideReason：专项兼容性复现'),
+  `${routeOut.text}\n${JSON.stringify(routeOptions)}\n${overrideStatus.text}`
+);
+
+routeOut = await routeDelegate.exec({ workspace: ws, prompt: 'route f' });
+check(
+  'f) 缺 route_class → 拒绝并给 enum 全表',
+  !routeOut.ok && ['implement', 'fix', 'review', 'recon', 'mechanical']
+    .every((value) => routeOut.text.includes(value)),
+  routeOut.text
+);
+
+const claudeDenied = await routeDelegate.exec({
+  route_class: 'implement', runner: 'claude', workspace: ws, prompt: 'table-out denied',
+});
+const claudeOverride = await routeDelegate.exec({
+  route_class: 'implement',
+  runner: 'claude',
+  runner_override_reason: '需要 Claude 专项验证',
+  workspace: ws,
+  prompt: 'table-out allowed',
+});
+const claudeOverrideJob = jobFrom(claudeOverride.text);
+const claudeOverrideOptions = JSON.parse(claudeOverrideJob?.options || '{}');
+check(
+  '表外 claude 无 override 拒绝、有 override 放行',
+  !claudeDenied.ok && claudeDenied.text.includes('正确默认是 codex')
+    && claudeOverride.ok && claudeOverrideJob?.runner === 'claude'
+    && claudeOverrideOptions.runnerSource === 'override',
+  `${claudeDenied.text}\n${claudeOverride.text}`
+);
+
+const emptyOverride = await routeDelegate.exec({
+  route_class: 'implement',
+  runner: 'grok',
+  runner_override_reason: '   ',
+  workspace: ws,
+  prompt: 'empty override denied',
+});
+check('空 override reason 拒绝', !emptyOverride.ok && emptyOverride.text.includes('非空字符串'), emptyOverride.text);
+
+const fixDefault = await routeDelegate.exec({ route_class: 'fix', workspace: ws, prompt: 'fix default' });
+const reconDefault = await routeDelegate.exec({ route_class: 'recon', workspace: ws, prompt: 'recon default' });
+check(
+  '完整默认表补证：fix → codex，recon → grok',
+  jobFrom(fixDefault.text)?.runner === 'codex' && jobFrom(reconDefault.text)?.runner === 'grok',
+  `${fixDefault.text}\n${reconDefault.text}`
+);
+
+const legacy = store.create({
+  requestedBy: 'route-smoke',
+  runner: 'codex',
+  workspace: ws,
+  prompt: 'legacy job without route metadata',
+  permissions: { write: false, shell: true, ssh: false },
+});
+if ('error' in legacy) throw new Error(legacy.error);
+routeOut = await routeStatus.exec({ job_id: legacy.job.id });
+check(
+  'g) 存量 job 无新字段 → status 显示未知且不崩',
+  routeOut.ok && routeOut.text.includes('routeClass：未知，runnerSource：未知'),
+  routeOut.text
+);
+
+check(
+  'tool description 写入稳定默认表且移除仅列 runner 文案',
+  routeDelegate.description.includes('implement/fix→codex')
+    && routeDelegate.description.includes('review/recon/mechanical→grok')
+    && routeDelegate.description.includes('runner_override_reason')
+    && !routeDelegate.description.includes('可用 runner：'),
+  routeDelegate.description
+);
+
 // 1. 越界 workspace 被拒
-let out = await byName.delegate_to_worker.exec({ runner: 'claude', workspace: '/etc', prompt: 'x' });
+let out = await byName.delegate_to_worker.exec({
+  route_class: 'review',
+  runner: 'claude',
+  runner_override_reason: '覆盖 Claude workspace 校验',
+  workspace: '/etc',
+  prompt: 'x',
+});
 check('workspace 越界被拒', !out.ok && out.text.includes('白名单'));
 
 // 2. SSH 是独立、显式的双层能力，不能被普通 shell 偷渡
 out = await byName.delegate_to_worker.exec({
+  route_class: 'implement',
   runner: 'codex',
   workspace: ws,
   prompt: '部署到 VPS',
@@ -81,6 +232,7 @@ const sshTools = buildDelegateTools(store, db, 'ssh-contact', {
   maxOpenJobs: 10,
 });
 out = await sshTools.find((tool) => tool.name === 'delegate_to_worker')!.exec({
+  route_class: 'implement',
   runner: 'codex',
   workspace: ws,
   prompt: '部署到 User-vps:/opt/app，只重启 target.service',
@@ -105,10 +257,20 @@ check(
   '旧的无条件 deploy-tail 指令已移除',
   !sshGuidance.includes('登记完即交付完成') && !sshGuidance.includes('若仅剩部署则另建 deploy-tail'),
 );
+check(
+  '编码任务外派规范注入 route_class 默认表',
+  sshGuidance.includes('implement/fix→codex')
+    && sshGuidance.includes('review/recon/mechanical→grok')
+    && sshGuidance.includes('runner_override_reason')
+    && sshGuidance.includes('必须显式传 route_class'),
+  sshGuidance,
+);
 
 // 3. 含糊的裸版本号被拒，不能悄悄退回 Worker 默认模型
 out = await byName.delegate_to_worker.exec({
+  route_class: 'review',
   runner: 'claude',
+  runner_override_reason: '覆盖 Claude 模型归一化测试',
   workspace: ws,
   prompt: 'x',
   model: '4.6',
@@ -117,7 +279,9 @@ check('Claude 裸版本号被拒', !out.ok && out.text.includes('不能只写 4.
 
 // 4. 正常派单
 out = await byName.delegate_to_worker.exec({
+  route_class: 'review',
   runner: 'claude',
+  runner_override_reason: '覆盖 Claude 固定版本测试',
   workspace: ws,
   prompt: '修一下 README 的错别字，改完 commit',
   model: 'Opus 4.6',
@@ -140,7 +304,9 @@ check(
 );
 
 // 5. codex 不带 shell 被拒（allowShell 开着但 runner 规则仍要求显式 shell → 自动带上）
-out = await byName.delegate_to_worker.exec({ runner: 'codex', workspace: ws, prompt: 'x', write: false });
+out = await byName.delegate_to_worker.exec({
+  route_class: 'implement', runner: 'codex', workspace: ws, prompt: 'x', write: false,
+});
 check('codex 自动带 shell 可派', out.ok, out.text);
 const readOnlyJobId = out.text.match(/任务 ([0-9a-f-]{36})/)?.[1] ?? '';
 const readOnlyPermissions = JSON.parse(
@@ -148,7 +314,7 @@ const readOnlyPermissions = JSON.parse(
 );
 check('只读派单真实写入 write=false', readOnlyPermissions.write === false && readOnlyPermissions.shell === true);
 
-// 5b. 不传 model/effort 时补默认：claude → Opus 5 / high，codex → gpt-5.6-sol / high，grok 不动
+// 5b. 不传 model/effort 时补默认：claude → Opus 5 / high，codex → gpt-5.6-sol / high，grok → 4.6 / high
 const sshDelegate = sshTools.find((tool) => tool.name === 'delegate_to_worker')!;
 const optionsOf = async (input: Record<string, unknown>) => {
   const res = await sshDelegate.exec(input);
@@ -156,26 +322,43 @@ const optionsOf = async (input: Record<string, unknown>) => {
   const id = res.text.match(/任务 ([0-9a-f-]{36})/)?.[1] ?? '';
   return JSON.parse((db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined)?.options || '{}');
 };
-let defaults = await optionsOf({ runner: 'claude', workspace: ws, prompt: 'x' });
+let defaults = await optionsOf({
+  route_class: 'review', runner: 'claude', runner_override_reason: '覆盖 Claude 默认值测试', workspace: ws, prompt: 'x',
+});
 check(
   'claude 默认 Opus 5 + high',
   defaults.model === 'claude-opus-5' && defaults.reasoning === 'high',
   JSON.stringify(defaults)
 );
-defaults = await optionsOf({ runner: 'codex', workspace: ws, prompt: 'x' });
+defaults = await optionsOf({ route_class: 'implement', runner: 'codex', workspace: ws, prompt: 'x' });
 check(
   'codex 默认 gpt-5.6-sol + high',
   defaults.model === 'gpt-5.6-sol' && defaults.reasoning === 'high',
   JSON.stringify(defaults)
 );
-defaults = await optionsOf({ runner: 'claude', workspace: ws, prompt: 'x', model: 'Opus 4.6', effort: 'low' });
+defaults = await optionsOf({
+  route_class: 'review', runner: 'claude', runner_override_reason: '覆盖 Claude 显式值测试',
+  workspace: ws, prompt: 'x', model: 'Opus 4.6', effort: 'low',
+});
 check(
   '显式传参不被默认值覆盖',
   defaults.model === 'claude-opus-4-6' && defaults.reasoning === 'low',
   JSON.stringify(defaults)
 );
-defaults = await optionsOf({ runner: 'grok', workspace: ws, prompt: 'x' });
-check('grok 不补默认', defaults.model === undefined && defaults.reasoning === undefined, JSON.stringify(defaults));
+defaults = await optionsOf({ route_class: 'review', runner: 'grok', workspace: ws, prompt: 'x' });
+check(
+  'grok 默认 grok-4.6 + high',
+  defaults.model === 'grok-4.6' && defaults.reasoning === 'high',
+  JSON.stringify(defaults)
+);
+defaults = await optionsOf({
+  route_class: 'review', runner: 'grok', workspace: ws, prompt: 'x', model: 'grok-4.5', effort: 'medium',
+});
+check(
+  'grok 显式传参覆盖默认值',
+  defaults.model === 'grok-4.5' && defaults.reasoning === 'medium',
+  JSON.stringify(defaults)
+);
 
 // 6. 状态查询（自己的 / 别人的）
 out = await byName.worker_job_status.exec({ job_id: jobId });
@@ -185,8 +368,8 @@ out = await foreign.find((t) => t.name === 'worker_job_status')!.exec({ job_id: 
 check('别人的任务查不了', !out.ok);
 
 // 7. open jobs 上限
-await byName.delegate_to_worker.exec({ runner: 'claude', workspace: ws, prompt: '3rd' });
-out = await byName.delegate_to_worker.exec({ runner: 'claude', workspace: ws, prompt: '4th' });
+await byName.delegate_to_worker.exec({ route_class: 'implement', runner: 'codex', workspace: ws, prompt: '3rd' });
+out = await byName.delegate_to_worker.exec({ route_class: 'implement', runner: 'codex', workspace: ws, prompt: '4th' });
 check('超过 maxOpenJobs 被拒', !out.ok && out.text.includes('队列'));
 
 // 8. 完成 → onFinished 恰好一次

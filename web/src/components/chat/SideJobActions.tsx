@@ -11,12 +11,13 @@ import { useConfirm } from '../ConfirmDialog';
 interface Props {
   message: Message;
   job: WorkerJob;
+  onHandled(): void;
   onRework(message: Message, job: WorkerJob): Promise<WorkerJob>;
   onFollowup(message: Message, job: WorkerJob, input: FollowupJobInput): Promise<WorkerJob>;
   onMarkTaskDone(message: Message, job: WorkerJob, taskPath: string): Promise<void>;
 }
 
-export default function SideJobActions({ message, job, onRework, onFollowup, onMarkTaskDone }: Props) {
+export default function SideJobActions({ message, job, onHandled, onRework, onFollowup, onMarkTaskDone }: Props) {
   const confirm = useConfirm();
   const [busy, setBusy] = useState<'rework' | 'followup' | 'done' | null>(null);
   const [createdId, setCreatedId] = useState<string | null>(null);
@@ -34,6 +35,7 @@ export default function SideJobActions({ message, job, onRework, onFollowup, onM
     try {
       const created = await onRework(message, job);
       setCreatedId(created.id);
+      onHandled();
     } catch {
       // ChatPane routes the API error to its existing visible sendError slot.
     } finally {
@@ -50,6 +52,7 @@ export default function SideJobActions({ message, job, onRework, onFollowup, onM
       setCreatedId(created.id);
       setInstruction('');
       setPanel(null);
+      onHandled();
     } catch {
       // ChatPane routes the API error to its existing visible sendError slot.
     } finally {
@@ -73,6 +76,7 @@ export default function SideJobActions({ message, job, onRework, onFollowup, onM
       await onMarkTaskDone(message, job, exactPath);
       setDonePath(exactPath);
       setPanel(null);
+      onHandled();
     } catch {
       // ChatPane routes the API error to its existing visible sendError slot.
     } finally {

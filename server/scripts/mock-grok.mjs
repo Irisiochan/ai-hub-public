@@ -1,4 +1,16 @@
 const args = process.argv.slice(2);
+
+if (args[0] === 'models') {
+  console.log('You are logged in with grok.com.');
+  console.log('');
+  console.log('Default model: grok-4.6');
+  console.log('');
+  console.log('Available models:');
+  console.log('  * grok-4.6 (default)');
+  console.log('  - grok-4.5');
+  process.exit(0);
+}
+
 const promptIndex = args.indexOf('-p');
 const prompt = promptIndex >= 0 ? args[promptIndex + 1] ?? '' : '';
 const sessionIndex = Math.max(args.indexOf('-s'), args.indexOf('-r'));

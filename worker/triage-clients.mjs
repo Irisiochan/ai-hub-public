@@ -388,7 +388,7 @@ export class HubClient {
   }
 
   async dispatch(contactId, content, {
-    origin = 'side',
+    origin = 'main',
     hidden = false,
     automation = null,
     idempotencyKey = null,
@@ -458,10 +458,14 @@ export class HubClient {
 
   async messages(contactId, after, limit = 200, origin = 'main') {
     const query = new URLSearchParams({
-      after: String(after),
       limit: String(limit),
       origin: String(origin),
     });
+    // Omit after to fetch newest-first window (hub default). Callers that page
+    // with a cursor still pass a numeric/string after as before.
+    if (after !== null && after !== undefined && after !== '') {
+      query.set('after', String(after));
+    }
     const body = await jsonRequest(
       `${this.baseUrl}/api/contacts/${encodeURIComponent(contactId)}/messages?${query}`,
       { headers: this.headers() },

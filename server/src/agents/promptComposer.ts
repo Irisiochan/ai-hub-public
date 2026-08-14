@@ -9,9 +9,12 @@ import {
   buildSessionPreamble,
   buildTurnBlock,
   injectTurnTime,
+  nsfwCraftCompact,
+  shouldInjectNsfwCraft,
   shanghaiStamp,
   timestampedMessage,
   wrapTurnText,
+  type NsfwCraftMode,
 } from '../memory/inject.js';
 import type { VaultClient } from '../memory/vaultClient.js';
 import { contactConfig } from './configSchemas.js';
@@ -20,9 +23,13 @@ import {
   CLI_REPLAY_SUMMARY_MAX_TOKENS,
   CLI_REPLAY_TOKEN_BUDGET,
 } from './conversationReplay.js';
-import { ConversationSummaryRepo } from './conversationSummaryRepo.js';
+import {
+  ConversationSummaryRepo,
+  SHARED_SUMMARY_MEMBER_ID,
+} from './conversationSummaryRepo.js';
 import { delegationGuidance, type DelegationCfg } from './gatewayTools.js';
 import { MessageRepo } from './messageRepo.js';
+import { ROOM_RHYTHM_TEMPLATE } from './roomPrompt.js';
 import { historicalMessageText } from './sideChannel.js';
 import { estimateTokens } from './tokenEstimate.js';
 import type { AffectService } from './affectService.js';
@@ -77,17 +84,20 @@ export class PromptComposer {
     // 所有后端默认只常驻 pinned/high facts。需要完整索引的联系人仍可显式设 full；
     // 不能再因 CLI 每轮重开进程就无条件塞进完整 get_context。
     const mode = cfg.memoryPreambleMode ?? 'compact';
+    const nsfwCraft = (cfg.nsfwCraft ?? 'intimate') as NsfwCraftMode;
 
     if (this.vault && ctx.memory.injectOnSpawn && mode !== 'off') {
       try {
         memoryPreamble = await buildSessionPreamble(
           this.vault,
           { id: ctx.agent.id, name: ctx.agent.name, backend: ctx.agent.backend },
-          mode
+          mode,
+          { nsfwCraft }
         );
         preamble = memoryPreamble;
         ctx.log(
           `memory preamble injected mode=${mode}` +
+          ` nsfwCraft=${nsfwCraft}` +
           ` chars=${preamble.length} tokens=${estimateTokens(preamble)}`
         );
       } catch (error: any) {
@@ -98,17 +108,22 @@ export class PromptComposer {
 
     const memoryBlock = preamble;
     const roomBlock = this.roomFraming(ctx);
-    // 工作流标记不挂在 vault 上：记忆库离线时同样要压住"去读全局工作流"的冲动。
-    // grok-cli 每轮重传 preamble，claude-cli/codex 常驻一次，两边都覆盖到。
-    preamble = [WORKFLOW_PRELOADED, TEMPORAL_CONTEXT_RULES, roomBlock, preamble]
-      .filter(Boolean)
-      .join('\n');
+    // C2：先算回放/既有历史，再决定是否注入时间语义。
+    // 红线：回放或历史摘要/既有消息在场时时间语义必须同场；纯新会话无历史才可省。
     let replayBlock = '';
     if (!resumeToken) {
       replayBlock = this.bridge(ctx);
-      if (replayBlock) {
-        preamble = [preamble, replayBlock].filter(Boolean).join('\n');
-      }
+    }
+    const temporalBlock = this.needsTemporalRules(ctx, resumeToken, replayBlock)
+      ? TEMPORAL_CONTEXT_RULES
+      : '';
+    // 工作流标记不挂在 vault 上：记忆库离线时同样要压住"去读全局工作流"的冲动。
+    // grok-cli 每轮重传 preamble，claude-cli/codex 常驻一次，两边都覆盖到。
+    preamble = [WORKFLOW_PRELOADED, temporalBlock, roomBlock, preamble]
+      .filter(Boolean)
+      .join('\n');
+    if (replayBlock) {
+      preamble = [preamble, replayBlock].filter(Boolean).join('\n');
     }
     // 叠层放最后：它要压过上面所有通用块，也压过存档回放里的旧口吻。
     const overlay = this.overlay(cfg, ctx.agent, ctx.log);
@@ -121,7 +136,7 @@ export class PromptComposer {
     ctx.log(
       'prompt blocks start' +
       ` workflow=${blockMetric(WORKFLOW_PRELOADED)}` +
-      ` temporal=${blockMetric(TEMPORAL_CONTEXT_RULES)}` +
+      ` temporal=${blockMetric(temporalBlock)}` +
       ` room=${blockMetric(roomBlock)}` +
       ` memory=${blockMetric(memoryBlock)}` +
       ` replay=${blockMetric(replayBlock)}` +
@@ -171,6 +186,12 @@ export class PromptComposer {
         // Best effort; composeStart is the guaranteed memory layer.
       }
     }
+    // C1：nsfwCraft=intimate 走 per-turn fail-open；always 已在 session preamble，避免双份。
+    const nsfwMode = (contactConfig(ctx.agent).nsfwCraft ?? 'intimate') as NsfwCraftMode;
+    if (nsfwMode === 'intimate' && shouldInjectNsfwCraft(nsfwMode, sourceText)) {
+      turnText = [turnText, '', nsfwCraftCompact()].join('\n');
+      ctx.log(`nsfw craft injected mode=intimate tokens=${estimateTokens(nsfwCraftCompact())}`);
+    }
     const affectBlock = this.affect?.turnBlock(ctx.agent, allowAffect) ?? '';
     if (affectBlock) {
       turnText = [turnText, '', affectBlock].join('\n');
@@ -201,10 +222,35 @@ export class PromptComposer {
     }
   }
 
+  /**
+   * C2 gate: temporal rules co-present with replay/history/summary context.
+   * Pure brand-new conversation (no resume, no replay, no prior messages, no saved summary)
+   * may omit the block.
+   */
+  private needsTemporalRules(
+    ctx: PromptContext,
+    resumeToken: string | null,
+    replayBlock: string
+  ): boolean {
+    if (resumeToken) return true;
+    if (replayBlock) return true;
+    // 群聊共享摘要：member_id=''（与 DM 同一存储键）
+    if (this.summaries?.get(ctx.convo.id, SHARED_SUMMARY_MEMBER_ID)) return true;
+    try {
+      if (this.messages && typeof this.messages.maxId === 'function' && this.messages.maxId(ctx.convo.id) > 0) {
+        return true;
+      }
+    } catch {
+      // messages stub in unit smokes may be null/partial
+    }
+    return false;
+  }
+
   private roomFraming(ctx: PromptContext): string {
     if (!ctx.isRoom) return '';
     const memberIds: string[] = contactConfig(ctx.convo).members ?? [];
     const names = memberIds.map((id) => ctx.nameOf(id));
+    // B 类：节奏/接话句迁入 ROOM_RHYTHM_TEMPLATE，与 per-turn 提示去重、只压表述。
     return [
       '',
       `# 群聊模式：「${ctx.convo.name}」`,
@@ -214,17 +260,16 @@ export class PromptComposer {
       '- 你自己发言直接说内容，不要输出 ROOM_MESSAGE_DATA 或名字前缀。',
       '- 只把标有「本轮新消息」的内容当成本轮刚发生；「历史消息/历史摘要」里的相对时间不得继承到现在。',
       '- 群里 @某人 不会自动召唤对方。想让谁跟进就直接说出来，由用户决定叫谁。',
-      '- 群聊节奏：简短、有自己观点、不复读别人说过的，不用每条都接。',
-      '- 每轮发言后有"接话轮"：你会看到其他成员刚说的话，可以自然接话、反驳、补充；',
-      '  没什么想说的就只回 [PASS]（会被网关静默处理，不丢人）。宁可 PASS 也别硬找话。',
+      ROOM_RHYTHM_TEMPLATE,
       '- 其他成员的错误/掉线由网关处理，你不会看到，也不用分析。',
     ].join('\n');
   }
 
   private bridge(ctx: PromptContext): string {
     if (ctx.agent.backend === 'api') return '';
-    const memberId = ctx.isRoom ? ctx.agent.id : '';
-    const saved = this.summaries?.get(ctx.convo.id, memberId);
+    // 方案 A：群聊与 DM 均使用共享 member_id=''；群遗留 per-member 行只读回落。
+    const legacyMemberId = ctx.isRoom ? ctx.agent.id : undefined;
+    const saved = this.summaries?.getSharedOrLegacy(ctx.convo.id, legacyMemberId);
     const rows = this.messages.historyAfter(ctx.convo.id, saved?.through_message_id ?? 0);
     const plan = buildConversationReplay(saved?.summary ?? '', rows, {
       tokenBudget: CLI_REPLAY_TOKEN_BUDGET,
@@ -235,7 +280,12 @@ export class PromptComposer {
     if (!plan) return '';
 
     if (this.summaries && plan.summarizedThrough !== null) {
-      this.summaries.upsert(ctx.convo.id, memberId, plan.summary, plan.summarizedThrough);
+      this.summaries.upsert(
+        ctx.convo.id,
+        SHARED_SUMMARY_MEMBER_ID,
+        plan.summary,
+        plan.summarizedThrough
+      );
     }
     const legacyTokens = estimateTokens(this.legacyBridge(ctx));
     ctx.log(

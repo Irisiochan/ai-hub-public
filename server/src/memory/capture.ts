@@ -27,7 +27,7 @@ const REVIEW_CAPTURE_THRESHOLD = 0.8;
 const REVIEW_REJECT_THRESHOLD = 0.2;
 const lastCapture = new Map<string, number>();
 
-const WORKER_RECEIPT_RE = /^⚙\s*Worker 任务回执（网关自动通知，User 也看得到这条）/;
+const WORKER_RECEIPT_RE = /^⚙\s*Worker 任务回执(?:（网关自动通知，User 也看得到这条）)?/;
 
 export interface CaptureReview {
   decision: 'capture' | 'reject' | 'pending';
@@ -42,13 +42,7 @@ export interface CaptureReview {
 export type CaptureReviewer = (text: string, triggerReason: string) => Promise<CaptureReview>;
 
 export function isSystemReceipt(text: string): boolean {
-  const normalized = text.replace(/\s+/g, ' ').trim();
-  return WORKER_RECEIPT_RE.test(text.trim())
-    || (
-      normalized.includes('Worker 任务回执')
-      && normalized.includes('网关自动通知')
-      && normalized.includes('交付状态：')
-    );
+  return WORKER_RECEIPT_RE.test(text.trim());
 }
 
 /**

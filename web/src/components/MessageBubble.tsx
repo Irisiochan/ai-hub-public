@@ -4,9 +4,8 @@ import remarkGfm from 'remark-gfm';
 import type { Contact, Message, UserProfile } from '../api';
 import { shouldOpenInExternalView } from '../externalLinks';
 import { withBase } from '../mobileShell';
-import { effectiveMessageOrigin, isManualUserMessage } from '../messageSource.ts';
+import { isManualUserMessage } from '../messageSource.ts';
 import { outputLimitWarning } from '../messageWarnings';
-import { sideSourceLabel, type QuoteMode } from '../sideQuote';
 import { formatMessageTimestamp } from '../time';
 
 /** 方案 1b：代码块带工具栏（语言 · 复制 · 折叠），样式见 styles.css §2 .code-card */
@@ -74,14 +73,15 @@ interface Props {
   selected: boolean;
   bulkMessageMode?: boolean;
   bulkSelected?: boolean;
+  showBulkMark?: boolean;
+  showActions?: boolean;
+  deleteScope?: 'turn';
   onSelect(id: number | null): void;
-  onBulkMessageToggle?(id: number): void;
+  onBulkMessageToggle?(message: Message): void;
   onEdit(m: Message): void;
   onResend(m: Message): void;
-  onDelete(m: Message): void;
+  onDelete(m: Message, scope?: 'turn'): void;
   onOpenExternalLink(url: string): void;
-  /** 只有副窗的正文消息拿得到；给了就在操作条里露出引用按钮 */
-  onQuoteToMain?(m: Message, mode: QuoteMode): void;
 }
 
 export default function MessageBubble({
@@ -93,26 +93,26 @@ export default function MessageBubble({
   selected,
   bulkMessageMode = false,
   bulkSelected = false,
+  showBulkMark = true,
+  showActions = true,
+  deleteScope,
   onSelect,
   onBulkMessageToggle,
   onEdit,
   onResend,
   onDelete,
   onOpenExternalLink,
-  onQuoteToMain,
 }: Props) {
   const [thinkingOpen, setThinkingOpen] = useState(false);
-  const [systemOpen, setSystemOpen] = useState(false);
   const mine = isManualUserMessage(message);
-  const effectiveOrigin = effectiveMessageOrigin(message);
   const edited = message.meta?.includes('"edited"');
   const outputWarning = outputLimitWarning(message.meta);
   const selectMessage = () => {
-    if (bulkMessageMode) onBulkMessageToggle?.(message.id);
+    if (bulkMessageMode) onBulkMessageToggle?.(message);
     else onSelect(selected ? null : message.id);
   };
   const bulkClass = bulkMessageMode ? ` bulk-selectable${bulkSelected ? ' bulk-selected' : ''}` : '';
-  const bulkMark = bulkMessageMode && (
+  const bulkMark = bulkMessageMode && showBulkMark && (
     <span className="tool-select-mark" aria-hidden="true">
       {bulkSelected ? '✓' : ''}
     </span>
@@ -124,7 +124,7 @@ export default function MessageBubble({
     event.stopPropagation();
     action();
   };
-  const actions = (
+  const actions = showActions ? (
     <div className={`msg-actions ${mine ? 'mine' : ''}`}>
       <time
         className="msg-time"
@@ -144,55 +144,11 @@ export default function MessageBubble({
           </button>
         </>
       )}
-      {onQuoteToMain && (
-        <>
-          <button type="button" onClick={(event) => stopAction(event, () => onQuoteToMain(message, 'full'))}>
-            ⤴ 引原文
-          </button>
-          <button type="button" onClick={(event) => stopAction(event, () => onQuoteToMain(message, 'digest'))}>
-            ⤴ 引摘要
-          </button>
-        </>
-      )}
-      <button type="button" className="del" onClick={(event) => stopAction(event, () => onDelete(message))}>
+      <button type="button" className="del" onClick={(event) => stopAction(event, () => onDelete(message, deleteScope))}>
         🗑 删除
       </button>
     </div>
-  );
-
-  if (effectiveOrigin === 'side' && message.role !== 'assistant' && message.kind === 'text') {
-    const long = message.content.length > 360;
-    const body = systemOpen || !long ? message.content : `${message.content.slice(0, 360)}…`;
-    return (
-      <div className={`${groupClass} center`}>
-        <div
-          className={`side-system-card${bulkClass}`}
-          role="button"
-          aria-pressed={bulkMessageMode ? bulkSelected : selected}
-          onClick={selectMessage}
-        >
-          <div className="side-system-head">
-            {bulkMark}
-            <span>{sideSourceLabel(message)}</span>
-          </div>
-          <pre>{body}</pre>
-          {long && !bulkMessageMode && (
-            <button
-              type="button"
-              className="side-expand-btn"
-              onClick={(event) => {
-                event.stopPropagation();
-                setSystemOpen((open) => !open);
-              }}
-            >
-              {systemOpen ? '收起原文' : '展开原文'}
-            </button>
-          )}
-        </div>
-        {actions}
-      </div>
-    );
-  }
+  ) : null;
 
   if (message.kind === 'tool_use') {
     return (
@@ -240,7 +196,7 @@ export default function MessageBubble({
             aria-pressed={bulkMessageMode ? bulkSelected : selected}
             onClick={() => {
               if (bulkMessageMode) {
-                onBulkMessageToggle?.(message.id);
+                onBulkMessageToggle?.(message);
                 return;
               }
               setThinkingOpen(!thinkingOpen);
@@ -329,6 +285,38 @@ export default function MessageBubble({
         )}
       </div>
       {actions}
+    </div>
+  );
+}
+
+export function AssistantTurnActions({
+  message,
+  onDelete,
+}: {
+  message: Message;
+  onDelete(message: Message, scope: 'turn'): void;
+}) {
+  const timestamp = formatMessageTimestamp(message.created_at);
+  return (
+    <div className="msg-actions">
+      <time
+        className="msg-time"
+        dateTime={message.created_at}
+        title={timestamp}
+        aria-label={`发送时间 ${timestamp}`}
+      >
+        {timestamp}
+      </time>
+      <button
+        type="button"
+        className="del"
+        onClick={(event) => {
+          event.stopPropagation();
+          onDelete(message, 'turn');
+        }}
+      >
+        🗑 删除
+      </button>
     </div>
   );
 }

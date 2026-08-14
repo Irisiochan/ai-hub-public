@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import type { Db, JobRow } from '../db.js';
 import type { SseHub } from '../sse.js';
 import { publicJob } from './deliveryStatus.js';
+import { parseCoordinationMarker } from './coordinationReceipt.js';
 
 const execFileAsync = promisify(execFile);
 const GIT_SHA_RE = /^[0-9a-f]{7,64}$/i;
@@ -51,6 +52,33 @@ export interface DeliveryUpdateInput {
   evidence?: Record<string, unknown>;
 }
 
+/** onFinished 经 durable outbox 重放；handler 抛错→指数退避重试，末次仍败→dead。 */
+export interface JobFinishContext {
+  /** true 表示这是最后一次尝试：handler 应走降级投递而不是再抛错重试。 */
+  finalAttempt: boolean;
+  /** outbox 行上的持久化步骤标记（如 tailDone），跨重试/重启保留。 */
+  meta: Record<string, unknown>;
+  setMeta(patch: Record<string, unknown>): void;
+}
+
+interface JobOutboxRow {
+  id: number;
+  job_id: string;
+  kind: string;
+  status: string;
+  attempts: number;
+  next_attempt_at: number;
+  meta: string;
+  last_error: string | null;
+}
+
+export const OUTBOX_MAX_ATTEMPTS = 8;
+const OUTBOX_BASE_DELAY_MS = 30_000;
+const OUTBOX_MAX_DELAY_MS = 30 * 60_000;
+const OUTBOX_CLAIM_LEASE_MS = 5 * 60_000;
+/** 启动补偿只回看这个窗口内的终态 job，避免翻出远古 job 重发回执。 */
+const OUTBOX_BACKFILL_WINDOW = '-48 hours';
+
 function jsonRecord(raw: string | null | undefined): Record<string, unknown> {
   try {
     const value = raw ? JSON.parse(raw) : {};
@@ -70,11 +98,41 @@ export interface CreateJobInput {
   ttlMinutes?: number;
   idempotencyKey?: string;
   permissions: { write: boolean; shell: boolean; ssh: boolean };
-  /** 派单时指定的模型和推理强度，覆盖 Worker config 默认值。 */
-  options?: { model?: string; reasoning?: string };
+  /** 派单执行选项与服务端路由审计元数据。 */
+  options?: {
+    model?: string;
+    reasoning?: string;
+    routeClass?: 'implement' | 'fix' | 'review' | 'recon' | 'mechanical';
+    runnerSource?: 'policy' | 'override';
+    runnerOverrideReason?: string;
+  };
   /** 委派发生的聊天（DM/群）与当时的最后一条消息 id——前端把任务 thread 挂回这条消息下。 */
   originContactId?: string | null;
   originAnchorId?: number | null;
+  /** Optional per-requester queue guard; coordination dedupe runs before this limit. */
+  maxOpenJobs?: number;
+}
+
+// pause/cancel 只是「已请求」，旧 worker 可能仍在执行；在真正转成 paused/cancelled
+// 终态前，同 taskPath 不允许第二张 job。
+const COORDINATION_ACTIVE_STATUSES =
+  "('pending','claimed','running','recovering','pause_requested','cancel_requested')";
+const DEPLOY_JOB_HEADER = '只运行 deploy/room-deploy-job.ps1，不做任何其他改动、不修任何文件。';
+
+/** Extract the task-level mutex key only from trusted fixed job shapes. */
+export function coordinationTaskPath(prompt: string | null | undefined): string | null {
+  const raw = String(prompt ?? '');
+  const marker = parseCoordinationMarker(raw);
+  if (marker) return marker.taskPath;
+
+  const lines = raw.split(/\r?\n/).map((line) => line.trim());
+  if (!lines.includes(DEPLOY_JOB_HEADER)) return null;
+  if (!lines.some((line) => /^命令[：:].*deploy[\\/]room-deploy-job\.ps1\b.*\s-Sha(?:\s|$)/i.test(line))) {
+    return null;
+  }
+  const taskLine = lines.find((line) => /^deploy-tail 任务文件[：:]/i.test(line));
+  const match = /^deploy-tail 任务文件[：:]\s*`?(tasks\/[^/\\\r\n]{1,100}\.md)`?$/i.exec(taskLine ?? '');
+  return match?.[1] ?? null;
 }
 
 function isWindowsWorkspace(workspace: string): boolean {
@@ -103,11 +161,19 @@ export function workspaceAllowed(workspace: string, roots: string[]): boolean {
 }
 
 export class JobStore {
-  /** Terminal transition hook (done/blocked/failed/interrupted). Set by index.ts. */
-  onFinished: ((job: JobRow) => void) | null = null;
+  /**
+   * Terminal transition hook (done/blocked/failed/interrupted). Set by index.ts.
+   * Invoked through the durable job_outbox: throw to retry with backoff; the
+   * ctx tells the handler when it is on its final attempt and lets it persist
+   * per-step progress across retries/restarts.
+   */
+  onFinished: ((job: JobRow, ctx: JobFinishContext) => void | Promise<void>) | null = null;
   private readonly statements: Record<string, any>;
   private outOfBandTimer: NodeJS.Timeout | null = null;
   private outOfBandSweepRunning = false;
+  private outboxTimer: NodeJS.Timeout | null = null;
+  private outboxDraining = false;
+  private outboxDrainScheduled = false;
 
   constructor(private db: Db, private sse: SseHub) {
     this.statements = {
@@ -158,6 +224,14 @@ export class JobStore {
           origin_contact_id, origin_anchor_id, options)
          VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', ?), ?, ?, ?, ?, ?)`
       ),
+      activeCoordinationJobs: db.prepare(
+        `SELECT * FROM jobs WHERE status IN ${COORDINATION_ACTIVE_STATUSES} ORDER BY created_at ASC, id ASC`
+      ),
+      openJobsByRequester: db.prepare(
+        `SELECT COUNT(*) AS c FROM jobs
+         WHERE requested_by = ? AND deleted = 0
+           AND status IN ('pending','claimed','running','recovering','pause_requested','cancel_requested')`
+      ),
       action: db.prepare(
         `UPDATE jobs SET status = ?, lease_until = NULL, error = NULL, updated_at = datetime('now') WHERE id = ?`
       ),
@@ -185,6 +259,53 @@ export class JobStore {
       deploymentCandidates: db.prepare(
         `SELECT * FROM jobs WHERE deleted = 0 AND status = 'done' AND delivery_state = 'delivered'
          ORDER BY updated_at DESC LIMIT 500`
+      ),
+      outboxEnqueue: db.prepare(
+        `INSERT OR IGNORE INTO job_outbox (job_id, kind) VALUES (?, 'finished')`
+      ),
+      outboxClaimNext: db.prepare(
+        `SELECT * FROM job_outbox WHERE status = 'pending' AND next_attempt_at <= ?
+         ORDER BY next_attempt_at, id LIMIT 1`
+      ),
+      outboxLease: db.prepare(
+        `UPDATE job_outbox SET attempts = attempts + 1, next_attempt_at = ?, updated_at = datetime('now')
+         WHERE id = ? AND status = 'pending'`
+      ),
+      outboxMarkDone: db.prepare(
+        `UPDATE job_outbox SET status = 'done', last_error = NULL, updated_at = datetime('now') WHERE id = ?`
+      ),
+      outboxMarkRetry: db.prepare(
+        `UPDATE job_outbox SET next_attempt_at = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?`
+      ),
+      outboxMarkDead: db.prepare(
+        `UPDATE job_outbox SET status = 'dead', last_error = ?, updated_at = datetime('now') WHERE id = ?`
+      ),
+      outboxSetMeta: db.prepare(
+        `UPDATE job_outbox SET meta = ?, updated_at = datetime('now') WHERE id = ?`
+      ),
+      outboxStatus: db.prepare(
+        `SELECT status, COUNT(*) AS c FROM job_outbox GROUP BY status`
+      ),
+      // 启动补偿：窗口内的终态 coordination/worker job，既没有 outbox 行（迁移前完成
+      // 或行丢失）也没有任何可见回执（room-host 幂等键 / DM 降级投递）的，补一行待重放。
+      outboxBackfill: db.prepare(
+        `INSERT OR IGNORE INTO job_outbox (job_id, kind)
+         SELECT j.id, 'finished' FROM jobs j
+         WHERE j.status IN ('done','blocked','failed','interrupted')
+           AND j.updated_at >= datetime('now', '${OUTBOX_BACKFILL_WINDOW}')
+           AND NOT EXISTS (
+             SELECT 1 FROM job_outbox o WHERE o.job_id = j.id AND o.kind = 'finished'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM messages m
+             WHERE m.sender = 'room-host' AND m.idempotency_key = 'receipt:v1:' || j.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM messages m2
+             WHERE m2.created_at >= datetime('now', '-72 hours')
+               AND json_extract(m2.meta, '$.event') = 'worker-receipt'
+               AND json_extract(m2.meta, '$.jobId') = j.id
+           )`
       ),
     };
   }
@@ -252,9 +373,96 @@ export class JobStore {
     if (row) this.sse.broadcast('job', publicJob(row));
   }
 
-  private notifyFinished(id: string): void {
-    const job = this.get(id);
-    if (job) this.onFinished?.(job);
+  /** 只入队（供事务内调用）；真正执行由 outbox drain 负责。 */
+  private enqueueFinished(id: string): void {
+    this.statements.outboxEnqueue.run(id);
+  }
+
+  scheduleOutboxDrain(): void {
+    if (this.outboxDrainScheduled) return;
+    this.outboxDrainScheduled = true;
+    setImmediate(() => {
+      this.outboxDrainScheduled = false;
+      // 关库竞态（进程/测试收尾时 setImmediate 晚于 db.close）只能吞：
+      // pending 行本就设计为重启后重放。
+      void this.drainOutbox().catch(() => {});
+    });
+  }
+
+  async drainOutbox(): Promise<void> {
+    if (this.outboxDraining) return;
+    this.outboxDraining = true;
+    try {
+      while (this.db.open && await this.drainOutboxOnce()) { /* drain until no due rows */ }
+    } finally {
+      this.outboxDraining = false;
+    }
+  }
+
+  /**
+   * 处理一条到期 outbox 行。claim 把 next_attempt_at 推成租约，进程崩溃在
+   * handler 中途时行保持 pending，租约到期后重放；handler 的幂等键保证不产
+   * 生第二个可见回执。
+   */
+  async drainOutboxOnce(now = Date.now()): Promise<boolean> {
+    const row = this.db.transaction((): JobOutboxRow | undefined => {
+      const due = this.statements.outboxClaimNext.get(now) as JobOutboxRow | undefined;
+      if (!due) return undefined;
+      this.statements.outboxLease.run(now + OUTBOX_CLAIM_LEASE_MS, due.id);
+      return { ...due, attempts: due.attempts + 1 };
+    })();
+    if (!row) return false;
+    const job = this.get(row.job_id);
+    if (!job) {
+      this.statements.outboxMarkDead.run('job row missing', row.id);
+      return true;
+    }
+    const finalAttempt = row.attempts >= OUTBOX_MAX_ATTEMPTS;
+    const ctx: JobFinishContext = {
+      finalAttempt,
+      meta: jsonRecord(row.meta),
+      setMeta: (patch) => {
+        ctx.meta = { ...ctx.meta, ...patch };
+        this.statements.outboxSetMeta.run(JSON.stringify(ctx.meta), row.id);
+      },
+    };
+    try {
+      await this.onFinished?.(job, ctx);
+      this.statements.outboxMarkDone.run(row.id);
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, 2000);
+      if (finalAttempt) {
+        this.statements.outboxMarkDead.run(message, row.id);
+      } else {
+        const delay = Math.min(OUTBOX_BASE_DELAY_MS * 2 ** (row.attempts - 1), OUTBOX_MAX_DELAY_MS);
+        this.statements.outboxMarkRetry.run(now + delay, message, row.id);
+      }
+    }
+    return true;
+  }
+
+  /** 可观测状态：pending/done/dead 计数（health 与测试用）。 */
+  outboxCounts(): Record<string, number> {
+    const rows = this.statements.outboxStatus.all() as { status: string; c: number }[];
+    return Object.fromEntries(rows.map((row) => [row.status, Number(row.c)]));
+  }
+
+  /**
+   * 启动补偿 + 周期 drain。补偿扫描窗口内缺回执且无 outbox 行的终态 job
+   * （迁移前完成的存量），补行后与崩溃遗留的 pending 行一起按租约重放。
+   */
+  startOutboxProcessor(intervalMs = 30_000): number {
+    if (this.outboxTimer) return 0;
+    const backfilled = (this.statements.outboxBackfill.run() as { changes: number }).changes;
+    this.scheduleOutboxDrain();
+    this.outboxTimer = setInterval(() => void this.drainOutbox().catch(() => {}), intervalMs);
+    this.outboxTimer.unref();
+    return backfilled;
+  }
+
+  stopOutboxProcessor(): void {
+    if (this.outboxTimer) clearInterval(this.outboxTimer);
+    this.outboxTimer = null;
   }
 
   /** TTL 过期 + 租约失联清扫。先留恢复窗口，窗口耗尽才转终态并触发 onFinished。 */
@@ -275,14 +483,19 @@ export class JobStore {
     }
     const expired = this.statements.staleRecovering.all() as { id: string }[];
     for (const { id } of expired) {
-      if (!this.statements.interrupt.run(id).changes) continue;
+      const interrupted = this.db.transaction((jobId: string): boolean => {
+        if (!this.statements.interrupt.run(jobId).changes) return false;
+        this.enqueueFinished(jobId);
+        return true;
+      })(id);
+      if (!interrupted) continue;
       this.addMessage(id, 'system', 'state', 'Worker 恢复窗口耗尽，任务已中断；需要人工继续。');
       this.emitJob(id);
-      this.notifyFinished(id);
+      this.scheduleOutboxDrain();
     }
   }
 
-  create(input: CreateJobInput): { job: JobRow } | { error: string } {
+  create(input: CreateJobInput): { job: JobRow; merged?: boolean } | { error: string } {
     if (!input.runner || !input.prompt.trim() || !input.workspace.trim())
       return { error: 'runner/workspace/prompt required' };
     if (input.prompt.length > 100_000 || input.workspace.length > 1000)
@@ -290,11 +503,23 @@ export class JobStore {
     if (input.runner === 'codex' && !input.permissions.shell)
       return { error: 'Codex 的文件读取/编辑都通过 Shell 工具；Codex 任务必须显式开启 Shell' };
 
+    const taskPath = coordinationTaskPath(input.prompt);
+    if (taskPath) {
+      const existing = (this.statements.activeCoordinationJobs.all() as JobRow[])
+        .find((job) => coordinationTaskPath(job.prompt)?.toLowerCase() === taskPath.toLowerCase());
+      if (existing) return { job: existing, merged: true };
+    }
+    if (Number.isSafeInteger(input.maxOpenJobs) && Number(input.maxOpenJobs) > 0) {
+      const open = this.statements.openJobsByRequester.get(input.requestedBy) as { c: number };
+      if (open.c >= Number(input.maxOpenJobs)) {
+        return { error: `你已有 ${open.c} 个任务在队列里，先用 worker_job_status 看看它们，别刷屏。` };
+      }
+    }
+
     const id = crypto.randomUUID();
     const workspace = normalizeWorkspace(input.workspace);
     const ttlMinutes = Math.min(Math.max(Number(input.ttlMinutes) || 1440, 5), 10080);
-    const options = input.options && (input.options.model || input.options.reasoning)
-      ? JSON.stringify(input.options) : '{}';
+    const options = input.options ? JSON.stringify(input.options) : '{}';
     try {
       this.statements.create.run(
           id,
@@ -396,7 +621,11 @@ export class JobStore {
         nextOwner: permissions.write === false ? '无需后续动作' : '部署负责人',
       },
     }).slice(0, 100_000);
-    const result = this.statements.resolveOutOfBand.run(deliveryMeta, job.id);
+    const result = this.db.transaction(() => {
+      const change = this.statements.resolveOutOfBand.run(deliveryMeta, job.id);
+      if (change.changes) this.enqueueFinished(job.id);
+      return change;
+    })();
     if (!result.changes) return { error: 'job changed before out-of-band resolution' };
     this.addMessage(
       job.id,
@@ -407,7 +636,7 @@ export class JobStore {
         : '场外接力已由 User 手动确认完成'
     );
     this.emitJob(job.id);
-    this.notifyFinished(job.id);
+    this.scheduleOutboxDrain();
     return { status: 'done', job: this.get(job.id)! };
   }
 
@@ -493,15 +722,23 @@ export class JobStore {
       : 'failed';
     if (current.status === 'cancel_requested') status = 'cancelled';
     if (current.status === 'pause_requested') status = 'paused';
-    const update = this.statements.complete.run(
-      status,
-      result,
-      error,
-      deliveryState,
-      deliveryMeta,
-      current.id,
-      current.status
-    );
+    // 终态转换与 outbox 入队同一事务：进程在内存回调前崩溃时，
+    // pending 行在重启后仍会驱动回执/tail 重放。
+    const update = this.db.transaction(() => {
+      const change = this.statements.complete.run(
+        status,
+        result,
+        error,
+        deliveryState,
+        deliveryMeta,
+        current.id,
+        current.status
+      );
+      if (change.changes && ['done', 'blocked', 'failed', 'interrupted'].includes(status)) {
+        this.enqueueFinished(current.id);
+      }
+      return change;
+    })();
     if (!update.changes) {
       const latest = this.get(current.id);
       if (latest && terminal.has(latest.status)) {
@@ -517,7 +754,7 @@ export class JobStore {
     );
     this.emitJob(current.id);
     if (['done', 'blocked', 'failed', 'interrupted'].includes(status)) {
-      this.notifyFinished(current.id);
+      this.scheduleOutboxDrain();
     }
     return { status, changed: true };
   }

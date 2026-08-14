@@ -14,10 +14,13 @@ const dbPath = path.join(here, '.contact-config-smoke.db');
 for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${dbPath}${suffix}`, { force: true });
 
 const db = openDb(dbPath);
+const switchedModels: string[] = [];
 const manager = {
   statusOf: () => ({ state: 'idle' }),
   isAgentBusy: () => false,
-  switchContactModel: async () => {},
+  switchContactModel: async (contact: ContactRow) => {
+    switchedModels.push(String(JSON.parse(contact.config).model ?? ''));
+  },
   notifyContactUpdated: async () => {},
   remove: async () => {},
 } as any;
@@ -25,6 +28,7 @@ const sse = { broadcast: () => {} } as any;
 const hubConfig = {
   agentsDir: here,
   codex: { cliPath: 'codex' },
+  grok: { cliPath: path.join(here, 'mock-grok.mjs') },
 } as any;
 const app = express();
 app.use(express.json());
@@ -46,6 +50,38 @@ async function json(pathname: string, init?: RequestInit): Promise<{ status: num
 }
 
 try {
+  db.prepare(
+    `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run('grok-model-test', 'Grok model test', '🤖', '#888888', 'grok-cli', 'dm', '{}', 999);
+
+  let result = await json('/grok-model-test/models');
+  assert.equal(result.status, 200);
+  assert.deepEqual(
+    result.body.models.slice(0, 3).map((model: { id: string }) => model.id),
+    ['', 'grok-4.6', 'grok-4.5'],
+    'Grok 下拉必须先保留默认项，再跟随 CLI 的运行时模型目录'
+  );
+  assert.equal(result.body.dynamic, true, 'Grok CLI 查询成功时应标记为动态目录');
+
+  result = await json('/grok-model-test/model', {
+    method: 'PATCH',
+    body: JSON.stringify({ model: 'grok-4.6' }),
+  });
+  assert.equal(result.status, 200, 'Grok 具体模型应可保存');
+  const storedGrok = db.prepare('SELECT config FROM contacts WHERE id = ?').get('grok-model-test') as { config: string };
+  assert.equal(JSON.parse(storedGrok.config).model, 'grok-4.6', '选定模型必须持久化到联系人 config');
+  assert.equal(switchedModels.at(-1), 'grok-4.6', '模型切换必须通知 manager 用新 config 重建 backend');
+
+  result = await json('/grok-model-test/model', {
+    method: 'PATCH',
+    body: JSON.stringify({ model: '' }),
+  });
+  assert.equal(result.status, 200, 'Grok 默认模型仍应可保存');
+  const defaultGrok = db.prepare('SELECT config FROM contacts WHERE id = ?').get('grok-model-test') as { config: string };
+  assert.equal(JSON.parse(defaultGrok.config).model, '', '默认项必须持久化为空串，维持 CLI 自动选择');
+  assert.equal(switchedModels.at(-1), '', '切回默认也必须通知 manager 重建 backend');
+
   // Stored rows are parsed once, receive defaults, preserve forward-compatible fields,
   // and never expose configParsed via object spread.
   const row = {
@@ -64,7 +100,7 @@ try {
   assert.equal(Object.keys(openContact(row)).includes('configParsed'), false, 'configParsed must be non-enumerable');
   assert.equal('configParsed' in { ...row }, false, 'spreading a row must not leak parsed secrets');
 
-  let result = await json('', {
+  result = await json('', {
     method: 'POST',
     body: JSON.stringify({ name: 'Missing model', backend: 'api', config: { provider: 'gemini', apiKey: 'k' } }),
   });

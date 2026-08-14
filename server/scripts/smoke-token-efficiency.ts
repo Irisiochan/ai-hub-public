@@ -175,7 +175,8 @@ try {
       },
     } as any,
     { id: 'test-api', name: '测试联系人', backend: 'api' },
-    'compact'
+    'compact',
+    { nsfwCraft: 'always' }
   );
   assert(!compactCalls.some((c) => c.startsWith('get_context:')), 'compact 不应调用完整 get_context');
   assert(
@@ -203,7 +204,8 @@ try {
       },
     } as any,
     { id: 'gem', name: 'Gem', backend: 'api' },
-    'full'
+    'full',
+    { nsfwCraft: 'always' }
   );
   assert(full.includes('full-v2'), 'full 前缀应携带可辨识版本');
   assert(full.includes('FULL_CTX'), 'full 应注入 get_context 结果');
@@ -216,8 +218,44 @@ try {
     'full 的 nsfwCraftCompact 不得重复注入'
   );
 
-  // --- tool result 截断 ---
-  const longText = 'X'.repeat(TOOL_RESULT_MAX_CHARS + 2500);
+  // --- tool result 选择性压缩（非无差别砍 80%）---
+  const { compressToolResultForInjection } = await import('../src/agents/selectiveCompress.js');
+  const longDump = Array.from({ length: 200 }, (_, i) => `DEBUG payload ${i} ${'x'.repeat(80)}`).join('\n');
+  const protectedBlock = [
+    'AssertionError: expected 200 to equal 404',
+    '    at Object.<anonymous> (server/src/agents/foo.ts:42:7)',
+    'FAIL server/scripts/smoke-token-efficiency.ts',
+    '--- a/server/src/agents/directApi/base.ts',
+    '+++ b/server/src/agents/directApi/base.ts',
+    '@@ -1,3 +1,4 @@',
+    '+export const KEEP_ME = 1;',
+    'C:/path/to/project/server/src/agents/directApi/base.ts',
+  ].join('\n');
+  const longText = `${longDump}\n${protectedBlock}\n${longDump}`;
+  assert.ok(longText.length > TOOL_RESULT_MAX_CHARS + 1000, 'fixture 应明显超过工具结果上限');
+
+  const direct = compressToolResultForInjection(longText, { maxChars: TOOL_RESULT_MAX_CHARS });
+  assert.ok(direct.meta.truncated, '超限工具结果应触发选择性压缩');
+  assert.ok(direct.text.length <= TOOL_RESULT_MAX_CHARS, '压缩后不得超过上限');
+  assert.match(direct.text, /AssertionError/, '不得压掉断言失败信息');
+  assert.match(direct.text, /FAIL server\/scripts\/smoke-token-efficiency/, '不得压掉失败测试路径');
+  assert.match(direct.text, /directApi\/base\.ts/, '不得压掉文件路径');
+  assert.match(direct.text, /\+\+\+ b\/server/, '不得压掉 diff 头');
+  // 大 dump 允许猛砍体积；关键证据行必须完整保留（SOMA：禁的是无差别按比例砍，不是禁压 dump）。
+  for (const line of protectedBlock.split('\n')) {
+    assert.ok(
+      direct.text.includes(line),
+      `protected evidence line must survive: ${line.slice(0, 80)}`
+    );
+  }
+  // 对照：无保护的纯 dump 应能压到上限附近，且不得误伤空输入
+  const pureDump = compressToolResultForInjection('Y'.repeat(TOOL_RESULT_MAX_CHARS + 3000));
+  assert.ok(pureDump.meta.truncated);
+  assert.ok(pureDump.text.length <= TOOL_RESULT_MAX_CHARS);
+  const untouched = compressToolResultForInjection('short ok');
+  assert.equal(untouched.meta.truncated, false);
+  assert.equal(untouched.text, 'short ok');
+
   let truncatedOut = '';
   const truncBackend = new DirectApiBackend({
     provider: 'openai-compat',
@@ -245,11 +283,12 @@ try {
   const toolOut = await (truncBackend as any).execTool('read_file', { path: 'x.md' }, queue);
   truncatedOut = toolOut.text;
   assert.equal(toolOut.ok, true);
-  assert.equal(
-    truncatedOut.length,
-    TOOL_RESULT_MAX_CHARS,
-    `工具结果应截断到 ${TOOL_RESULT_MAX_CHARS} 字符`
+  assert.ok(
+    truncatedOut.length <= TOOL_RESULT_MAX_CHARS,
+    `工具结果注入前应 ≤ ${TOOL_RESULT_MAX_CHARS}，实际 ${truncatedOut.length}`
   );
+  assert.match(truncatedOut, /AssertionError/, 'execTool 路径也必须保留断言');
+  assert.match(truncatedOut, /FAIL server\/scripts/, 'execTool 路径也必须保留失败测试信息');
 
   // --- Gemini 多工具轮 usage：input 用最终轮，inputRoundsSum 为各轮累加 ---
   let geminiHits = 0;

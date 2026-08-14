@@ -22,6 +22,13 @@ import {
 } from '../agents/messageSource.js';
 import { getMessageReadState, markMessagesRead } from '../readState.js';
 import { normalizeRoomCoordinationDispatch } from '../agents/roomPrompt.js';
+import {
+  executionDispatchKey,
+  legacyExecutionDispatchKey,
+  legacyVerificationDispatchKey,
+  verificationDispatchKey,
+} from '../workers/coordinationKeys.js';
+import { parsePositiveIntegerQuery } from '../queryParams.js';
 
 export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploadsDir: string): Router {
   const r = Router();
@@ -111,7 +118,7 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     const after = req.query.after ? Number(req.query.after) : null;
     const origin = typeof req.query.origin === 'string' ? req.query.origin : 'main';
     // Initial unread hydration may request more than one normal 50-row page.
-    const limit = Math.min(Number(req.query.limit) || 50, after !== null ? 1000 : 200);
+    const limit = parsePositiveIntegerQuery(req.query.limit, 50, after !== null ? 1000 : 200);
     if (!['main', 'side', 'all'].includes(origin)) {
       return res.status(400).json({ error: 'origin must be main, side, or all' });
     }
@@ -148,9 +155,9 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     }
     res.json({
       messages: withAttachmentsMany(db, rows),
-      readState: origin === 'all'
-        ? null
-        : getMessageReadState(db, contact.id, origin as MessageOrigin),
+      // side/all remain readable as an audit API, but only the user-visible main
+      // conversation participates in unread tracking.
+      readState: origin === 'main' ? getMessageReadState(db, contact.id) : null,
     });
   });
 
@@ -160,14 +167,14 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     if (!contact) return res.status(404).json({ error: 'contact not found' });
     const origin = req.body?.origin;
     const throughMessageId = Number(req.body?.throughMessageId);
-    if (origin !== 'main' && origin !== 'side') {
-      return res.status(400).json({ error: 'origin must be main or side' });
+    if (origin !== 'main') {
+      return res.status(400).json({ error: 'only main messages have read state' });
     }
     if (!Number.isSafeInteger(throughMessageId) || throughMessageId <= 0) {
       return res.status(400).json({ error: 'throughMessageId must be a positive integer' });
     }
     try {
-      const readState = markMessagesRead(db, contact.id, origin, throughMessageId);
+      const readState = markMessagesRead(db, contact.id, throughMessageId);
       sse.broadcast('read-state', { contactId: contact.id, ...readState });
       res.json({ readState });
     } catch (error) {
@@ -229,13 +236,16 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
       const expectedTarget = coordination.kind === 'verification'
         ? coordination.verifier
         : coordination.executor;
-      const expectedKey = coordination.kind === 'verification'
-        ? `verification:v1:${coordination.taskPath}:${coordination.due}`
-        : `coordination:${coordination.taskPath}:${coordination.planHash}`;
+      // v2 key 由 coordination 元数据全字段重算，把 executor/workspace/branch
+      // （或 verifier）绑进幂等键；v1 旧格式仅在 worker/server 分批部署的过渡
+      // 窗口内保留接受。
+      const expectedKeys = coordination.kind === 'verification'
+        ? [verificationDispatchKey(coordination), legacyVerificationDispatchKey(coordination)]
+        : [executionDispatchKey(coordination), legacyExecutionDispatchKey(coordination)];
       if (!trigger
           || targetOverride.length !== 1
           || targetOverride[0].id !== expectedTarget
-          || idempotencyKey !== expectedKey) {
+          || !expectedKeys.includes(idempotencyKey)) {
         return res.status(400).json({ error: 'coordination routing contract mismatch' });
       }
     }
@@ -284,10 +294,15 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
       return res.status(201).json(roomHostResponse(doneRow));
     }
 
+    // Domain signal: meta.roomHost.coordination (normalized above). When set,
+    // reaction rounds only wake authority holders; members auto-PASS without model.
     const tracked = manager.dispatchRoomMessageTracked(contact, content, {
       targetOverride,
       capture: false,
       reactionRounds: initialMeta.roomHost.reactionRounds,
+      ...(coordination
+        ? { coordinationDomain: true as const, coordination }
+        : {}),
     });
     void tracked.completion.then((outcome) => {
       const lastMessageId = Number(
@@ -353,7 +368,7 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     res.status(202).json({ ok: true, messageId: mid });
   });
 
-  /** 删除单条消息：软删 + CLI 上下文重置（被删内容不再进入任何上下文）。 */
+  /** 删除消息：默认单条；scope=turn 时按持久化 turn_id 软删整轮。 */
   r.delete('/:id/messages/:mid', async (req, res) => {
     const contact = getContact(req.params.id);
     if (!contact) return res.status(404).json({ error: 'contact not found' });
@@ -363,16 +378,38 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
       .get(mid, contact.id) as MessageRow | undefined;
     if (!row) return res.status(404).json({ error: 'message not found' });
 
-    db.prepare('UPDATE messages SET deleted = 1 WHERE id = ?').run(mid);
-    deleteMessageFiles(db, uploadsDir, mid);
-    sse.broadcast('prune', { contactId: contact.id, ids: [mid] });
-    const origin = row.origin;
-    sse.broadcast('read-state', {
-      contactId: contact.id,
-      ...getMessageReadState(db, contact.id, origin),
+    const scope = req.query.scope;
+    if (scope !== undefined && scope !== 'turn') {
+      return res.status(400).json({ error: 'invalid delete scope' });
+    }
+    if (scope === 'turn' && (!row.turn_id || row.role === 'user')) {
+      return res.status(400).json({ error: 'message does not belong to an assistant turn' });
+    }
+    const rows = scope === 'turn'
+      ? db.prepare(
+          `SELECT * FROM messages
+           WHERE contact_id = ? AND turn_id = ? AND role <> 'user' AND deleted = 0
+           ORDER BY id ASC`
+        ).all(contact.id, row.turn_id) as MessageRow[]
+      : [row];
+    const ids = rows.map((message) => message.id);
+    const softDelete = db.transaction((messageIds: number[]) => {
+      const update = db.prepare('UPDATE messages SET deleted = 1 WHERE id = ?');
+      for (const id of messageIds) {
+        update.run(id);
+        deleteMessageFiles(db, uploadsDir, id);
+      }
     });
-    await manager.invalidateConversation(contact, mid);
-    res.json({ ok: true });
+    softDelete(ids);
+    sse.broadcast('prune', { contactId: contact.id, ids });
+    if (rows.some((message) => message.origin === 'main')) {
+      sse.broadcast('read-state', {
+        contactId: contact.id,
+        ...getMessageReadState(db, contact.id),
+      });
+    }
+    await manager.invalidateConversation(contact, Math.min(...ids));
+    res.json({ ok: true, ids });
   });
 
   /** token 消耗聚合（api/订阅通用，由 migration trigger 维护索引表）。 */

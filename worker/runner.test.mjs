@@ -70,9 +70,29 @@ test('grok permission table and resume arguments are deterministic', () => {
     assert.equal(spec.args[spec.args.indexOf('--disallowed-tools') + 1], 'run_terminal_command');
     assert.equal(spec.args.includes('--always-approve'), true);
     assert.deepEqual(spec.args.slice(spec.args.indexOf('-r'), spec.args.indexOf('-r') + 2), ['-r', 'session_123']);
+    assert.deepEqual(spec.args.slice(spec.args.indexOf('-m'), spec.args.indexOf('-m') + 2), ['-m', 'grok-code']);
     assert.match(fs.readFileSync(spec.args[1], 'utf8'), /SERVER DELIVERY CONTRACT/);
     spec.cleanup();
     assert.equal(fs.existsSync(spec.args[1]), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('grok task model and reasoning override worker fallback config', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-runner-test-'));
+  try {
+    const spec = buildRunnerSpec({
+      ...baseJob,
+      runner: 'grok',
+      options: { model: 'grok-4.6', reasoning: 'high' },
+    }, { grokModel: 'grok-code' }, { tmpdir: dir, platform: 'win32' });
+    assert.deepEqual(spec.args.slice(spec.args.indexOf('-m'), spec.args.indexOf('-m') + 2), ['-m', 'grok-4.6']);
+    assert.deepEqual(
+      spec.args.slice(spec.args.indexOf('--reasoning-effort'), spec.args.indexOf('--reasoning-effort') + 2),
+      ['--reasoning-effort', 'high']
+    );
+    spec.cleanup();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -143,6 +163,60 @@ test('codex reasoning effort uses the supported config override for fresh and re
   }, {}, { platform: 'win32' });
   assert.equal(resumed.args.includes('--reasoning-effort'), false);
   assert.equal(resumed.args.includes('model_reasoning_effort="max"'), true);
+});
+
+test('codex resume re-applies the exact job sandbox in all three modes', () => {
+  const effectiveSandbox = (spec) => {
+    const flagIndex = spec.args.indexOf('--sandbox');
+    if (flagIndex !== -1) return spec.args[flagIndex + 1];
+    const override = spec.args.find((arg) => arg.startsWith('sandbox_mode='));
+    return override ? JSON.parse(override.slice('sandbox_mode='.length)) : null;
+  };
+  const cases = [
+    { permissions: { write: false, shell: true }, cfg: {}, expected: 'read-only' },
+    { permissions: { write: true, shell: true }, cfg: {}, expected: 'workspace-write' },
+    {
+      permissions: { write: true, shell: true },
+      cfg: { codexSandboxMode: 'danger-full-access' },
+      expected: 'danger-full-access',
+    },
+  ];
+  for (const { permissions, cfg, expected } of cases) {
+    const fresh = buildRunnerSpec({ ...baseJob, runner: 'codex', permissions }, cfg, { platform: 'win32' });
+    const resumed = buildRunnerSpec(
+      { ...baseJob, runner: 'codex', session_id: 'thread-9', permissions },
+      cfg,
+      { platform: 'win32' },
+    );
+    assert.equal(effectiveSandbox(fresh), expected);
+    assert.equal(effectiveSandbox(resumed), expected, `resume 后有效 sandbox 必须与 fresh 一致（${expected}）`);
+    // codex-cli 0.145 实测：exec resume 不接受 --sandbox 旗标，只认 -c sandbox_mode
+    assert.equal(resumed.args.includes('--sandbox'), false);
+    const overrideIndex = resumed.args.indexOf(`sandbox_mode="${expected}"`);
+    assert.notEqual(overrideIndex, -1);
+    assert.equal(resumed.args[overrideIndex - 1], '--config');
+  }
+});
+
+test('job payload alone cannot escalate the codex sandbox', () => {
+  const hostileJob = {
+    ...baseJob,
+    runner: 'codex',
+    permissions: { write: true, shell: true },
+    // 任务 payload 里塞进各种“像配置”的字段：sandbox 只能由 worker 侧配置授予
+    options: { sandbox: 'danger-full-access', codexSandboxMode: 'danger-full-access' },
+    codexSandboxMode: 'danger-full-access',
+    sandbox: 'danger-full-access',
+  };
+  const fresh = buildRunnerSpec(hostileJob, {}, { platform: 'win32' });
+  assert.equal(
+    fresh.args[fresh.args.indexOf('--sandbox') + 1],
+    'workspace-write',
+    'danger-full-access 只能来自 worker 配置，任务 payload 不得升权',
+  );
+  const resumed = buildRunnerSpec({ ...hostileJob, session_id: 'thread-9' }, {}, { platform: 'win32' });
+  assert.equal(resumed.args.includes('sandbox_mode="danger-full-access"'), false);
+  assert.equal(resumed.args.includes('sandbox_mode="workspace-write"'), true);
 });
 
 test('all configured runners advertise one-shot resume support', () => {

@@ -1,6 +1,6 @@
 # ai-hub
 
-自托管的 AI 聊天网关与长期记忆库：像 IM 一样跟 Claude Code、Codex 和任意 API 模型聊天。
+自托管的 AI 聊天网关与长期记忆库：像 IM 一样跟 Claude Code、Codex、Grok CLI 和任意 API 模型聊天。
 手机/电脑浏览器访问，历史全同步，CLI 后端走订阅额度，还能把编码任务派回自己的 PC 执行。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
@@ -9,8 +9,8 @@
 ## 能干什么
 
 - **IM 式永续会话**：每个 AI 是一个联系人，一条永远聊下去的对话；改名、换头像、换颜色
-- **三种后端**：`claude` CLI（stream-json 持久子进程 + resume）、`codex app-server`（JSON-RPC）、
-  API 直连（Anthropic / OpenAI-compatible / Gemini 原生协议，UI 里自助添加任意供应商）
+- **四类后端**：`claude` CLI（stream-json 持久子进程 + resume）、`codex app-server`（JSON-RPC）、
+  Grok CLI，以及 API 直连（Anthropic / OpenAI-compatible / Gemini 原生协议，UI 里自助添加任意供应商）
 - **群聊**：拉现有联系人建群，`@名字` / `@all` 调度，每成员独立会话
 - **图片**：选图/粘贴截图直接发，API 联系人可按需配独立视觉模型
 - **内置长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档
@@ -33,6 +33,7 @@
    │  每个联系人一个持久子进程或 API 客户端
    ├─ claude --input-format stream-json --output-format stream-json [--resume]
    ├─ codex app-server (JSON-RPC over stdio, thread/resume)
+   ├─ grok (CLI stream events, session/resume)
    ├─ 直连 API (anthropic / openai-compat / gemini)
    └─ Memory Vault (MCP, :8900) → vault-data/ (Markdown)
 
@@ -47,7 +48,7 @@ PC Worker (主动出站长轮询，无入站端口)
 ## 快速启动
 
 推荐用 Compose 一次启动前端、网关和记忆库。Compose 默认从独立仓库构建
-Memory Vault `v0.6.0`，本仓库不维护它的源码副本：
+Memory Vault `v0.7.0`，本仓库不维护它的源码副本：
 
 ```bash
 cp .env.example .env
@@ -66,8 +67,8 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 
 或构建后单进程：`cd web && npm run build`，网关直接 serve `web/dist`。
 
-首次启动自动种一个 claude-cli 联系人。前提：`claude` CLI 已登录（`claude /login`）。
-不想耗额度可以用 🧪 Mock 联系人（`server/scripts/mock-claude.mjs`）测管线和 UI。
+首次启动会创建中性的 `Claude Code`、`Codex`、`Grok Build` 三个工具联系人；使用前请先
+登录对应 CLI。也可以用 🧪 Mock 联系人（`server/scripts/mock-claude.mjs`）测试管线和 UI。
 
 ## 配置
 
@@ -81,8 +82,8 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
   （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server，
   `overlay.md` 是该联系人相对它家厂商 base prompt 的差分叠层（跟着仓库走，四个后端通用）
 - 系统提示词分几层、想改口吻该动哪一层：[docs/prompt-layers.md](docs/prompt-layers.md)
-- 自动消息的主窗/副窗 `origin` 约定（派单、轮询写 `side`，daily 陪伴写 `main`）：
-  [docs/split-private-and-side-channel-windows.md](docs/split-private-and-side-channel-windows.md) 文末「已实施约定」
+- 自动消息 `origin` 兼容与 side 审计层约定（任务执行进会议室，daily 陪伴进 `main`）：
+  [docs/split-private-and-side-channel-windows.md](docs/split-private-and-side-channel-windows.md) 文末「side 退役为审计层」
 - **多会话并发写这个仓库时先开自己的分支**（暂存区是仓库级共享状态，直接在 master 上
   add/commit 会互相收走对方的文件）：
 
@@ -152,6 +153,43 @@ overlay 网络内、绑定内网 IP；**绝对不要把 3900 直接暴露公网*
 容器镜像包含网关与 Web UI，但不内置 Claude/Codex CLI 或个人凭据；API 直连联系人可直接使用。
 如需 CLI 后端，请基于 Dockerfile 自建包含相应 CLI 的镜像并显式挂载凭据，或者使用上面的
 宿主机 systemd 部署方式。不要为了让容器重启宿主服务而挂载 `docker.sock`。
+
+## 设计参考与致谢
+
+下面列的是已经影响到现有实现的协议或工程设计参考，不表示 AI Hub 是这些项目的 fork，
+也不表示它们与 AI Hub 存在官方关联或背书：
+
+- [Model Context Protocol](https://modelcontextprotocol.io/) 与
+  [TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk)：Memory Vault、工具发现、
+  Streamable HTTP 与 Hub MCP 的协议边界。
+- [OpenAI Codex app-server](https://github.com/openai/codex/tree/main/codex-rs/app-server)：
+  Codex 后端的 JSON-RPC、thread/resume 与 native compact 接入。
+- [Anthropic Claude Code](https://github.com/anthropics/claude-code)：Claude CLI 的 stream-json、
+  resume 与项目级 agent 工作目录集成。
+- [CAS — Coding Agent System](https://github.com/codingagentsystem/cas)：用于对照会议室编排、
+  supervisor/worker 分工、共享任务状态与隔离 worktree 的交付闭环。
+- [NVIDIA Labs OO Agents (NOOA)](https://github.com/NVIDIA-NeMo/labs-OO-Agents)：用于对照
+  大对象 bounded preview + recall、显式状态与优先采用后端原生 compaction 的上下文策略。
+
+项目由 Irisiochan 发起并维护；Claude Code、Codex 等 AI 编程代理参与过设计、实现、测试与
+审查，AI 不作为版权所有者。若代码、配置或资产直接复用/改编自第三方，应在对应文件和
+第三方声明中单独标注来源与许可证。
+
+## 第三方依赖与许可证
+
+React、Node.js、SQLite、Electron、Capacitor、MCP SDK 等构成主要技术栈。各目录的
+`package.json` 与 `package-lock.json` 是依赖名称和版本的权威来源；由四份 lockfile
+可重复生成的完整 npm 组件清单见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：
+
+```bash
+npm run notices        # 重新生成
+npm run notices:check  # 验证锁文件与声明仍一致
+```
+
+生成器会拒绝缺失许可证元数据以及 GPL/AGPL/LGPL/SSPL/BUSL/自定义许可证，当前清单覆盖
+网关/Docker、Web UI、Electron 桌面壳和 Capacitor Android 壳所用的 npm 运行时与构建依赖。
+Electron/Chromium/Node、Android 等原生工具链仍以它们随二进制附带的上游 notices 为准。
+第三方组件分别受其自身许可证约束，与本项目自身的 MIT License 分开表达。
 
 ## License
 

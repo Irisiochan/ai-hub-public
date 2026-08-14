@@ -23,6 +23,9 @@
   `_meta/cli/global-agent-workflow.md`。
 - 这一层只放**所有联系人都成立**的东西：身份边界、时间语义、记忆写入通道、NSFW 下限、
   User 的通用沟通偏好。
+- **条件注入（token round2）**：`TEMPORAL_CONTEXT_RULES` 仅在有回放/历史摘要/既有消息/resume
+  时注入；`nsfwCraft` 联系人开关 `always|intimate|off`（默认 `intimate`，亲密场景 fail-open
+  per-turn；`always` 才进 session preamble）。
 
 ### ③b 联系人叠层 overlay——「某家 base 缺什么 / 多什么」
 

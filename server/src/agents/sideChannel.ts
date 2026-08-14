@@ -24,11 +24,45 @@ function metaEvent(row: HistoricalMessageRow): string {
   }
 }
 
+function receiptHistoryHandle(row: HistoricalMessageRow): string | null {
+  let meta: Record<string, any> = {};
+  try {
+    const parsed = JSON.parse(row.meta || '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) meta = parsed;
+  } catch {}
+  const roomReceipt = meta.roomHost?.receipt && typeof meta.roomHost.receipt === 'object'
+    ? meta.roomHost.receipt as Record<string, any>
+    : null;
+  const previewJob = row.content.match(/^Worker job：\s*([^\s]+)/m);
+  const legacy = row.content.match(/任务\s+([^\s：:]+)\s*[：:]\s*([^\r\n]+)/);
+  const contentReceipt = /^⚙\s*Worker 任务回执/m.test(row.content)
+    || /工作对接回执（preview）/.test(row.content);
+  if (!roomReceipt && meta.event !== 'worker-receipt' && !(contentReceipt && (previewJob || legacy))) return null;
+
+  const updates = Array.isArray(roomReceipt?.stateUpdates) ? roomReceipt.stateUpdates : [];
+  const latest = updates.length && typeof updates[updates.length - 1] === 'object'
+    ? updates[updates.length - 1] as Record<string, unknown>
+    : {};
+  const jobId = String(roomReceipt?.jobId ?? meta.jobId ?? previewJob?.[1] ?? legacy?.[1] ?? '').trim();
+  const statusLine = row.content.match(/^(?:终态|状态)：\s*([^\r\n]+)/m)?.[1]?.trim() ?? '';
+  const status = [
+    latest.status ?? roomReceipt?.status ?? meta.status,
+    latest.deliveryState ?? roomReceipt?.deliveryState ?? meta.deliveryState,
+  ].filter((value) => typeof value === 'string' && value.trim()).join(' / ')
+    || statusLine
+    || legacy?.[2]?.trim()
+    || '状态未知';
+  return `[后台事件] Worker 回执${jobId ? ` · ${jobId}` : ''} · ${compact(status, 160)}`;
+}
+
 /** Fold an already-finished automation row when it becomes conversation history. */
 export function historicalMessageText(row: HistoricalMessageRow): string {
   if (row.origin === 'side' && row.role === 'assistant') {
     return `[后台回复] ${compact(row.content, 200)}`;
   }
+
+  const receipt = receiptHistoryHandle(row);
+  if (receipt) return receipt;
 
   const automation = normalizeAutomationDescriptor(parseMessageMeta(row.meta));
   if (automation?.messageType === 'background-event') {
@@ -46,12 +80,6 @@ export function historicalMessageText(row: HistoricalMessageRow): string {
   }
 
   const event = metaEvent(row);
-  if (event === 'worker-receipt') {
-    const task = row.content.match(/任务\s+([^\s]+)\s+→\s+([^\s（]+)/);
-    return task
-      ? `[后台事件] Worker 回执 · ${task[1]} · ${task[2]}`
-      : '[后台事件] Worker 回执';
-  }
   if (event === 'model-switch') return `[后台事件] ${compact(row.content, 160)}`;
   if (event === 'effort-switch') return `[后台事件] ${compact(row.content, 160)}`;
   if (row.content.startsWith('⚡ AI Hub 自主事件分派')) {

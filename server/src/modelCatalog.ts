@@ -47,9 +47,13 @@ const BUILTIN: Record<string, BackendCatalog> = {
       { id: 'max', label: 'max' },
     ],
   },
-  // grok build 还在 beta，模型 id 没有稳定目录——默认自动选择，特定 id 靠这里或 modelOptions 补
+  // `grok models` 是主目录；这里用于旧 CLI / 临时查询失败时兜底，也可被热更新 JSON 覆盖。
   'grok-cli': {
-    models: [{ id: '', label: '默认（Grok CLI 自动选择）', isDefault: true }],
+    models: [
+      { id: '', label: '默认（Grok CLI 自动选择）', isDefault: true },
+      { id: 'grok-4.6', label: 'Grok 4.6' },
+      { id: 'grok-4.5', label: 'Grok 4.5' },
+    ],
   },
 };
 

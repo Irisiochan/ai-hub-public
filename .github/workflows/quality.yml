@@ -1,0 +1,41 @@
+name: quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            server/package-lock.json
+            web/package-lock.json
+
+      - name: Verify third-party notices
+        run: npm run notices:check
+
+      - name: Install gateway and web dependencies
+        run: |
+          npm ci --prefix server
+          npm ci --prefix web
+
+      - name: Test gateway, web, and worker
+        run: |
+          npm test --prefix server
+          npm test --prefix web
+          npm test --prefix worker
+
+      - name: Build gateway and web
+        run: npm run build

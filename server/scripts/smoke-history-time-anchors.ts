@@ -119,7 +119,7 @@ try {
     messageIds: currentRoomIds,
     fromCreatedAt: '2026-07-26 10:34:56',
     throughCreatedAt: '2026-07-26 10:35:04',
-  });
+  }, null, 'gulami');
   const roomHistory = (roomBackend as any).history(
     currentRoomNotice,
     undefined,
@@ -162,12 +162,14 @@ try {
       && currentRoomNotice.includes('"count":3'),
     'manifest 必须用真实 ID 和同格式上海时间锚定当前窗口'
   );
+  // 方案 A：升级后写到共享 member_id=''（遗留 per-member 行仅作只读回落源）
   const upgradedSummary = db.prepare(
     `SELECT summary FROM conversation_summaries
-     WHERE contact_id = 'room-time' AND member_id = 'galami-time'`
-  ).get() as { summary: string };
+     WHERE contact_id = 'room-time' AND member_id = ''`
+  ).get() as { summary: string } | undefined;
+  assert.ok(upgradedSummary, 'time-anchor 升级必须落到共享摘要行');
   assert.ok(
-    upgradedSummary.summary.startsWith(SUMMARY_FORMAT_MARKER),
+    upgradedSummary!.summary.startsWith(SUMMARY_FORMAT_MARKER),
     '线上遗留的旧格式摘要必须在首次读取时自动重建为带时间锚点的新版本'
   );
 

@@ -86,11 +86,12 @@ try {
   assert.equal((await post({ content: 'bad', origin: 'elsewhere' })).status, 400);
 
   const main = await (await fetch(`${base}?origin=main`)).json() as { messages: MessageRow[] };
-  const side = await (await fetch(`${base}?origin=side`)).json() as { messages: MessageRow[] };
+  const side = await (await fetch(`${base}?origin=side`)).json() as { messages: MessageRow[]; readState: null };
   assert.deepEqual(main.messages.map((row) => row.content), ['User 手打']);
   assert.equal(side.messages.length, 2);
   assert.equal(side.messages[0].sender, 'system', 'triage source marker must not impersonate User');
   assert.equal(side.messages[0].origin, 'side');
+  assert.equal(side.readState, null, 'side remains queryable for audit but has no UI unread state');
   assert.equal(queued.length, 4, 'background and hidden daily triggers still reach the runtime');
 
   const explicitMeta = JSON.parse(side.messages[0].meta);
@@ -161,7 +162,7 @@ try {
   assert.match(serialized, /\[后台事件\]/);
   assert.doesNotMatch(serialized, /绝不应进入历史原文/);
 
-  console.log('side channel smoke: ok');
+  console.log('side audit compatibility smoke: ok');
 } finally {
   await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
   sse.close();

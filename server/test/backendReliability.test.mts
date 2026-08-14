@@ -52,7 +52,7 @@ async function authPathBoundary(): Promise<void> {
   }
 }
 
-function workerCompletionIsIdempotent(): void {
+async function workerCompletionIsIdempotent(): Promise<void> {
   const jobs = new JobStore(db, sse);
   const created = jobs.create({
     requestedBy: 'codex',
@@ -72,7 +72,8 @@ function workerCompletionIsIdempotent(): void {
 
   const duplicate = jobs.complete(created.job, 'done', 'ok', null);
   assert.deepEqual(duplicate, { status: 'done', changed: false });
-  assert.equal(finished, 1);
+  await jobs.drainOutbox();
+  assert.equal(finished, 1, 'durable outbox must fire the hook exactly once across terminal retries');
   assert.equal(jobs.messages(created.job.id).length, messagesAfterFirst);
 
   const cancelled = jobs.create({
@@ -297,7 +298,7 @@ async function unexpectedEofInterruptsStreamingRows(): Promise<void> {
 
 try {
   await authPathBoundary();
-  workerCompletionIsIdempotent();
+  await workerCompletionIsIdempotent();
   await directApiStopAbortsTurn();
   await unexpectedEofInterruptsStreamingRows();
 } finally {

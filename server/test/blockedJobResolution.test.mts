@@ -65,6 +65,7 @@ assert.equal(autoMeta.resolution.mode, 'git_ancestor');
 assert.equal(autoMeta.resolution.head, baseHead);
 assert.equal(typeof autoMeta.resolvedAt, 'string');
 assert.match(autoMeta.resolutionReason, /ancestor/);
+await jobs.drainOutbox();
 assert.deepEqual(finished, [ancestor.id], 'automatic completion must reuse the terminal receipt hook');
 assert.equal(jobs.get(nonAncestor.id)?.status, 'blocked');
 assert.equal(jobs.get(invalid.id)?.status, 'blocked');
@@ -89,6 +90,7 @@ const manualBody = await manualResponse.json() as any;
 assert.equal(manualBody.job.status, 'done');
 assert.equal(manualBody.job.delivery_state, 'delivered_out_of_band');
 assert.equal(manualBody.job.delivery_meta.resolution.mode, 'manual');
+await jobs.drainOutbox();
 assert.equal(finished.at(-1), manual.id, 'manual completion must reuse the terminal receipt hook');
 
 const repeated = await fetch(`${endpoint}/${manual.id}/resolve-out-of-band`, {

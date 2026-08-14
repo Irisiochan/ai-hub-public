@@ -5,8 +5,13 @@ import {
   defaultClosableTaskPath,
   followupIdempotencyKey,
   isTailTaskPath,
+  isActionableReceiptJob,
+  loadHandledReceiptIds,
+  pendingReceiptCards,
   reworkIdempotencyKey,
+  saveHandledReceiptIds,
   taskPathCandidates,
+  visibleJobsForContact,
   workerReceiptJobId,
 } from '../src/sideJobActions.ts';
 
@@ -18,7 +23,7 @@ const receipt = {
   content: '验收失败：按钮没有可见报错',
 };
 
-assert.equal(workerReceiptJobId(receipt), 'job-123');
+assert.equal(workerReceiptJobId(receipt), null, 'legacy side receipts no longer expose action cards');
 assert.equal(workerReceiptJobId({ ...receipt, origin: 'main' }), null);
 assert.equal(workerReceiptJobId({
   ...receipt,
@@ -42,6 +47,108 @@ assert.equal(workerReceiptJobId({
 }), null);
 assert.equal(workerReceiptJobId({ ...receipt, meta: '{broken' }), null);
 assert.equal(workerReceiptJobId({ ...receipt, meta: JSON.stringify({ event: 'other', jobId: 'job-123' }) }), null);
+
+const roomReceipt = {
+  ...receipt,
+  id: 43,
+  origin: 'main',
+  meta: JSON.stringify({ roomHost: { receipt: { jobId: 'job-room-receipt' } } }),
+};
+const secondRoomReceipt = {
+  ...roomReceipt,
+  id: 44,
+  meta: JSON.stringify({ roomHost: { receipt: { jobId: 'job-room-second' } } }),
+};
+const receiptJobs = [
+  { id: 'job-room-receipt' },
+  { id: 'job-room-second' },
+];
+assert.deepEqual(
+  pendingReceiptCards([receipt, roomReceipt, secondRoomReceipt], receiptJobs),
+  [
+    { message: roomReceipt, job: receiptJobs[0] },
+    { message: secondRoomReceipt, job: receiptJobs[1] },
+  ],
+  'only structured receipts with a matching loaded job are actionable',
+);
+assert.deepEqual(
+  pendingReceiptCards([roomReceipt, secondRoomReceipt], receiptJobs, new Set([43])),
+  [{ message: secondRoomReceipt, job: receiptJobs[1] }],
+  'a successfully handled receipt leaves the pending entry',
+);
+assert.deepEqual(pendingReceiptCards([roomReceipt], []), [], 'a receipt without job data has no action card');
+
+const closedLoopJob = {
+  id: 'job-room-receipt',
+  delivery_summary: { state: 'closed_loop', label: '已闭环', summary: '', nextOwner: '', needsUserDecision: false },
+};
+assert.equal(isActionableReceiptJob(closedLoopJob), false);
+assert.deepEqual(
+  pendingReceiptCards([roomReceipt], [closedLoopJob]),
+  [],
+  'closed-loop receipts leave the pending pin bar',
+);
+assert.equal(
+  isActionableReceiptJob({ id: 'job-open', delivery_summary: { state: 'online_waiting_validation', label: '已上线，等待验收', summary: '', nextOwner: '', needsUserDecision: false } }),
+  true,
+);
+
+const memoryStorage = {
+  data: {},
+  getItem(key) { return Object.prototype.hasOwnProperty.call(this.data, key) ? this.data[key] : null; },
+  setItem(key, value) { this.data[key] = String(value); },
+};
+saveHandledReceiptIds('cmrhxny03', new Set([43, 44]), memoryStorage);
+assert.deepEqual([...loadHandledReceiptIds('cmrhxny03', memoryStorage)].sort((a, b) => a - b), [43, 44]);
+assert.deepEqual(
+  pendingReceiptCards([roomReceipt, secondRoomReceipt], receiptJobs, loadHandledReceiptIds('cmrhxny03', memoryStorage)),
+  [],
+  'persisted handled ids survive a remount-style reload',
+);
+
+const roomId = 'cmrhxny03';
+const chengReceiptJob = {
+  id: 'job-room-receipt',
+  origin_contact_id: 'claude',
+  requested_by: 'claude',
+  status: 'blocked',
+};
+const unrelatedJob = {
+  id: 'job-unrelated',
+  origin_contact_id: 'codex',
+  requested_by: 'codex',
+  status: 'blocked',
+};
+const legacyRoomJobs = [chengReceiptJob, unrelatedJob].filter(
+  (job) =>
+    job.origin_contact_id === roomId ||
+    (!job.origin_contact_id && job.requested_by === roomId && new Set(['pending']).has(job.status)),
+);
+assert.deepEqual(
+  pendingReceiptCards([roomReceipt], legacyRoomJobs),
+  [],
+  'the old contact-origin predicate drops a room receipt whose job originated from claude',
+);
+
+const visibleRoomJobs = visibleJobsForContact(
+  roomId,
+  [roomReceipt],
+  [chengReceiptJob, unrelatedJob],
+  new Set(['pending']),
+);
+assert.deepEqual(
+  visibleRoomJobs.map((job) => job.id),
+  ['job-room-receipt'],
+  'the receipt-linked claude job is visible without leaking an unrelated job',
+);
+assert.ok(
+  pendingReceiptCards([roomReceipt], visibleRoomJobs).length >= 1,
+  'the visible receipt job contributes a pending action card',
+);
+assert.ok(
+  visibleRoomJobs.find((job) => job.id === workerReceiptJobId(roomReceipt)),
+  'MessageList can find the receipt job and mount SideJobActions',
+);
 
 assert.equal(reworkIdempotencyKey('job-123', 42), 'rework-job-123-42');
 const prompt = buildReworkPrompt({ prompt: '实现副窗操作按钮' }, receipt);

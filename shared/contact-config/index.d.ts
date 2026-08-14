@@ -54,6 +54,8 @@ export interface ContactConfig {
   projectAccess: ProjectAccessConfig;
   affect: 'on' | 'off';
   affectBaseline: { valence: number; arousal: number };
+  /** NSFW craft injection: always=preamble, intimate=per-turn fail-open, off=never. */
+  nsfwCraft: 'always' | 'intimate' | 'off';
   maxSessionInputTokens: number;
   roomDeliveryMaxChars: number;
   roomDeliveryMaxMessages: number;

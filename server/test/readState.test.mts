@@ -29,9 +29,8 @@ legacy.close();
 
 const db = openDb(dbPath);
 try {
-  assert.equal(db.pragma('user_version', { simple: true }), 21);
-  assert.equal(getMessageReadState(db, 'codex', 'main').unreadCount, 0, 'upgrade seeds old main history as read');
-  assert.equal(getMessageReadState(db, 'codex', 'side').unreadCount, 0, 'upgrade seeds old side history as read');
+  assert.equal(db.pragma('user_version', { simple: true }), 22);
+  assert.equal(getMessageReadState(db, 'codex').unreadCount, 0, 'upgrade seeds old main history as read');
 
   const insert = db.prepare(
     `INSERT INTO messages (contact_id, sender, role, kind, content, status, meta, origin)
@@ -40,38 +39,28 @@ try {
   const manualId = Number(insert.run('user', 'user', 'text', 'User reply', 'main').lastInsertRowid);
   insert.run('codex', 'assistant', 'thinking', 'internal trace', 'main');
   const mainId = Number(insert.run('codex', 'assistant', 'text', 'new answer', 'main').lastInsertRowid);
-  const sideId = Number(insert.run('system', 'system', 'error', 'worker failed', 'side').lastInsertRowid);
+  insert.run('system', 'system', 'error', 'archived worker event', 'side');
 
-  assert.deepEqual(getMessageReadState(db, 'codex', 'main'), {
+  assert.deepEqual(getMessageReadState(db, 'codex'), {
     origin: 'main',
     lastReadMessageId: 1,
     firstUnreadId: mainId,
     unreadCount: 1,
   });
-  assert.deepEqual(getMessageReadState(db, 'codex', 'side'), {
-    origin: 'side',
-    lastReadMessageId: 2,
-    firstUnreadId: sideId,
-    unreadCount: 1,
-  });
-
-  assert.equal(markMessagesRead(db, 'codex', 'main', mainId).unreadCount, 0);
+  assert.equal(markMessagesRead(db, 'codex', mainId).unreadCount, 0);
   assert.equal(
-    markMessagesRead(db, 'codex', 'main', manualId).lastReadMessageId,
+    markMessagesRead(db, 'codex', manualId).lastReadMessageId,
     mainId,
     'read cursors are monotonic'
   );
-  assert.equal(getMessageReadState(db, 'codex', 'side').unreadCount, 1, 'main and side cursors are isolated');
-
-  db.prepare('UPDATE messages SET deleted = 1 WHERE id = ?').run(sideId);
-  assert.equal(getMessageReadState(db, 'codex', 'side').firstUnreadId, null, 'deleting the first unread advances the anchor');
+  assert.equal(getMessageReadState(db, 'codex').unreadCount, 0, 'side audit rows never affect main unread state');
 } finally {
   db.close();
 }
 
 const reopened = openDb(dbPath);
 try {
-  assert.equal(reopened.pragma('user_version', { simple: true }), 21, 'migration remains idempotent on reopen');
+  assert.equal(reopened.pragma('user_version', { simple: true }), 22, 'migration remains idempotent on reopen');
 } finally {
   reopened.close();
   fs.rmSync(tempDir, { recursive: true, force: true });

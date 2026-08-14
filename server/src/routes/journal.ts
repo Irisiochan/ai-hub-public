@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import type { Db } from '../db.js';
+import { parsePositiveIntegerQuery } from '../queryParams.js';
 
 /**
  * Read side of the diary rollup: hand back one Asia/Shanghai calendar day of
@@ -92,10 +93,7 @@ export function journalRouter(db: Db): Router {
     if (!DATE_RE.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00Z`))) {
       return res.status(400).json({ error: 'date must be a valid YYYY-MM-DD' });
     }
-    const requested = Number(req.query.limit);
-    const limit = Number.isFinite(requested) && requested > 0
-      ? Math.min(Math.floor(requested), MAX_LIMIT)
-      : DEFAULT_LIMIT;
+    const limit = parsePositiveIntegerQuery(req.query.limit, DEFAULT_LIMIT, MAX_LIMIT);
     const messages = journalDay(db, date, limit);
     res.json({
       date,

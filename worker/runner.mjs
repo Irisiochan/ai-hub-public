@@ -5,7 +5,7 @@ import process from 'node:process';
 
 const SESSION_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 const MODEL_RE = /^[a-zA-Z0-9._-]{1,100}$/;
-const CODEX_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
 const CLAUDE_PERMISSIONS = {
   read: { allowed: ['Read', 'Grep', 'Glob'], denied: ['Bash'] },
@@ -67,7 +67,7 @@ export function buildRunnerSpec(job, cfg, runtime = {}) {
     if (policy.denied.length) args.push('--disallowedTools', policy.denied.join(','));
     const model = validModel(opts.model) ? opts.model : cfg.claudeModel;
     if (validModel(model)) args.push('--model', model);
-    if (['low', 'medium', 'high', 'xhigh', 'max'].includes(opts.reasoning)) {
+    if (REASONING_EFFORTS.has(opts.reasoning)) {
       args.push('--effort', opts.reasoning);
     }
     if (sessionId) args.push('--resume', sessionId);
@@ -87,7 +87,9 @@ export function buildRunnerSpec(job, cfg, runtime = {}) {
     if (policy.denied.length) args.push('--disallowed-tools', policy.denied.join(','));
     if (policy.approve) args.push('--always-approve');
     if (sessionId) args.push('-r', sessionId);
-    if (validModel(cfg.grokModel)) args.push('-m', cfg.grokModel);
+    const model = validModel(opts.model) ? opts.model : cfg.grokModel;
+    if (validModel(model)) args.push('-m', model);
+    if (REASONING_EFFORTS.has(opts.reasoning)) args.push('--reasoning-effort', opts.reasoning);
     return {
       command: cfg.grokCommand ?? 'grok',
       args,
@@ -107,14 +109,20 @@ export function buildRunnerSpec(job, cfg, runtime = {}) {
   const command = cfg.codexCommand ?? (platform === 'win32' ? 'codex.cmd' : 'codex');
   const model = validModel(opts.model) ? opts.model : cfg.codexModel;
   const modelArgs = validModel(model) ? ['--model', model] : [];
-  const reasoningArgs = CODEX_REASONING_EFFORTS.has(opts.reasoning)
+  const reasoningArgs = REASONING_EFFORTS.has(opts.reasoning)
     ? ['--config', `model_reasoning_effort="${opts.reasoning}"`] : [];
   const windowsSandbox = !fullAccess && platform === 'win32'
     && ['elevated', 'unelevated'].includes(cfg.codexWindowsSandbox ?? 'unelevated')
     ? ['--config', `windows.sandbox="${cfg.codexWindowsSandbox ?? 'unelevated'}"`]
     : [];
+  // resume 分支必须显式重施本 job 的 sandbox：不带覆盖时 resume 会落回
+  // session/全局默认，权限可能相对 fresh 启动漂移（read-only 单被放大，或
+  // danger-full-access 单被压回）。`codex exec resume` 不接受 --sandbox 旗标
+  // （codex-cli 0.145.0 实测 unexpected argument），等价形式是
+  // `--config sandbox_mode="…"`。fresh 与 resume 的有效 sandbox 必须一致。
   const args = sessionId
-    ? ['exec', 'resume', '--json', ...windowsSandbox, ...modelArgs, ...reasoningArgs, sessionId, '-']
+    ? ['exec', 'resume', '--json', ...windowsSandbox, '--config', `sandbox_mode="${sandbox}"`,
+      ...modelArgs, ...reasoningArgs, sessionId, '-']
     : ['exec', '--json', ...windowsSandbox, '--sandbox', sandbox, '--skip-git-repo-check',
       ...modelArgs, ...reasoningArgs, '-'];
   return { command, args, stdin: prompt, cleanup: null };

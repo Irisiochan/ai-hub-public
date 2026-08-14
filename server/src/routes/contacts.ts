@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { AgentManager } from '../agents/manager.js';
 import { CodexAppServerBackend, type CodexModelOption } from '../agents/codexAppServer.js';
+import { GrokCliBackend, type GrokModelOption } from '../agents/grokCli.js';
 import type { HubConfig } from '../config.js';
 import type { Db, ContactRow } from '../db.js';
 import type { SseHub } from '../sse.js';
@@ -71,6 +72,7 @@ export function contactsRouter(
 ): Router {
   const r = Router();
   let codexCache: { expires: number; models: CodexModelOption[] } | null = null;
+  let grokCache: { expires: number; models: GrokModelOption[] } | null = null;
 
   const catalogLog = (message: string) => logger?.warn({ component: 'models' }, message);
   const catalogOf = (backend: string) => modelCatalog(backend, catalogLog);
@@ -87,6 +89,20 @@ export function contactsRouter(
       };
     }
     return codexCache.models;
+  };
+
+  const loadGrokModels = async (cfg: Record<string, any>): Promise<GrokModelOption[]> => {
+    if (!grokCache || grokCache.expires < Date.now()) {
+      grokCache = {
+        expires: Date.now() + 10 * 60_000,
+        models: await GrokCliBackend.listModels({
+          cliPath: cfg.cliPath ?? hubConfig.grok.cliPath,
+          cwd: hubConfig.agentsDir,
+          log: (message) => logger?.info({ component: 'models' }, message),
+        }),
+      };
+    }
+    return grokCache.models;
   };
 
   const publicRow = (c: ContactRow) => {
@@ -156,7 +172,24 @@ export function contactsRouter(
       efforts = catalog.efforts;
       currentEffort = typeof cfg.effort === 'string' ? cfg.effort : '';
     } else if (contact.backend === 'grok-cli') {
-      models = [...catalogOf('grok-cli').models, ...customModels(cfg)];
+      const catalog = catalogOf('grok-cli');
+      const defaultModel = catalog.models.find((model) => model.id === '')
+        ?? { id: '', label: '默认（Grok CLI 自动选择）', isDefault: true };
+      try {
+        models = await loadGrokModels(cfg);
+        dynamic = true;
+      } catch (e: any) {
+        warning = `Grok 模型列表暂时不可用：${e.message}`;
+      }
+      models = [
+        defaultModel,
+        ...models,
+        ...catalog.models.filter((model) => model.id !== ''),
+        ...customModels(cfg),
+      ];
+      if (current && !models.some((model) => model.id === current)) {
+        models.push({ id: current, label: current });
+      }
     } else {
       models = [...customModels(cfg)];
       if (current) models.unshift({ id: current, label: current });

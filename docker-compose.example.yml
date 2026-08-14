@@ -3,7 +3,7 @@ services:
     build:
       # Memory Vault is a versioned external dependency, not source copied into
       # this repository. Override only when intentionally testing a release.
-      context: "https://github.com/Irisiochan/memory-vault.git#${MEMORY_VAULT_VERSION:-v0.6.0}"
+      context: "https://github.com/Irisiochan/memory-vault.git#${MEMORY_VAULT_VERSION:-v0.7.0}"
     restart: unless-stopped
     init: true
     env_file:

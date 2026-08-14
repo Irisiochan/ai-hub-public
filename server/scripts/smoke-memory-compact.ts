@@ -19,7 +19,8 @@ const vault = {
 const preamble = await buildSessionPreamble(
   vault,
   { id: 'compact-test', name: 'Example', backend: 'api' },
-  'compact'
+  'compact',
+  { nsfwCraft: 'always' }
 );
 
 assert.deepEqual(requested, ['get_core_context']);
@@ -57,7 +58,8 @@ const fullVault = {
 const full = await buildSessionPreamble(
   fullVault,
   { id: 'full-test', name: 'Gem', backend: 'api' },
-  'full'
+  'full',
+  { nsfwCraft: 'always' }
 );
 assert.deepEqual(fullRequested, ['get_context']);
 assert.equal(full.split('当前会话身份边界').length - 1, 1, 'full identityGuard must not be duplicated');

@@ -28,7 +28,6 @@ import { incrementReadStateForIncoming, unreadHydrationAfter } from './unreadSta
 
 const emptyReadStates = (): MessageReadStates => ({
   main: { origin: 'main', lastReadMessageId: 0, firstUnreadId: null, unreadCount: 0 },
-  side: { origin: 'side', lastReadMessageId: 0, firstUnreadId: null, unreadCount: 0 },
 });
 
 export default function App() {
@@ -45,8 +44,6 @@ export default function App() {
 
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
-  const activeChannelRef = useRef<MessageOrigin>('main');
-  const activeChannelContactRef = useRef<string | null>(null);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
   const statusesRef = useRef(statuses);
@@ -58,11 +55,12 @@ export default function App() {
   const applyReadState = useCallback((contactId: string, state: MessageReadState) => {
     setReadStates((prev) => {
       const contactStates = prev[contactId] ?? emptyReadStates();
-      return { ...prev, [contactId]: { ...contactStates, [state.origin]: state } };
+      return { ...prev, [contactId]: { ...contactStates, main: state } };
     });
   }, []);
 
   const upsertMessage = useCallback((msg: Message) => {
+    if (effectiveMessageOrigin(msg) !== 'main') return;
     const incomingKey = `${msg.contact_id}:${msg.id}`;
     const alreadyPresent =
       incomingIdsRef.current.has(incomingKey) ||
@@ -84,36 +82,31 @@ export default function App() {
           : c
       )
     );
-    const origin = effectiveMessageOrigin(msg) as MessageOrigin;
     setReadStates((prev) => {
       const contactStates = prev[msg.contact_id] ?? emptyReadStates();
-      const next = incrementReadStateForIncoming(contactStates[origin], msg, alreadyPresent);
-      if (!next || next === contactStates[origin]) return prev;
-      return { ...prev, [msg.contact_id]: { ...contactStates, [origin]: next } };
+      const next = incrementReadStateForIncoming(contactStates.main, msg, alreadyPresent);
+      if (!next || next === contactStates.main) return prev;
+      return { ...prev, [msg.contact_id]: { ...contactStates, main: next } };
     });
   }, []);
 
   const loadMessages = useCallback(async (contactId: string) => {
-    const loadChannel = async (origin: MessageOrigin) => {
-      const initial = await api.messages(contactId, { limit: 50, origin });
-      let rows = initial.messages;
-      let state = initial.readState ?? emptyReadStates()[origin];
-      const after = unreadHydrationAfter(state, rows.map((message) => message.id));
-      if (after !== null) {
-        const hydrated = await api.messages(contactId, { after, limit: 1000, origin });
-        rows = mergeMessageRows(hydrated.messages, rows);
-        state = hydrated.readState ?? state;
-      }
-      return { rows, state };
-    };
-    const [main, side] = await Promise.all([loadChannel('main'), loadChannel('side')]);
+    const initial = await api.messages(contactId, { limit: 50, origin: 'main' });
+    let rows = initial.messages;
+    let state = initial.readState ?? emptyReadStates().main;
+    const after = unreadHydrationAfter(state, rows.map((message) => message.id));
+    if (after !== null) {
+      const hydrated = await api.messages(contactId, { after, limit: 1000, origin: 'main' });
+      rows = mergeMessageRows(hydrated.messages, rows);
+      state = hydrated.readState ?? state;
+    }
     setMessages((prev) => {
       const existing = prev[contactId] ?? [];
-      return { ...prev, [contactId]: mergeMessageRows(existing, [...main.rows, ...side.rows]) };
+      return { ...prev, [contactId]: mergeMessageRows(existing, rows) };
     });
     setReadStates((prev) => ({
       ...prev,
-      [contactId]: { main: main.state, side: side.state },
+      [contactId]: { main: state },
     }));
   }, []);
 
@@ -122,10 +115,10 @@ export default function App() {
     [loadMessages]
   );
 
-  const loadEarlier = useCallback(async (contactId: string, origin: MessageOrigin) => {
-    const list = (messagesRef.current[contactId] ?? []).filter((message) => message.origin === origin);
+  const loadEarlier = useCallback(async (contactId: string) => {
+    const list = (messagesRef.current[contactId] ?? []).filter((message) => message.origin === 'main');
     if (list.length === 0) return;
-    const { messages: rows } = await api.messages(contactId, { before: list[0].id, limit: 50, origin });
+    const { messages: rows } = await api.messages(contactId, { before: list[0].id, limit: 50, origin: 'main' });
     if (rows.length === 0) return;
     setMessages((prev) => {
       const existing = prev[contactId] ?? [];
@@ -226,8 +219,6 @@ export default function App() {
 
   const select = useCallback((id: string | null) => {
     setSelectedId(id);
-    activeChannelRef.current = 'main';
-    activeChannelContactRef.current = id;
     if (id) void reconcileMessages(id);
   }, [reconcileMessages]);
 
@@ -258,18 +249,13 @@ export default function App() {
           status={statuses[selected.id] ?? { state: 'idle' }}
           user={user}
           onBack={() => select(null)}
-          readStates={readStates[selected.id] ?? emptyReadStates()}
-          sideUnread={(readStates[selected.id]?.side.unreadCount ?? 0) > 0}
-          onChannelChange={(channel) => {
-            activeChannelRef.current = channel;
-            activeChannelContactRef.current = selected.id;
-          }}
-          onMarkRead={(origin, throughMessageId) => {
-            void api.markRead(selected.id, origin, throughMessageId)
+          readState={(readStates[selected.id] ?? emptyReadStates()).main}
+          onMarkRead={(throughMessageId) => {
+            void api.markRead(selected.id, throughMessageId)
               .then(({ readState }) => applyReadState(selected.id, readState))
               .catch(() => {});
           }}
-          onLoadEarlier={(origin) => void loadEarlier(selected.id, origin)}
+          onLoadEarlier={() => void loadEarlier(selected.id)}
           onSettings={() => setConfigFor({ contact: selected })}
         />
       ) : (

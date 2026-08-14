@@ -19,9 +19,12 @@ import {
   DELIVERY_POOL_COORDINATION,
   DELIVERY_POOL_IDEA,
   DELIVERY_POOL_TASK,
+  EXECUTED_VIA_CONTACT,
   EXECUTED_VIA_NONE,
   EXECUTED_VIA_WORKER,
   estimateCostCny,
+  executionDispatchKey,
+  executionFingerprint,
   formatCoordinationDispatchBlock,
   formatTaskReminderRoomNotice,
   formatVerificationDispatchBlock,
@@ -44,13 +47,18 @@ import {
   OUTCOME_LABEL_UNKNOWN,
   parseTriageJson,
   parseCoordinationTask,
+  parseVaultInboxList,
   parseVerificationTask,
+  planHubAutoHygiene,
   shanghaiClock,
   summarizeTaskContext,
   taskReminderRoomRoute,
   timerSchedule,
   TriageStore,
   validateTriageMode,
+  verificationDispatchKey,
+  legacyExecutionDispatchKey,
+  legacyVerificationDispatchKey,
 } from './triage-core.mjs';
 import { DeepSeekClient, HubClient, VaultClient } from './triage-clients.mjs';
 import {
@@ -60,6 +68,27 @@ import {
   normalizeAbsenceExtract,
   normalizeFollowupConfig,
 } from './followups.mjs';
+
+// Fetch rejects a small set of ports even for loopback URLs. Windows can
+// occasionally hand one of those ports back for listen(0), making these
+// integration tests flaky before the mock server receives a request.
+const FETCH_BLOCKED_PORTS = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79,
+  87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137,
+  139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540,
+  548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049,
+  3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+]);
+
+async function listenOnFetchSafePort(server) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address && !FETCH_BLOCKED_PORTS.has(address.port)) return address;
+    await new Promise((resolve) => server.close(resolve));
+  }
+  throw new Error('Unable to allocate a fetch-safe loopback port');
+}
 
 test('strict triage JSON accepts the contract and rejects invalid priority/category', () => {
   const parsed = parseTriageJson(JSON.stringify({
@@ -87,7 +116,7 @@ test('strict triage JSON accepts the contract and rejects invalid priority/categ
   })), /needsLocalExec/);
 });
 
-test('task reminders cover time boundaries and ignore no-due or closed tasks', () => {
+test('task reminders cover time boundaries and ignore future, no-due, or closed tasks', () => {
   const snapshot = [
     '任务快照日期：2026-08-01（Asia/Shanghai）',
     '',
@@ -95,6 +124,7 @@ test('task reminders cover time boundaries and ignore no-due or closed tasks', (
     '',
     '- ⚠ **已过期任务** (`tasks/overdue.md`) 已过期 2 天——主动问问 User 完成了没',
     '- 🔔 **今天任务** (`tasks/today.md`) 今天到期',
+    '- **明天任务** (`tasks/tomorrow.md`) 还有 1 天（2026-08-02 星期日）',
     '- **七天任务** (`tasks/upcoming.md`) 还有 7 天（2026-08-08 星期六）',
     '- **无期限任务** (`tasks/no-due.md`)（无期限，仍未完成）',
     '- **已完成任务** (`tasks/done.md`) 今天到期 done',
@@ -109,32 +139,26 @@ test('task reminders cover time boundaries and ignore no-due or closed tasks', (
   })), [
     { path: 'tasks/overdue.md', stage: 'overdue', due: '2026-07-30', priority: 3 },
     { path: 'tasks/today.md', stage: 'due-today', due: '2026-08-01', priority: 2 },
-    { path: 'tasks/upcoming.md', stage: 'upcoming', due: '2026-08-08', priority: 1 },
   ]);
   assert.match(reminders[0].summary, /下一步：确认完成、改期或作废。/);
   assert.match(reminders[0].summary, /需要 User 操作：是。/);
 });
 
-test('task reminder key is stable inside a stage and changes on escalation or reschedule', () => {
-  const futureAtSeven = buildTaskReminders([
-    '任务快照日期：2026-08-01（Asia/Shanghai）',
-    '- **同一任务** (`tasks/same.md`) 还有 7 天（2026-08-08 星期六）',
-  ].join('\n'))[0];
-  const futureAtSix = buildTaskReminders([
-    '任务快照日期：2026-08-02（Asia/Shanghai）',
-    '- **同一任务** (`tasks/same.md`) 还有 6 天（2026-08-08 星期六）',
-  ].join('\n'))[0];
+test('task reminder key is stable inside a stage and changes on escalation', () => {
   const dueToday = buildTaskReminders([
     '任务快照日期：2026-08-08（Asia/Shanghai）',
     '- 🔔 **同一任务** (`tasks/same.md`) 今天到期',
   ].join('\n'))[0];
-  const rescheduled = buildTaskReminders([
-    '任务快照日期：2026-08-02（Asia/Shanghai）',
-    '- **同一任务** (`tasks/same.md`) 还有 7 天（2026-08-09 星期日）',
+  const overdueDayOne = buildTaskReminders([
+    '任务快照日期：2026-08-09（Asia/Shanghai）',
+    '- ⚠ **同一任务** (`tasks/same.md`) 已过期 1 天——主动问问 User 完成了没',
   ].join('\n'))[0];
-  assert.equal(futureAtSeven.reminderKey, futureAtSix.reminderKey);
-  assert.notEqual(futureAtSix.reminderKey, dueToday.reminderKey);
-  assert.notEqual(futureAtSix.reminderKey, rescheduled.reminderKey);
+  const overdueDayTwo = buildTaskReminders([
+    '任务快照日期：2026-08-10（Asia/Shanghai）',
+    '- ⚠ **同一任务** (`tasks/same.md`) 已过期 2 天——主动问问 User 完成了没',
+  ].join('\n'))[0];
+  assert.equal(overdueDayOne.reminderKey, overdueDayTwo.reminderKey);
+  assert.notEqual(dueToday.reminderKey, overdueDayOne.reminderKey);
   assert.equal(isTaskReminderMode({ payload: { mode: 'task-reminder' } }), true);
 });
 
@@ -169,11 +193,31 @@ test('task reminder room routing recognizes executor, verifier, and configured t
   });
   assert.equal(taskReminderRoomRoute(frontmatter(['tags: [生活, 租房]'])).route, 'main');
   assert.equal(taskReminderRoomRoute('not frontmatter').route, 'main');
-  assert.match(formatTaskReminderRoomNotice({
-    title: '工程验收',
-    summary: '今天到期。',
-    taskPath: 'tasks/demo.md',
-  }), /纯通告，不需要群成员接单/);
+  const cases = [
+    {
+      title: '今日工程验收',
+      stage: 'due-today',
+      dueDate: '2026-08-01',
+      daysUntilDue: 0,
+      nextStep: '确认完成、改期或作废。',
+      expected: /进度：今天到期（2026-08-01）。/,
+    },
+    {
+      title: '逾期工程验收',
+      stage: 'overdue',
+      dueDate: '2026-07-30',
+      daysUntilDue: -2,
+      nextStep: '确认完成、改期或作废。',
+      expected: /进度：已过期 2 天（原定 2026-07-30）。/,
+    },
+  ];
+  for (const reminder of cases) {
+    const notice = formatTaskReminderRoomNotice({ ...reminder, taskPath: 'tasks/demo.md' });
+    assert.match(notice, reminder.expected);
+    assert.match(notice, new RegExp(`下一步：${reminder.nextStep}`));
+    assert.equal(notice.split(reminder.title).length - 1, 1, 'room notice title must appear exactly once');
+    assert.match(notice, /纯通告，不需要群成员接单/);
+  }
 });
 
 test('task reminder event retry and repeat scans keep one durable delivery', () => {
@@ -183,7 +227,7 @@ test('task reminder event retry and repeat scans keep one durable delivery', () 
     const input = {
       source: 'task-reminder',
       summary: 'one reminder',
-      dedupeKey: 'tasks/same.md:2026-08-08:upcoming',
+      dedupeKey: 'tasks/same.md:2026-08-08:due-today',
       payload: { mode: 'task-reminder' },
     };
     const first = store.enqueue(input);
@@ -233,6 +277,28 @@ test('backlog task snapshot excludes tails, future tasks, and already claimed pa
     'tail',
     'future',
   ]);
+  assert.equal(snapshot.parseOk, true);
+});
+
+test('dispatchable snapshot soft-fails empty/garbage; well-formed zero is parseOk', () => {
+  assert.equal(buildDispatchableTaskContext('').parseOk, false);
+  assert.equal(buildDispatchableTaskContext('garbage without anchor').parseOk, false);
+  assert.equal(
+    buildDispatchableTaskContext([
+      '任务快照日期：2026-08-11',
+      '- **looks like a task but path missing**',
+    ].join('\n')).parseOk,
+    false,
+  );
+  const wellFormedZero = buildDispatchableTaskContext([
+    '任务快照日期：2026-08-11',
+    '',
+    '## ⏰ 时间敏感事项',
+    '- **尾巴** (`tasks/worker-tail-x.md`)（无期限，仍未完成）',
+  ].join('\n'));
+  assert.equal(wellFormedZero.parseOk, true);
+  assert.equal(wellFormedZero.taskPaths.length, 0);
+  assert.equal(wellFormedZero.allTaskPaths.length, 1);
 });
 
 test('backlog triage requires an exact eligible taskPath', () => {
@@ -379,9 +445,10 @@ test('coordination parser requires open executor Plan and hashes only the Plan v
   assert.equal(parseCoordinationTask(taskText.replace('status: open', 'status: done'), { taskPath: 'tasks/demo.md' }), null);
 
   const fixedPrompt = coordinationWorkerPrompt(parsed);
-  assert.match(fixedPrompt, /^\[AI_HUB_COORDINATION_V1\]/);
+  assert.match(fixedPrompt, /^\[AI_HUB_COORDINATION_V2\]/);
   assert.match(fixedPrompt, /taskPath=tasks\/demo\.md/);
   assert.match(fixedPrompt, /planHash=[a-f0-9]{64}/);
+  assert.match(fixedPrompt, new RegExp(`fingerprint=${executionFingerprint(parsed)}`));
   const dispatch = formatCoordinationDispatchBlock(parsed);
   assert.match(dispatch, /@codex/);
   assert.match(dispatch, /delegate_to_worker\.prompt 必须逐字/);
@@ -394,10 +461,96 @@ test('coordination parser requires open executor Plan and hashes only the Plan v
   });
   assert.equal(config.tasksDir, '/opt/memory-vault/tasks');
   assert.deepEqual(config.reminderRoomTags, ['ai-hub', 'worker', 'deploy', '工程']);
+  assert.deepEqual(config.hubAutoHygiene, { enabled: false, staleDays: 14 });
+  assert.deepEqual(
+    normalizeCoordinationConfig({ hubAutoHygiene: { enabled: true, staleDays: 21 } }).hubAutoHygiene,
+    { enabled: true, staleDays: 21 },
+  );
   assert.equal(coordinationPolicyState(config, { count: 7 }).poolFull, false);
   assert.equal(coordinationPolicyState(config, { count: 7 }).remaining, 1);
   assert.equal(coordinationPolicyState(config, { count: 8 }).poolFull, true);
   assert.equal(coordinationPolicyState({ enabled: true, roomId: '', dailyLimit: 8 }).poolFull, true);
+});
+
+test('fingerprint v2 covers executor/workspace/branch and canonicalizes workspace paths', () => {
+  const base = {
+    taskPath: 'tasks/demo.md',
+    planHash: 'a'.repeat(64),
+    executor: 'codex',
+    workspace: 'C:/ai-hub-codex',
+    branch: 'coordination-demo',
+  };
+  const fingerprint = executionFingerprint(base);
+  assert.match(fingerprint, /^[a-f0-9]{64}$/);
+  // 语义等价的写法必须得到同一个 fingerprint
+  assert.equal(executionFingerprint({ ...base, workspace: 'c:\\ai-hub-codex\\' }), fingerprint);
+  assert.equal(executionFingerprint({ ...base, executor: ' Codex ' }), fingerprint);
+  // 任一语义字段变化都必须产生新 fingerprint —— 特别是 Plan 不变、只改派 executor
+  assert.notEqual(executionFingerprint({ ...base, executor: 'aye' }), fingerprint);
+  assert.notEqual(executionFingerprint({ ...base, workspace: 'D:/other' }), fingerprint);
+  assert.notEqual(executionFingerprint({ ...base, branch: 'other-branch' }), fingerprint);
+  assert.notEqual(executionFingerprint({ ...base, planHash: 'b'.repeat(64) }), fingerprint);
+  assert.notEqual(executionFingerprint({ ...base, taskPath: 'tasks/other.md' }), fingerprint);
+  // Linux 路径大小写敏感，不做小写化
+  assert.notEqual(
+    executionFingerprint({ ...base, workspace: '/opt/Repo' }),
+    executionFingerprint({ ...base, workspace: '/opt/repo' }),
+  );
+
+  assert.equal(executionDispatchKey(base), `coordination:v2:tasks/demo.md:${fingerprint}`);
+  assert.equal(legacyExecutionDispatchKey(base), `coordination:tasks/demo.md:${'a'.repeat(64)}`);
+  const verification = { taskPath: 'tasks/demo.md', due: '2026-08-14', verifier: 'Aye' };
+  assert.equal(
+    verificationDispatchKey(verification),
+    'verification:v2:tasks/demo.md:2026-08-14:aye',
+  );
+  assert.equal(
+    legacyVerificationDispatchKey(verification),
+    'verification:v1:tasks/demo.md:2026-08-14',
+  );
+});
+
+test('hub-auto hygiene parses inbox rows, applies the 14-day boundary, and groups the digest', () => {
+  const inbox = [
+    '共 6 条待确认：',
+    '',
+    '- **无标签** (`inbox/2026-07-01_no-tags.md`)',
+    '- **13 天偏好** (`inbox/2026-07-27_fresh.md`)  [hub-auto, claude, 偏好]',
+    '- **14 天承诺** (`inbox/2026-07-26_temporal.md`)  [hub-auto, claude, 承诺与待办, llm-review-pending]',
+    '- **20 天人生事件** (`inbox/2026-07-20_manual.md`)  [hub-auto, 人生事件]',
+    '- **非法日期** (`inbox/2026-02-30_invalid.md`)  [hub-auto, 时间与计划]',
+    '- **普通需求** (`inbox/2026-07-01_req.md`)  [需求, ai-hub]',
+  ].join('\n');
+
+  const parsed = parseVaultInboxList(inbox);
+  assert.equal(parsed.length, 6);
+  assert.deepEqual(parsed[0].tags, []);
+  assert.deepEqual(parsed[2].tags, ['hub-auto', 'claude', '承诺与待办', 'llm-review-pending']);
+  assert.equal(parsed[4].date, null);
+
+  const plan = planHubAutoHygiene(inbox, { today: '2026-08-09', staleDays: 14 });
+  assert.deepEqual(plan.metrics, {
+    hubAutoTotal: 4,
+    staleCount: 2,
+    oldestDays: 20,
+    invalidDateCount: 1,
+  });
+  assert.deepEqual(plan.stale.map((item) => [item.path, item.ageDays, item.group]), [
+    ['inbox/2026-07-20_manual.md', 20, 'manual'],
+    ['inbox/2026-07-26_temporal.md', 14, 'temporal'],
+  ]);
+  assert.match(plan.digest, /时效类（时间与计划\/承诺与待办）可归档提案/);
+  assert.match(plan.digest, /偏好\/人生事件类需人工判断/);
+  assert.match(plan.digest, /2026-07-26_temporal\.md`｜14 天｜分类：承诺与待办/);
+  assert.match(plan.digest, /hub-auto 存量 4｜超期 2｜最老 20 天｜日期前缀不可解析 1/);
+  assert.doesNotMatch(plan.digest, /2026-07-27_fresh/);
+
+  const quiet = planHubAutoHygiene(
+    '- **13 天偏好** (`inbox/2026-07-27_fresh.md`)  [hub-auto, 偏好]',
+    { today: '2026-08-09', staleDays: 14 },
+  );
+  assert.equal(quiet.metrics.staleCount, 0);
+  assert.equal(quiet.digest, '');
 });
 
 test('verification parser requires open verifier and a real due date, with a fixed read-only template', () => {
@@ -542,6 +695,80 @@ test('idea completion and diary outbox are atomic, retryable, and idempotent', (
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM triage_vault_outbox').get().count, 1);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM triage_deliveries WHERE pool = ?').get(DELIVERY_POOL_IDEA).count, 1);
     assert.equal(store.dailySummary(4000).ideaDiariesWritten, 1);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('coordination settle is atomic and idempotent across state, delivery, and event finish', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-settle-'));
+  const store = new TriageStore(path.join(dir, 'triage.db'));
+  try {
+    const event = store.enqueue({
+      source: 'coordination-sweep',
+      summary: 'settle test',
+      dedupeKey: 'settle-1',
+    });
+    const settleInput = {
+      recipientId: 'room',
+      pool: DELIVERY_POOL_COORDINATION,
+      messageId: 501,
+      executedVia: EXECUTED_VIA_CONTACT,
+      taskPath: 'tasks/settle.md',
+      sourceStates: [{ key: 'coordination:v1', value: '{"tasks/settle.md":"fp"}' }],
+      triageResult: {
+        actionable: true,
+        needsLocalExec: true,
+        category: 'coordination',
+        priority: 2,
+        suggestedRecipient: 'codex',
+        rationale: 'settle test',
+      },
+      finishRecipientId: 'codex',
+    };
+    store.settleCoordinationDispatch(event.id, settleInput, 4000);
+    // 幂等：重复 settle（崩溃后重放）不得二次计池或重复 outcome
+    store.settleCoordinationDispatch(event.id, settleInput, 5000);
+    assert.equal(store.getSourceState('coordination:v1'), '{"tasks/settle.md":"fp"}');
+    assert.equal(store.poolUsage(DELIVERY_POOL_COORDINATION, 5000).count, 1);
+    const deliveries = store.db.prepare(
+      'SELECT * FROM triage_deliveries WHERE event_id = ?',
+    ).all(event.id);
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0].message_id, 501);
+    const outcomes = store.db.prepare(
+      'SELECT * FROM triage_outcomes WHERE event_id = ?',
+    ).all(event.id);
+    assert.equal(outcomes.length, 1);
+    const eventRow = store.db.prepare('SELECT * FROM triage_events WHERE id = ?').get(event.id);
+    assert.equal(eventRow.status, 'dispatched');
+    assert.equal(eventRow.recipient_id, 'codex');
+
+    // 原子性：事务内任一步失败必须整体回滚，不得留下半套账
+    const broken = store.enqueue({
+      source: 'coordination-sweep',
+      summary: 'settle rollback test',
+      dedupeKey: 'settle-2',
+    });
+    assert.throws(() => store.settleCoordinationDispatch(broken.id, {
+      ...settleInput,
+      sourceStates: [
+        { key: 'rollback-probe', value: 'written-first' },
+        // 注入：第二条 state 读取即抛错，模拟事务中途任意一步失败
+        { get key() { throw new Error('injected mid-transaction failure'); }, value: '' },
+      ],
+    }, 6000));
+    assert.equal(store.getSourceState('rollback-probe'), null, '事务失败后先写的 state 必须回滚');
+    assert.equal(
+      store.db.prepare('SELECT COUNT(*) AS c FROM triage_deliveries WHERE event_id = ?').get(broken.id).c,
+      0,
+    );
+    assert.equal(
+      store.db.prepare('SELECT status FROM triage_events WHERE id = ?').get(broken.id).status,
+      'queued',
+      '事务失败后 event 必须保持可重试',
+    );
   } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -787,7 +1014,7 @@ test('fuzzy L2.5 preserves needsLocalExec and only sees delegation recipients', 
       }));
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await listenOnFetchSafePort(server);
   const previous = process.env.TEST_TRIAGE_ROUTE_KEY;
   process.env.TEST_TRIAGE_ROUTE_KEY = 'test-only';
   try {
@@ -1479,8 +1706,7 @@ test('minimal streamable HTTP MCP client initializes a session and calls a vault
       }
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
+  const address = await listenOnFetchSafePort(server);
   const client = new VaultClient({ url: `http://127.0.0.1:${address.port}/mcp` });
   try {
     assert.equal(await client.call('search_vault', { query: 'triage-backlog' }), 'vault result');
@@ -1531,8 +1757,7 @@ test('controlled idea diary delivery retries without reopening or duplicating th
       }
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
+  const address = await listenOnFetchSafePort(server);
   const vault = new VaultClient({ url: `http://127.0.0.1:${address.port}/mcp` });
   try {
     const queued = store.enqueue({
@@ -1596,7 +1821,7 @@ test('controlled idea diary delivery retries without reopening or duplicating th
   }
 });
 
-test('hub dispatch declares automation source and preserves daily main semantics', async () => {
+test('hub dispatch defaults to main and declares automation source', async () => {
   const received = [];
   const server = http.createServer((req, res) => {
     let raw = '';
@@ -1609,8 +1834,7 @@ test('hub dispatch declares automation source and preserves daily main semantics
         : { queued: true, messageId: received.length }));
     });
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
+  const address = await listenOnFetchSafePort(server);
   const client = new HubClient({
     baseUrl: `http://127.0.0.1:${address.port}`,
     timeoutMs: 2000,
@@ -1631,11 +1855,11 @@ test('hub dispatch declares automation source and preserves daily main semantics
     });
     const outcomeMessages = await client.messages('codex', 42, 200, 'all');
     assert.equal(outcomeMessages[0].id, 43);
-    assert.deepEqual(received, [
+    assert.deepEqual(received.slice(0, 2), [
       {
         url: '/api/contacts/codex/messages',
         body: {
-          content: 'task flow', origin: 'side', automated: true, hidden: false,
+          content: 'task flow', origin: 'main', automated: true, hidden: false,
           automation: {
             messageType: 'background-event', eventSource: 'quarter-hour-check', eventId: 'event-task',
             eventCategory: 'backlog', eventPriority: 2,
@@ -1652,11 +1876,15 @@ test('hub dispatch declares automation source and preserves daily main semantics
           },
         },
       },
-      {
-        url: '/api/contacts/codex/messages?after=42&limit=200&origin=all',
-        body: null,
-      },
     ]);
+    assert.equal(received.length, 3);
+    const messagesUrl = new URL(received[2].url, 'http://localhost');
+    assert.equal(messagesUrl.pathname, '/api/contacts/codex/messages');
+    assert.deepEqual([...messagesUrl.searchParams.keys()].sort(), ['after', 'limit', 'origin']);
+    assert.equal(messagesUrl.searchParams.get('after'), '42');
+    assert.equal(messagesUrl.searchParams.get('limit'), '200');
+    assert.equal(messagesUrl.searchParams.get('origin'), 'all');
+    assert.equal(received[2].body, null);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

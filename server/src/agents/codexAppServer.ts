@@ -16,6 +16,10 @@ export interface CodexAppServerBackendOpts {
   developerInstructions?: string;
   mcpServers?: CodexMcpServerConfig[];
   sandbox?: 'read-only' | 'workspace-write';
+  nativeCompact?: {
+    enabled?: boolean;
+    inputTokens?: number;
+  };
   turnTimeoutMs: number;
   log: (msg: string) => void;
 }
@@ -26,6 +30,8 @@ export interface CodexMcpServerConfig {
   enabledTools?: string[];
   required?: boolean;
   defaultToolsApprovalMode?: 'auto' | 'prompt' | 'writes' | 'approve';
+  /** streamable-http 自定义请求头（hub-mcp per-contact bearer 走这里）。 */
+  httpHeaders?: Record<string, string>;
 }
 
 /** Build per-process config overrides so one contact never leaks MCP authority to another. */
@@ -47,6 +53,9 @@ export function codexAppServerArgs(servers: CodexMcpServerConfig[] = []): string
         '--config',
         `${key}.default_tools_approval_mode=${JSON.stringify(server.defaultToolsApprovalMode)}`
       );
+    }
+    if (server.httpHeaders && Object.keys(server.httpHeaders).length) {
+      args.push('--config', `${key}.http_headers=${JSON.stringify(server.httpHeaders)}`);
     }
   }
   return args;
@@ -160,6 +169,10 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
+const DEFAULT_NATIVE_COMPACT_INPUT_TOKENS = 200_000;
+const NATIVE_COMPACT_START_ACK_TIMEOUT_MS = 30_000;
+const NATIVE_COMPACT_MIN_COMPLETION_TIMEOUT_MS = 120_000;
+
 /** Drives `codex app-server` over its newline-delimited JSON-RPC v2 protocol. */
 export class CodexAppServerBackend implements AgentBackend {
   readonly kind = 'codex' as const;
@@ -171,11 +184,21 @@ export class CodexAppServerBackend implements AgentBackend {
   private threadAnnounced = false;
   private turnId: string | null = null;
   private turn: AsyncQueue<TurnEvent> | null = null;
+  private userTurnStartRequested = false;
   private turnTimer: NodeJS.Timeout | null = null;
   private accText = '';
   private stderrTail: string[] = [];
   private toolNames = new Map<string, string>();
   private lastTokenUsage: TokenUsage | undefined;
+  private compactQueued = false;
+  private compactInFlight = false;
+  private compactThresholdLatched = false;
+  private compactThreadId: string | null = null;
+  private compactTurnId: string | null = null;
+  private compactTimer: NodeJS.Timeout | null = null;
+  private compactBarrier: Promise<void> | null = null;
+  private resolveCompactBarrier: (() => void) | null = null;
+  private stopping = false;
 
   constructor(private opts: CodexAppServerBackendOpts) {}
 
@@ -272,6 +295,7 @@ export class CodexAppServerBackend implements AgentBackend {
   }
 
   async start(resumeToken: string | null): Promise<void> {
+    this.stopping = false;
     this.spawn();
     await this.request('initialize', {
       clientInfo: { name: 'ai_hub', title: 'ai-hub', version: '0.1.0' },
@@ -342,7 +366,9 @@ export class CodexAppServerBackend implements AgentBackend {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
     this.finishTurn();
+    this.settleNativeCompact();
     await this.proc?.stop();
   }
 
@@ -350,6 +376,7 @@ export class CodexAppServerBackend implements AgentBackend {
     const queue = new AsyncQueue<TurnEvent>();
     this.turn = queue;
     this.turnId = null;
+    this.userTurnStartRequested = false;
     this.accText = '';
     this.lastTokenUsage = undefined;
     this.toolNames.clear();
@@ -359,7 +386,7 @@ export class CodexAppServerBackend implements AgentBackend {
       queue.push({ type: 'session', sessionId: this.threadId });
     }
 
-    void this.beginTurn(input.text, input.imagePaths).catch((e: any) => {
+    void this.beginTurnAfterCompaction(input.text, input.imagePaths).catch((e: any) => {
       queue.push({ type: 'error', message: `Codex 发送失败：${e.message}`, fatal: false });
       this.finishTurn();
     });
@@ -367,8 +394,23 @@ export class CodexAppServerBackend implements AgentBackend {
     return { events: queue, interrupt: () => this.interrupt() };
   }
 
+  private async beginTurnAfterCompaction(text: string, imagePaths: string[] = []): Promise<void> {
+    if (this.compactBarrier) await this.compactBarrier;
+    if (this.stopping) throw new Error('Codex app-server is stopping');
+    try {
+      await this.beginTurn(text, imagePaths);
+    } catch (error) {
+      if (this.isActiveTurnNotSteerable(error)) {
+        this.userTurnStartRequested = false;
+        throw new Error('Codex 仍有不可插话的活跃轮次（可能仍在压缩上下文），当前消息未发送，请稍后重试');
+      }
+      throw error;
+    }
+  }
+
   private async beginTurn(text: string, imagePaths: string[] = []): Promise<void> {
     if (!this.threadId) throw new Error('Codex thread is not ready');
+    this.userTurnStartRequested = true;
     const result = await this.request('turn/start', {
       threadId: this.threadId,
       input: codexTurnInput(text, imagePaths),
@@ -452,6 +494,24 @@ export class CodexAppServerBackend implements AgentBackend {
       this.captureThread(params.thread.id);
       return;
     }
+    if (method === 'turn/started' && this.compactInFlight && !this.userTurnStartRequested) {
+      const threadId = typeof params?.threadId === 'string' ? params.threadId : null;
+      const turnId = typeof params?.turn?.id === 'string' ? params.turn.id : null;
+      if (threadId === this.compactThreadId && turnId) {
+        if (!this.compactTurnId) {
+          this.compactTurnId = turnId;
+          this.opts.log(
+            `native compact turn identified thread=${threadId.slice(0, 12)} turn=${turnId.slice(0, 12)}`
+          );
+        } else if (turnId !== this.compactTurnId) {
+          this.opts.log(
+            `native compact ignored unexpected turn/start thread=${threadId.slice(0, 12)}`
+            + ` expected=${this.compactTurnId.slice(0, 12)} actual=${turnId.slice(0, 12)}`
+          );
+        }
+      }
+      if (!this.turn || !this.userTurnStartRequested) return;
+    }
     if (method === 'thread/tokenUsage/updated' && params?.tokenUsage?.last) {
       if (!this.threadId || !params.threadId || params.threadId === this.threadId) {
         const last = params.tokenUsage.last;
@@ -461,10 +521,28 @@ export class CodexAppServerBackend implements AgentBackend {
           cacheRead: cached,
           output: Number(last.outputTokens ?? 0),
         };
+        this.considerNativeCompact(Number(last.inputTokens ?? 0), params.threadId);
       }
       return;
     }
-    if (!this.turn) return;
+    if (method === 'thread/compacted') {
+      if (!this.threadId || !params?.threadId || params.threadId === this.threadId) {
+        this.completeNativeCompact(params?.threadId, params?.turnId, 'thread/compacted');
+      }
+      return;
+    }
+    // Current schemas prefer a ContextCompaction item; keep the deprecated
+    // thread/compacted route above because the local protocol still exposes it.
+    if (method === 'item/completed' && params?.item?.type === 'contextCompaction') {
+      if (!this.threadId || !params?.threadId || params.threadId === this.threadId) {
+        this.completeNativeCompact(params?.threadId, params?.turnId, 'contextCompaction item');
+      }
+      return;
+    }
+    // A queued user turn may already own `this.turn` while native compaction is
+    // still emitting its own turn/item notifications. Do not attach those to
+    // the chat queue until this backend has actually requested the user turn.
+    if (!this.turn || !this.userTurnStartRequested) return;
 
     switch (method) {
       case 'turn/started':
@@ -543,6 +621,9 @@ export class CodexAppServerBackend implements AgentBackend {
 
   private captureThread(id: string): void {
     if (id === this.threadId) return;
+    this.compactQueued = false;
+    this.compactThresholdLatched = false;
+    this.settleNativeCompact();
     this.threadId = id;
     if (this.turn) {
       this.threadAnnounced = true;
@@ -556,8 +637,107 @@ export class CodexAppServerBackend implements AgentBackend {
     if (this.turnTimer) clearTimeout(this.turnTimer);
     this.turnTimer = null;
     this.turnId = null;
+    this.userTurnStartRequested = false;
     this.turn?.end();
     this.turn = null;
+    if (!this.stopping && this.compactQueued) void this.startQueuedNativeCompact();
+  }
+
+  private nativeCompactEnabled(): boolean {
+    return this.opts.nativeCompact?.enabled !== false;
+  }
+
+  private nativeCompactInputTokens(): number {
+    const configured = Number(this.opts.nativeCompact?.inputTokens);
+    return Number.isFinite(configured) && configured > 0
+      ? Math.floor(configured)
+      : DEFAULT_NATIVE_COMPACT_INPUT_TOKENS;
+  }
+
+  private nativeCompactCompletionTimeoutMs(): number {
+    return Math.max(this.opts.turnTimeoutMs, NATIVE_COMPACT_MIN_COMPLETION_TIMEOUT_MS);
+  }
+
+  private considerNativeCompact(inputTokens: number, notificationThreadId?: string): void {
+    if (!this.nativeCompactEnabled() || !this.threadId) return;
+    if (notificationThreadId && notificationThreadId !== this.threadId) return;
+    if (!Number.isFinite(inputTokens) || inputTokens < this.nativeCompactInputTokens()) {
+      if (!this.compactQueued && !this.compactInFlight) this.compactThresholdLatched = false;
+      return;
+    }
+    if (this.compactThresholdLatched || this.compactQueued || this.compactInFlight) return;
+    this.compactThresholdLatched = true;
+    this.compactQueued = true;
+    this.opts.log(
+      `native compact queued thread=${this.threadId.slice(0, 12)} inputTokens=${inputTokens}`
+      + ` threshold=${this.nativeCompactInputTokens()}`
+    );
+    if (!this.turn) void this.startQueuedNativeCompact();
+  }
+
+  private async startQueuedNativeCompact(): Promise<void> {
+    if (!this.nativeCompactEnabled() || !this.compactQueued || this.compactInFlight || this.turn || !this.threadId) {
+      return;
+    }
+    const threadId = this.threadId;
+    this.compactQueued = false;
+    this.compactInFlight = true;
+    this.compactThreadId = threadId;
+    this.compactTurnId = null;
+    this.compactBarrier = new Promise<void>((resolve) => { this.resolveCompactBarrier = resolve; });
+    this.opts.log(`native compact starting thread=${threadId.slice(0, 12)}`);
+    try {
+      await this.request('thread/compact/start', { threadId }, NATIVE_COMPACT_START_ACK_TIMEOUT_MS);
+      if (this.compactInFlight && this.compactThreadId === threadId) {
+        this.compactTimer = setTimeout(() => {
+          if (!this.compactInFlight || this.compactThreadId !== threadId) return;
+          this.opts.log(`native compact completion timed out thread=${threadId.slice(0, 12)}`);
+          this.settleNativeCompact();
+        }, this.nativeCompactCompletionTimeoutMs());
+      }
+    } catch (e: any) {
+      if (this.compactInFlight && this.compactThreadId === threadId) {
+        this.opts.log(`native compact failed thread=${threadId.slice(0, 12)}: ${e.message}`);
+        this.settleNativeCompact();
+      }
+    }
+  }
+
+  private settleNativeCompact(): void {
+    if (this.compactTimer) clearTimeout(this.compactTimer);
+    this.compactTimer = null;
+    this.compactInFlight = false;
+    this.compactThreadId = null;
+    this.compactTurnId = null;
+    const resolve = this.resolveCompactBarrier;
+    this.resolveCompactBarrier = null;
+    this.compactBarrier = null;
+    resolve?.();
+  }
+
+  private completeNativeCompact(threadId?: string, turnId?: string, source = 'notification'): void {
+    if (
+      !this.compactInFlight
+      || !threadId
+      || threadId !== this.compactThreadId
+      || !turnId
+      || turnId !== this.compactTurnId
+    ) {
+      this.opts.log(
+        `native compact ignored unmatched completion via=${source}`
+        + ` thread=${String(threadId ?? 'missing').slice(0, 12)}`
+        + ` turn=${String(turnId ?? 'missing').slice(0, 12)}`
+        + ` expectedThread=${String(this.compactThreadId ?? 'none').slice(0, 12)}`
+        + ` expectedTurn=${String(this.compactTurnId ?? 'none').slice(0, 12)}`
+      );
+      return;
+    }
+    this.compactQueued = false;
+    this.settleNativeCompact();
+    this.opts.log(
+      `native compact completed thread=${String(threadId ?? this.threadId ?? 'unknown').slice(0, 12)}`
+      + `${turnId ? ` turn=${String(turnId).slice(0, 12)}` : ''} via=${source}`
+    );
   }
 
   private summarize(value: unknown): string {
@@ -567,6 +747,13 @@ export class CodexAppServerBackend implements AgentBackend {
     } catch {
       return '';
     }
+  }
+
+  private isActiveTurnNotSteerable(error: unknown): boolean {
+    const detail = typeof (error as any)?.message === 'string'
+      ? (error as any).message
+      : compactCodexError(error);
+    return /active[\s_-]*turn[\s_-]*not[\s_-]*steerable/i.test(detail);
   }
 
   private stderrSnippet(prefix = ''): string {

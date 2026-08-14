@@ -71,6 +71,9 @@ assert.match(delegation, /deploy-tail 只允许三种情况/);
 assert.match(replayHeader, /权威存档/);
 assert.match(replayHeader, /全部是历史记录/);
 assert.match(nsfw, /亲密场景强制/);
+assert.match(nsfw, /关键动作单元/);
+assert.match(nsfw, /动作闭环/);
+assert.match(nsfw, /禁同义复述|循环注水/);
 
 console.log(JSON.stringify({
   ok: true,

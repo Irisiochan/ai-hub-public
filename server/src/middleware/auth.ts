@@ -96,6 +96,9 @@ export function sessionAuth(hubToken: string | undefined): RequestHandler | null
 
     // Health and signed release metadata/assets stay public so an old Android
     // shell can fetch the login-capable Web OTA before it has a session.
+    // /api/worker 与 /api/hub-mcp 不是无认证：worker 走 worker token，
+    // hub-mcp 走 per-contact HMAC bearer（middleware/hubMcpAuth.ts），
+    // 这里只是把 hub session cookie 这层豁免掉。
     if (
       req.path === '/api/health'
       || isProtocolPath(req.path, '/api/app')

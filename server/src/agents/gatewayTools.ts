@@ -1,4 +1,8 @@
 import type { Db, JobRow } from '../db.js';
+import type { HubLogger } from '../logger.js';
+import { canonicalWorkspacePath } from '../workers/coordinationKeys.js';
+import { coordinationMarkerDispatchKey, parseCoordinationMarker } from '../workers/coordinationReceipt.js';
+import { normalizeRoomCoordinationDispatch } from './roomPrompt.js';
 import { JobStore, workspaceAllowed } from '../workers/jobStore.js';
 
 /**
@@ -30,12 +34,29 @@ export interface DelegationCfg {
   maxOpenJobs?: number;
 }
 
-const OPEN_STATUSES = "('pending','claimed','running','recovering','pause_requested','cancel_requested')";
+type DelegatedRunner = 'claude' | 'codex' | 'grok';
+type RouteClass = 'implement' | 'fix' | 'review' | 'recon' | 'mechanical';
+type RunnerSource = 'policy' | 'override';
 
-/** 调用方没显式传 model/effort 时补上的默认；grok 沿用 Worker 自己的默认。 */
-const RUNNER_DEFAULTS: Partial<Record<'claude' | 'codex' | 'grok', { model: string; effort: string }>> = {
+const ROUTE_CLASS_VALUES: RouteClass[] = ['implement', 'fix', 'review', 'recon', 'mechanical'];
+const RUNNER_VALUES: DelegatedRunner[] = ['claude', 'codex', 'grok'];
+const ROUTE_DEFAULT_RUNNER: Record<RouteClass, 'codex' | 'grok'> = {
+  implement: 'codex',
+  fix: 'codex',
+  review: 'grok',
+  recon: 'grok',
+  mechanical: 'grok',
+};
+const ROUTE_POLICY_TEXT =
+  '默认路由表：implement/fix→codex；review/recon/mechanical→grok；偏离默认必须显式传非空 runner_override_reason。';
+const ROUTE_CLASS_REQUIRED_ERROR =
+  `route_class 必填，且必须是 ${ROUTE_CLASS_VALUES.join(' | ')}。${ROUTE_POLICY_TEXT}`;
+
+/** 调用方没显式传 model/effort 时补上的派单默认。 */
+const RUNNER_DEFAULTS: Partial<Record<DelegatedRunner, { model: string; effort: string }>> = {
   claude: { model: 'claude-opus-5', effort: 'high' },
   codex: { model: 'gpt-5.6-sol', effort: 'high' },
+  grok: { model: 'grok-4.6', effort: 'high' },
 };
 
 /**
@@ -43,7 +64,7 @@ const RUNNER_DEFAULTS: Partial<Record<'claude' | 'codex' | 'grok', { model: stri
  * back to the moving `opus` / `sonnet` aliases.
  */
 export function normalizeDelegatedModel(
-  runner: 'claude' | 'codex' | 'grok',
+  runner: DelegatedRunner,
   value: unknown
 ): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -59,15 +80,134 @@ export function normalizeDelegatedModel(
   return /^[a-zA-Z0-9._-]{1,100}$/.test(raw) ? raw : undefined;
 }
 
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function parseRecord(value: string | null | undefined): Record<string, unknown> {
+  try { return record(value ? JSON.parse(value) : {}); } catch { return {}; }
+}
+
+function briefValue(value: unknown, max = 180): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, Math.max(max - 1, 0))}…` : text;
+}
+
+function boolBrief(value: unknown): string {
+  return typeof value === 'boolean' ? String(value) : 'unknown';
+}
+
 function jobBrief(job: JobRow): string {
-  const opts = JSON.parse(job.options || '{}');
+  const opts = parseRecord(job.options);
+  const permissions = parseRecord(job.permissions);
+  const meta = parseRecord(job.delivery_meta);
+  const declared = record(meta.declared);
+  const git = record(meta.git);
+  const checks = Array.isArray(meta.checks) ? meta.checks.map(record) : [];
   const extra = [opts.model, opts.reasoning].filter(Boolean).join('/');
+  const routeClass = typeof opts.routeClass === 'string' ? opts.routeClass : '未知';
+  const runnerSource = typeof opts.runnerSource === 'string' ? opts.runnerSource : '未知';
+  const overrideReason = typeof opts.runnerOverrideReason === 'string' && opts.runnerOverrideReason
+    ? `\nrunnerOverrideReason：${briefValue(opts.runnerOverrideReason)}` : '';
+  const declaredParts = [
+    `committed=${boolBrief(declared.committed)}`,
+    `pushed=${boolBrief(declared.pushed)}`,
+    `stage=${briefValue(declared.stage) || 'unknown'}`,
+    `nextOwner=${briefValue(declared.nextOwner) || 'unknown'}`,
+  ];
+  const dirtyCount = Array.isArray(git.dirtyFiles)
+    ? git.dirtyFiles.length
+    : git.dirty === true ? 'unknown' : 0;
+  const shortHead = typeof git.head === 'string' ? git.head.trim().slice(0, 8) : '';
+  const gitParts = Object.keys(git).length > 0 ? [
+    `HEAD=${shortHead || 'unknown'}`,
+    `ahead=${typeof git.ahead === 'number' && Number.isFinite(git.ahead) ? git.ahead : 'unknown'}`,
+    `behind=${typeof git.behind === 'number' && Number.isFinite(git.behind) ? git.behind : 'unknown'}`,
+    `branch=${briefValue(git.branch, 80) || 'detached/unknown'}`,
+    `dirty=${dirtyCount}`,
+  ] : ['未上送（旧 runner）'];
+  const failedChecks = checks.filter((item) => item.pass === false);
   return [
     `任务 ${job.id}`,
-    `状态：${job.status}`,
+    `状态：${job.status} / ${job.delivery_state ?? 'unknown'}`,
     `runner：${job.runner}${extra ? `（${extra}）` : ''}，workspace：${job.workspace}`,
+    `routeClass：${routeClass}，runnerSource：${runnerSource}${overrideReason}`,
+    `permissions：write=${boolBrief(permissions.write)}，shell=${boolBrief(permissions.shell)}，ssh=${boolBrief(permissions.ssh)}`,
+    `declared：${declaredParts.join('，')}`,
+    `git：${gitParts.join('，')}`,
+    ...failedChecks.map((item) => (
+      `机检未通过：${briefValue(item.id, 80)} — ${briefValue(item.detail)}`
+    )),
     job.worker_id ? `worker：${job.worker_id}` : 'worker：待认领',
   ].join('\n');
+}
+
+/**
+ * Coordination-marker prompt 的工具层硬闸（不再只靠 prompt 约束）：
+ * 只有会议室里最新一张对应 taskPath 的 room-host 执行派单消息里点名的
+ * executor，才能用该 marker 派单；fingerprint/taskPath 不匹配（伪造/跨 task）、
+ * 已被新版派单取代（过期）、workspace 与派单不符，一律拒绝并留审计。
+ * 派单消息本体由网关生成（roomHost meta 只受服务端控制），是可信 authority
+ * 源；member/verifier 无论 prompt 被注入成什么样都拿不到这条授权。
+ */
+function coordinationDelegateGate(
+  db: Db,
+  contactId: string,
+  prompt: string,
+  workspace: string,
+  logger?: HubLogger
+): { ok: true } | { ok: false; text: string } {
+  const marker = parseCoordinationMarker(prompt);
+  if (!marker) return { ok: true };
+  const reject = (reason: string, detail: Record<string, unknown> = {}): { ok: false; text: string } => {
+    logger?.warn({
+      component: 'coordination-delegate-gate',
+      contactId,
+      taskPath: marker.taskPath,
+      dispatchKey: coordinationMarkerDispatchKey(marker),
+      reason,
+      ...detail,
+    }, 'coordination delegate rejected');
+    return { ok: false, text: `coordination 派单校验失败：${reason}` };
+  };
+  const dispatchKey = coordinationMarkerDispatchKey(marker);
+  const row = db.prepare(
+    `SELECT messages.idempotency_key, messages.meta FROM messages
+     JOIN contacts ON contacts.id = messages.contact_id
+     WHERE messages.sender = 'room-host'
+       AND contacts.kind = 'room'
+       AND json_extract(messages.meta, '$.roomHost.coordination.kind') = 'execution'
+       AND json_extract(messages.meta, '$.roomHost.coordination.taskPath') = ?
+     ORDER BY messages.id DESC LIMIT 1`
+  ).get(marker.taskPath) as { idempotency_key: string | null; meta: string } | undefined;
+  if (!row) {
+    return reject('找不到这张任务的会议室执行派单；不能凭 marker 自派 coordination 任务');
+  }
+  if (row.idempotency_key !== dispatchKey) {
+    return reject('fingerprint 与最新派单不符（伪造或已被新版任务取代）', {
+      latestKey: row.idempotency_key,
+    });
+  }
+  let dispatch;
+  try {
+    dispatch = normalizeRoomCoordinationDispatch(JSON.parse(row.meta)?.roomHost?.coordination);
+  } catch {
+    dispatch = null;
+  }
+  if (dispatch?.kind !== 'execution') {
+    return reject('派单元数据无效或不是执行派单');
+  }
+  if (dispatch.executor !== contactId) {
+    return reject(`这张派单的 executor 是 @${dispatch.executor}，member/verifier 不得代为委派`, {
+      executor: dispatch.executor,
+    });
+  }
+  if (canonicalWorkspacePath(workspace) !== canonicalWorkspacePath(dispatch.workspace)) {
+    return reject('workspace 与派单绑定不符', { boundWorkspace: dispatch.workspace });
+  }
+  return { ok: true };
 }
 
 export function buildDelegateTools(
@@ -76,7 +216,8 @@ export function buildDelegateTools(
   contactId: string,
   cfg: DelegationCfg,
   /** 委派发生的聊天 id（群里是 room id）——任务 thread 挂回这个聊天。 */
-  originChatId: string = contactId
+  originChatId: string = contactId,
+  logger?: HubLogger
 ): GatewayTool[] {
   const workspaces = Array.isArray(cfg.workspaces) ? cfg.workspaces.filter(Boolean) : [];
   const runners = Array.isArray(cfg.runners) && cfg.runners.length ? cfg.runners : ['claude', 'codex', 'grok'];
@@ -95,7 +236,7 @@ export function buildDelegateTools(
       description:
         `把一个编码/文件任务派给 User 本机的 PC Worker 执行（那边有正式 git 仓库和 CLI agent）。` +
         `派单后任务进入持久队列，PC 离线也不会丢；结果回来时网关会自动通知你验收。` +
-        `可用 runner：${runners.join('/')}；可用 workspace：${workspaces.join('、') || '（未配置）'}。` +
+        `${ROUTE_POLICY_TEXT}可用 workspace：${workspaces.join('、') || '（未配置）'}。` +
         `prompt 要自包含：写清楚目标、验收标准、commit/push 与部署要求。` +
         (cfg.allowSsh === true
           ? ' 需要访问 VPS 时显式传 ssh=true，并在 prompt 写清主机、checkout、服务和验收。'
@@ -103,7 +244,16 @@ export function buildDelegateTools(
       schema: {
         type: 'object',
         properties: {
-          runner: { type: 'string', enum: runners, description: '本机执行方' },
+          route_class: {
+            type: 'string',
+            enum: ROUTE_CLASS_VALUES,
+            description: ROUTE_POLICY_TEXT,
+          },
+          runner: { type: 'string', enum: runners, description: '可选；不填时按 route_class 默认路由表推出' },
+          runner_override_reason: {
+            type: 'string',
+            description: '偏离 route_class 默认 runner 时必填的非空理由；会写入 job 元数据',
+          },
           workspace: { type: 'string', description: 'PC 上的项目路径，必须在白名单内' },
           prompt: { type: 'string', description: '自包含的任务描述（目标/约束/验收标准）' },
           write: {
@@ -125,23 +275,51 @@ export function buildDelegateTools(
           model: {
             type: 'string',
             description:
-              '覆盖默认模型（不填时 claude=claude-opus-5、codex=gpt-5.6-sol）。Claude 固定版本必须写清系列和版本，例如 Opus 4.6 或 claude-opus-4-6；用户指定版本时禁止用会漂移的 opus/sonnet 别名代替。Codex 例如 gpt-5.6-sol。',
+              '覆盖默认模型（不填时 claude=claude-opus-5、codex=gpt-5.6-sol、grok=grok-4.6）。Claude 固定版本必须写清系列和版本，例如 Opus 4.6 或 claude-opus-4-6；用户指定版本时禁止用会漂移的 opus/sonnet 别名代替。Codex 例如 gpt-5.6-sol。',
           },
-          effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: '推理强度（claude: effort，codex: reasoning_effort）；不填时 claude/codex 默认 high' },
+          effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: '推理强度（claude: effort，codex/grok: reasoning_effort）；不填时各 runner 默认 high' },
         },
-        required: ['runner', 'workspace', 'prompt'],
+        required: ['route_class', 'workspace', 'prompt'],
       },
       exec: async (input) => {
+        const routeClass = ROUTE_CLASS_VALUES.includes(input.route_class as RouteClass)
+          ? input.route_class as RouteClass : null;
+        if (!routeClass) return { ok: false, text: ROUTE_CLASS_REQUIRED_ERROR };
         if (workspaces.length === 0)
           return { ok: false, text: '你的委派白名单是空的——让 User 在联系人配置 delegation.workspaces 里加上允许的路径。' };
-        const runner = ['claude', 'codex', 'grok'].includes(input.runner as string)
-          ? (input.runner as 'claude' | 'codex' | 'grok')
-          : null;
-        if (!runner || !runners.includes(runner))
-          return { ok: false, text: `runner 必须是 ${runners.join('/')}` };
+        const expectedRunner = ROUTE_DEFAULT_RUNNER[routeClass];
+        const explicitRunner = input.runner === undefined
+          ? undefined
+          : RUNNER_VALUES.includes(input.runner as DelegatedRunner)
+            ? input.runner as DelegatedRunner
+            : null;
+        if (explicitRunner === null)
+          return { ok: false, text: `runner 必须是 ${RUNNER_VALUES.join('/')}` };
+        const overrideProvided = input.runner_override_reason !== undefined;
+        const overrideReason = typeof input.runner_override_reason === 'string'
+          ? input.runner_override_reason.trim() : '';
+        if (overrideProvided && !overrideReason) {
+          return { ok: false, text: 'runner_override_reason 必须是非空字符串。' };
+        }
+        const runner = explicitRunner ?? expectedRunner;
+        if (runner !== expectedRunner && !overrideReason) {
+          return {
+            ok: false,
+            text:
+              `runner 路由违规：route_class=${routeClass} 与 runner=${runner}；` +
+              `正确默认是 ${expectedRunner}。若确需覆盖，显式传非空 runner_override_reason。`,
+          };
+        }
+        if (!runners.includes(runner))
+          return { ok: false, text: `runner=${runner} 未在该联系人的可用配置中（${runners.join('/')}）` };
+        const runnerSource: RunnerSource = overrideReason ? 'override' : 'policy';
         const workspace = typeof input.workspace === 'string' ? input.workspace.trim() : '';
         if (!workspace || !workspaceAllowed(workspace, workspaces))
           return { ok: false, text: `workspace 不在白名单内。可用：${workspaces.join('、')}` };
+        const coordinationGate = coordinationDelegateGate(
+          db, contactId, String(input.prompt ?? ''), workspace, logger
+        );
+        if (!coordinationGate.ok) return coordinationGate;
         const wantWrite = input.write !== false;
         const wantShell = input.shell === true || runner === 'codex';
         if (wantShell && cfg.allowShell !== true)
@@ -149,14 +327,6 @@ export function buildDelegateTools(
         const wantSsh = input.ssh === true;
         if (wantSsh && cfg.allowSsh !== true)
           return { ok: false, text: 'SSH 能力没开（联系人配置 delegation.allowSsh）。不能把远程部署伪装成普通 Shell；请留下 deploy-tail。' };
-        const open = db
-          .prepare(
-            `SELECT COUNT(*) AS c FROM jobs WHERE requested_by = ? AND deleted = 0 AND status IN ${OPEN_STATUSES}`
-          )
-          .get(contactId) as { c: number };
-        if (open.c >= maxOpen)
-          return { ok: false, text: `你已有 ${open.c} 个任务在队列里，先用 worker_job_status 看看它们，别刷屏。` };
-
         // 派单瞬间聊天里的最后一条消息（通常是本轮的 tool_use 气泡）当锚点
         const anchor = db
           .prepare('SELECT MAX(id) AS m FROM messages WHERE contact_id = ? AND deleted = 0')
@@ -181,11 +351,24 @@ export function buildDelegateTools(
           workerId: cfg.workerId || null,
           priority: Number(input.priority) || 0,
           permissions: { write: wantWrite, shell: wantShell, ssh: wantSsh },
-          options: finalModel || finalEffort ? { model: finalModel, reasoning: finalEffort } : undefined,
+          options: {
+            ...(finalModel ? { model: finalModel } : {}),
+            ...(finalEffort ? { reasoning: finalEffort } : {}),
+            routeClass,
+            runnerSource,
+            ...(overrideReason ? { runnerOverrideReason: overrideReason } : {}),
+          },
           originContactId: originChatId,
           originAnchorId: anchor.m ?? null,
+          maxOpenJobs: maxOpen,
         });
         if ('error' in created) return { ok: false, text: created.error };
+        if (created.merged) {
+          return {
+            ok: true,
+            text: `${jobBrief(created.job)}\n已并入在途 job；同一 taskPath 不再新建第二张。`,
+          };
+        }
         return {
           ok: true,
           text:
@@ -196,10 +379,14 @@ export function buildDelegateTools(
     },
     {
       name: 'worker_job_status',
-      description: '查询你派出的 Worker 任务的状态、最近日志和结果。',
+      description: '查询你派出的 Worker 任务状态、最近日志，并用 result_offset/result_limit 分页 recall 完整回执。',
       schema: {
         type: 'object',
-        properties: { job_id: { type: 'string', description: 'delegate_to_worker 返回的任务 id' } },
+        properties: {
+          job_id: { type: 'string', description: 'delegate_to_worker 返回的任务 id' },
+          result_offset: { type: 'integer', minimum: 0, description: '完整回执起始字符 offset；默认 0' },
+          result_limit: { type: 'integer', minimum: 1, maximum: 12000, description: '本页字符数；默认 4000，最大 12000' },
+        },
         required: ['job_id'],
       },
       exec: async (input) => {
@@ -209,7 +396,26 @@ export function buildDelegateTools(
         const tail = (store.messages(job.id, 8) as { sender: string; kind: string; content: string }[])
           .map((m) => `[${m.sender}/${m.kind}] ${m.content.slice(0, 300)}`)
           .join('\n');
-        const outcome = job.result ? `\n结果：\n${job.result.slice(0, 4000)}` : job.error ? `\n错误：${job.error.slice(0, 1000)}` : '';
+        const payload = job.result ?? job.error ?? '';
+        const payloadLabel = job.result ? 'result' : job.error ? 'error' : 'empty';
+        const requestedOffset = Number(input.result_offset);
+        const requestedLimit = Number(input.result_limit);
+        const offset = Number.isFinite(requestedOffset) ? Math.max(Math.floor(requestedOffset), 0) : 0;
+        const limit = Number.isFinite(requestedLimit)
+          ? Math.min(Math.max(Math.floor(requestedLimit), 1), 12_000)
+          : 4_000;
+        const start = Math.min(offset, payload.length);
+        const end = Math.min(start + limit, payload.length);
+        const page = payload.slice(start, end);
+        const outcome = payload
+          ? [
+              `\n完整回执片段（${payloadLabel} ${start}-${end}/${payload.length}）：`,
+              page,
+              end < payload.length
+                ? `下一页：worker_job_status(job_id="${job.id}", result_offset=${end}, result_limit=${limit})`
+                : '已到全文末尾。',
+            ].join('\n')
+          : '\n完整回执：（无输出）';
         return { ok: true, text: `${jobBrief(job)}${outcome}\n最近事件：\n${tail || '（还没有事件）'}` };
       },
     },
@@ -272,6 +478,7 @@ export function delegationGuidance(cfg: DelegationCfg, toolPrefix = ''): string 
     '',
     '# 编码任务外派规范（网关注入）',
     `- 代码修改用 ${p('delegate_to_worker')} 交给 PC Worker；白名单：${(cfg.workspaces ?? []).join('、') || '（未配置）'}。`,
+    `- ${ROUTE_POLICY_TEXT} ${p('delegate_to_worker')} 必须显式传 route_class；runner 可省略并由服务端按表推出。`,
     '- 委派 prompt 写清目标、边界、验证与交付。验证全绿后只暂存本任务文件，commit、push；需要且权限允许时继续部署、重启并做 post-deploy 验收。验证失败不提交推送，回报具体错误；仅 User 当次明确要求时覆盖。',
     remoteDelivery,
     '- Worker 进程结束不等于完成：验证、commit、push 或所需部署缺失且留下本任务改动时必须 blocked，回执写清文件、检查、原因与下一步；网关会自动登记 worker-tail。',

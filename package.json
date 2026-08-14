@@ -6,6 +6,8 @@
     "dev:server": "npm run dev --prefix server",
     "dev:web": "npm run dev --prefix web",
     "build": "npm run build --prefix web && npm run build --prefix server",
+    "notices": "node scripts/generate-third-party-notices.mjs",
+    "notices:check": "node scripts/generate-third-party-notices.mjs --check",
     "start": "npm run start --prefix server"
   }
 }

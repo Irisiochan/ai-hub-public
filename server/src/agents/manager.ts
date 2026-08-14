@@ -4,10 +4,13 @@ import { maybeCapture } from '../memory/capture.js';
 import { maybeWriteBackTask } from '../memory/taskWriteback.js';
 import { contactConfig, openContact } from './configSchemas.js';
 import { Debouncer } from './debouncer.js';
+import {
+  coordinationAuthorityHolderIds,
+  type RoomCoordinationDispatch,
+} from './roomPrompt.js';
 import { AgentRuntime, type AgentDeps, type RoomTurnOutcome } from './runtime.js';
 import { SessionRepo } from './sessionRepo.js';
 import { parseRoomTargets } from './roomTargets.js';
-import { dispatchCoordinationRoomHost } from './coordinationRoom.js';
 
 export { AgentRuntime } from './runtime.js';
 export type { RoomTurnOutcome } from './runtime.js';
@@ -27,6 +30,14 @@ export interface RoomDispatchOptions {
   capture?: boolean;
   reactionRounds?: number;
   userMessageId?: number;
+  /**
+   * Coordination-domain host rounds only: reaction participants are filtered to
+   * coordination_authority holders; non-holders are counted as passed with no
+   * model wake. Leave unset for idea/social rooms so reactions stay unchanged.
+   */
+  coordinationDomain?: boolean;
+  /** Optional structured dispatch; widens authority beyond orchestrator alone. */
+  coordination?: RoomCoordinationDispatch;
 }
 
 export interface TrackedRoomDispatch {
@@ -41,12 +52,6 @@ export class AgentManager {
   private readonly invalidations: Debouncer<string, InvalidationPayload>;
 
   constructor(private deps: AgentDeps) {
-    this.deps.dispatchCoordinationRoomHost = (input) => dispatchCoordinationRoomHost({
-      db: this.deps.db,
-      sse: this.deps.sse,
-      manager: this,
-      logger: this.deps.logger,
-    }, input);
     this.sessions = new SessionRepo(deps.db);
     this.invalidations = new Debouncer(
       300,
@@ -167,7 +172,11 @@ export class AgentManager {
     // 同一个群的轮次串行：用户连发消息时排队，不交叉
     const prev = this.roomChains.get(room.id) ?? Promise.resolve();
     const completion = prev.then(() =>
-      this.runRoomRound(room, targets, options.reactionRounds)
+      this.runRoomRound(room, targets, {
+        reactionRounds: options.reactionRounds,
+        coordinationDomain: options.coordinationDomain,
+        coordination: options.coordination,
+      })
     );
     this.roomChains.set(
       room.id,
@@ -208,8 +217,9 @@ export class AgentManager {
   private async runRoomRound(
     room: ContactRow,
     targets: ContactRow[],
-    reactionRounds?: number
+    options: Pick<RoomDispatchOptions, 'reactionRounds' | 'coordinationDomain' | 'coordination'> = {}
   ): Promise<RoomRoundStats> {
+    const { reactionRounds, coordinationDomain, coordination } = options;
     const normal = await Promise.all(
       this.shuffle(targets).map((member) => this.getRoomMember(room, member).runRoomTurn('normal'))
     );
@@ -229,11 +239,22 @@ export class AgentManager {
       3
     );
     const everyone = this.roomMembers(room);
+    // Anti-regression gate for coordination host rounds: policy already forces
+    // role=member → [PASS], so do not spend a model wake computing that. Idea /
+    // social rooms leave coordinationDomain unset and keep full reactions.
+    const authorityIds = coordinationDomain
+      ? new Set(coordinationAuthorityHolderIds(coordination))
+      : null;
 
     for (let round = 0; round < maxReactionRounds; round++) {
       let anySpoke = false;
       const outcomes: RoomTurnOutcome[] = [];
       for (const member of this.shuffle(everyone)) {
+        if (authorityIds && !authorityIds.has(member.id)) {
+          // Zero-token short-circuit: same outcome bucket as model-side [PASS].
+          outcomes.push('passed');
+          continue;
+        }
         const outcome = await this.getRoomMember(room, member).runRoomTurn('reaction');
         outcomes.push(outcome);
         if (outcome === 'spoke') anySpoke = true;

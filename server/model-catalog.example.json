@@ -17,6 +17,6 @@
     ]
   },
 
-  "_shorthand": "只想加模型、强度沿用内置时，可以直接写成数组：",
-  "grok-cli": ["grok-code-fast-1"]
+  "_shorthand": "只想给旧版 Grok CLI 配兜底模型，可以直接写成数组；新版优先运行 grok models 动态发现：",
+  "grok-cli": ["grok-4.6", "grok-4.5"]
 }

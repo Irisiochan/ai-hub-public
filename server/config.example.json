@@ -11,7 +11,11 @@
   },
   "codex": {
     "cliPath": "codex",
-    "turnTimeoutMs": 300000
+    "turnTimeoutMs": 300000,
+    "nativeCompact": {
+      "enabled": true,
+      "inputTokens": 200000
+    }
   },
   "memory": {
     "mcpUrl": null,

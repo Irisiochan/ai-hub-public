@@ -53,7 +53,10 @@ const codexQuotaPoller = new CodexQuotaPoller(
   { cliPath: config.codex.cliPath, cwd: config.agentsDir },
   logMessage(logger, 'quota.codex')
 );
-const grokQuotaPoller = new GrokQuotaPoller(logMessage(logger, 'quota.grok'));
+const grokQuotaPoller = new GrokQuotaPoller(
+  logMessage(logger, 'quota.grok'),
+  (message, fields) => logger.warn({ component: 'quota.grok', ...fields }, message),
+);
 
 const app = createServer({
   config,
@@ -80,6 +83,10 @@ codexQuotaPoller.start();
 grokQuotaPoller.start();
 deployReceipts.start();
 jobStore.startOutOfBandResolver();
+const outboxBackfilled = jobStore.startOutboxProcessor();
+if (outboxBackfilled > 0) {
+  logger.info({ component: 'jobs', backfilled: outboxBackfilled }, 'job outbox backfilled terminal jobs missing receipts');
+}
 
 const server = app.listen(config.port, config.host, () => {
   wechatChannel.start();
@@ -108,6 +115,7 @@ async function shutdown(signal: string): Promise<void> {
   grokQuotaPoller.stop();
   deployReceipts.stop();
   jobStore.stopOutOfBandResolver();
+  jobStore.stopOutboxProcessor();
   await vault?.close();
   db.close();
   process.exit(0);

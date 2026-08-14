@@ -114,7 +114,7 @@ assert.match(roomDispatches[0].text, /@claude 工作对接回执/);
 assert.match(roomDispatches[0].text, /tasks\/demo\.md/);
 assert.match(roomDispatches[0].text, /branch=coordination-demo/);
 assert.match(roomDispatches[0].text, /101\/101 PASS/);
-assert.match(roomDispatches[0].text, /worker-tail：无/);
+assert.match(roomDispatches[0].text, /Recall 全文：调用 worker_job_status/);
 
 const message = db.prepare(
   "SELECT * FROM messages WHERE contact_id = 'room' AND sender = 'room-host' ORDER BY id DESC LIMIT 1"
@@ -123,6 +123,12 @@ assert.ok(message);
 assert.equal(message.origin, 'main');
 assert.equal(JSON.parse(message.meta).roomHost.coordination.jobId, created.job.id);
 assert.equal(JSON.parse(message.meta).roomHost.coordination.originAnchorId, 42);
+assert.deepEqual(JSON.parse(message.meta).roomHost.receipt, {
+  jobId: created.job.id,
+  requestedBy: 'codex',
+  status: 'done',
+  deliveryState: 'delivered',
+});
 assert.equal(created.job.origin_contact_id, 'codex', 'job origin is a DM, not the dispatch room');
 
 const second = store.complete(running, 'done', 'duplicate', null, 'delivered', '{}');
@@ -177,7 +183,11 @@ assert.equal(roomDispatches.length, 2, 'blocked terminal job must also post a ro
 assert.equal(roomDispatches[1].room.id, 'room');
 assert.match(roomDispatches[1].text, /tasks\/blocked-demo\.md/);
 assert.match(roomDispatches[1].text, /blocked \/ blocked_unpushed/);
-assert.match(roomDispatches[1].text, /worker-tail：有/);
+assert.match(roomDispatches[1].text, /read_file\("tasks\/worker-tail-/);
+const blockedMessage = db.prepare(
+  "SELECT * FROM messages WHERE contact_id = 'room' AND sender = 'room-host' ORDER BY id DESC LIMIT 1"
+).get() as any;
+const broadcastsBeforeResolution = broadcasts.length;
 
 const resolved = store.resolveBlockedOutOfBand(
   store.get(blockedCreated.job.id)!,
@@ -186,10 +196,22 @@ const resolved = store.resolveBlockedOutOfBand(
 );
 assert.equal('job' in resolved && resolved.job.status, 'done');
 await new Promise<void>((resolve) => setImmediate(resolve));
-assert.equal(roomDispatches.length, 3, 'out-of-band completion must reuse the room receipt chain');
-assert.match(roomDispatches[2].text, /tasks\/blocked-demo\.md/);
-assert.match(roomDispatches[2].text, /done \/ delivered_out_of_band/);
-assert.match(roomDispatches[2].text, /worker-tail：无/);
+assert.equal(roomDispatches.length, 2, 'one job lifecycle must keep one full room receipt');
+const updatedBlockedMessage = db.prepare('SELECT * FROM messages WHERE id = ?').get(blockedMessage.id) as any;
+const updatedBlockedMeta = JSON.parse(updatedBlockedMessage.meta);
+assert.equal(updatedBlockedMessage.id, blockedMessage.id);
+assert.match(updatedBlockedMessage.content, /状态更新 \d{2}:\d{2}：场外接力成果已经进入主分支，等待部署与线上验收。/);
+assert.deepEqual(updatedBlockedMeta.roomHost.receipt.stateUpdates, [{
+  at: updatedBlockedMeta.roomHost.receipt.stateUpdates[0].at,
+  status: 'done',
+  deliveryState: 'delivered_out_of_band',
+  summary: '场外接力成果已经进入主分支，等待部署与线上验收。',
+}]);
+assert.match(updatedBlockedMeta.roomHost.receipt.stateUpdates[0].at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+assert.ok(
+  broadcasts.slice(broadcastsBeforeResolution).some((value: any) => value?.id === blockedMessage.id),
+  'state update must rebroadcast the original receipt message id',
+);
 
 const ordinaryCreated = store.create({
   requestedBy: 'codex',
@@ -207,41 +229,30 @@ store.complete(ordinaryRunning, 'done', 'ordinary PASS', null, 'delivered', JSON
   branch: 'ordinary', head: 'feedface1234', ahead: 0, dirtyFiles: [],
 }));
 await new Promise<void>((resolve) => setImmediate(resolve));
-assert.equal(roomDispatches.length, 4, 'ordinary terminal jobs should post to the coordination room');
-assert.deepEqual(roomDispatches[3].options.targetOverride.map((item: ContactRow) => item.id), ['codex']);
-assert.equal(roomDispatches[3].options.capture, false);
-assert.equal(roomDispatches[3].options.reactionRounds, 0);
+assert.equal(roomDispatches.length, 3, 'ordinary terminal jobs should post to the coordination room');
+assert.deepEqual(roomDispatches[2].options.targetOverride.map((item: ContactRow) => item.id), ['codex']);
+assert.equal(roomDispatches[2].options.capture, false);
+assert.equal(roomDispatches[2].options.reactionRounds, 0);
+assert.match(roomDispatches[2].text, /⚙ Worker 任务回执/);
+assert.match(
+  roomDispatches[2].text,
+  /请按 preview 验收；需要逐项证据时先 recall 完整回执。/,
+);
+assert.doesNotMatch(roomDispatches[2].text, /网关自动通知|User 也看得到这条|请直接给出验收结论/);
 const ordinaryMessage = db.prepare(
   "SELECT * FROM messages WHERE contact_id = 'room' AND sender = 'room-host' ORDER BY id DESC LIMIT 1"
 ).get() as any;
 assert.deepEqual(JSON.parse(ordinaryMessage.meta).roomHost.receipt, {
   jobId: ordinaryCreated.job.id,
   requestedBy: 'codex',
+  status: 'done',
+  deliveryState: 'delivered',
 });
 
-const notification = dispatchCoordinationRoomHost({ db, sse, manager, logger }, {
-  targetId: 'claude',
-  content: '@claude 后台任务通知\n需要处理 delivery block。',
-  kind: 'background-notification',
-  duplicateKey: 'triage:delivery-block',
-  duplicateMinutes: 30,
-  meta: { notification: { kind: 'delivery_block', key: 'triage:delivery-block' } },
-});
-assert.equal(notification.status, 'posted');
-const notificationDuplicate = dispatchCoordinationRoomHost({ db, sse, manager, logger }, {
-  targetId: 'claude',
-  content: '@claude 后台任务通知\n需要处理 delivery block。',
-  kind: 'background-notification',
-  duplicateKey: 'triage:delivery-block',
-  duplicateMinutes: 30,
-  meta: { notification: { kind: 'delivery_block', key: 'triage:delivery-block' } },
-});
-assert.equal(notificationDuplicate.status, 'duplicate');
 await new Promise<void>((resolve) => setImmediate(resolve));
 assert.deepEqual(coordinationRoomHealth(db), {
-  total: 5,
-  receipts: 4,
-  backgroundNotifications: 1,
+  total: 3,
+  receipts: 3,
 });
 
 db.prepare("UPDATE contacts SET config = ? WHERE id = 'room'")
@@ -259,14 +270,17 @@ if ('error' in fallbackCreated) throw new Error(fallbackCreated.error);
 db.prepare("UPDATE jobs SET status = 'running' WHERE id = ?").run(fallbackCreated.job.id);
 store.complete(store.get(fallbackCreated.job.id) as JobRow, 'done', 'fallback PASS', null, 'delivered', '{}');
 await new Promise<void>((resolve) => setImmediate(resolve));
-assert.equal(roomDispatches.length, 5, 'disabled room must not add another room dispatch');
+assert.equal(roomDispatches.length, 3, 'disabled room must not add another room dispatch');
 assert.equal(fallbackEnqueues.length, 1);
 assert.equal(fallbackEnqueues[0].contactId, 'codex');
 const fallbackMessage = db.prepare(
-  "SELECT * FROM messages WHERE contact_id = 'codex' AND origin = 'side' ORDER BY id DESC LIMIT 1"
+  "SELECT * FROM messages WHERE contact_id = 'codex' AND origin = 'main' ORDER BY id DESC LIMIT 1"
 ).get() as any;
 assert.equal(JSON.parse(fallbackMessage.meta).event, 'worker-receipt');
+assert.match(fallbackMessage.content, /^【降级投递：会议室不可用】/);
+assert.match(fallbackMessage.content, /⚙ Worker 任务回执/);
+assert.doesNotMatch(fallbackMessage.content, /网关自动通知|User 也看得到这条|请直接给出验收结论/);
 
 db.close();
 fs.rmSync(dir, { recursive: true, force: true });
-console.log('[PASS] worker receipts and background notifications route to the coordination room with safe DM fallback');
+console.log('[PASS] worker receipts route to the coordination room with visible DM main fallback');

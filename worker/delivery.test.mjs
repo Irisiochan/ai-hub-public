@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import {
   classifyDelivery,
@@ -6,6 +10,8 @@ import {
   DEFAULT_RECONCILE_GRACE_MS,
   extractDeliveryDeclaration,
   reconciliationDecision,
+  repoDeliveryEvidence,
+  snapshotRepo,
 } from './delivery.mjs';
 
 const clean = (head = 'a', ahead = 0) => ({
@@ -91,6 +97,59 @@ test('a successful CLI delivery declaration takes priority over git dirt', () =>
   });
   assert.equal(delivery.state, 'delivered');
   assert.equal(delivery.source, 'cli');
+  assert.deepEqual(repoDeliveryEvidence(before, after), {
+    git: {
+      head: after.head,
+      dirty: true,
+      dirtyFiles: ['session.json'],
+      ahead: after.ahead,
+      behind: null,
+      branch: null,
+    },
+    before: { head: before.head, dirty: false, ahead: before.ahead },
+  });
+});
+
+test('snapshotRepo records branch and behind while preserving null without an upstream', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-delivery-snapshot-'));
+  const remote = path.join(root, 'remote.git');
+  const first = path.join(root, 'first');
+  const second = path.join(root, 'second');
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+  try {
+    fs.mkdirSync(first);
+    git(root, 'init', '--bare', remote);
+    git(first, 'init', '--initial-branch=main');
+    git(first, 'config', 'user.email', 'worker-test@example.invalid');
+    git(first, 'config', 'user.name', 'Worker Test');
+    fs.writeFileSync(path.join(first, 'tracked.txt'), 'one\n');
+    git(first, 'add', 'tracked.txt');
+    git(first, 'commit', '-m', 'first');
+
+    const withoutUpstream = await snapshotRepo(first);
+    assert.equal(withoutUpstream.branch, 'main');
+    assert.equal(withoutUpstream.ahead, null);
+    assert.equal(withoutUpstream.behind, null);
+
+    git(first, 'remote', 'add', 'origin', remote);
+    git(first, 'push', '-u', 'origin', 'main');
+    git(remote, 'symbolic-ref', 'HEAD', 'refs/heads/main');
+    git(root, 'clone', remote, second);
+    git(second, 'config', 'user.email', 'worker-test@example.invalid');
+    git(second, 'config', 'user.name', 'Worker Test');
+    fs.writeFileSync(path.join(second, 'tracked.txt'), 'two\n');
+    git(second, 'add', 'tracked.txt');
+    git(second, 'commit', '-m', 'second');
+    git(second, 'push');
+    git(first, 'fetch', 'origin');
+
+    const behind = await snapshotRepo(first);
+    assert.equal(behind.branch, 'main');
+    assert.equal(behind.ahead, 0);
+    assert.equal(behind.behind, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('an unpushed CLI delivery declaration stays blocked', () => {

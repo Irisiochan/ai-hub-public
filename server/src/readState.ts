@@ -1,7 +1,7 @@
-import type { Db, MessageOrigin } from './db.js';
+import type { Db } from './db.js';
 
 export interface MessageReadState {
-  origin: MessageOrigin;
+  origin: 'main';
   lastReadMessageId: number;
   firstUnreadId: number | null;
   unreadCount: number;
@@ -16,24 +16,23 @@ const ELIGIBLE_MESSAGE_SQL = `
 
 export function getMessageReadState(
   db: Db,
-  contactId: string,
-  origin: MessageOrigin
+  contactId: string
 ): MessageReadState {
   const cursor = db.prepare(
     `SELECT last_read_message_id AS lastReadMessageId
      FROM message_read_cursors WHERE contact_id = ? AND origin = ?`
-  ).get(contactId, origin) as { lastReadMessageId: number } | undefined;
+  ).get(contactId, 'main') as { lastReadMessageId: number } | undefined;
   const lastReadMessageId = cursor?.lastReadMessageId ?? 0;
   const row = db.prepare(
     `SELECT MIN(id) AS firstUnreadId, COUNT(*) AS unreadCount
      FROM messages
      WHERE contact_id = ? AND origin = ? AND id > ? AND ${ELIGIBLE_MESSAGE_SQL}`
-  ).get(contactId, origin, lastReadMessageId) as {
+  ).get(contactId, 'main', lastReadMessageId) as {
     firstUnreadId: number | null;
     unreadCount: number;
   };
   return {
-    origin,
+    origin: 'main',
     lastReadMessageId,
     firstUnreadId: row.firstUnreadId ?? null,
     unreadCount: Number(row.unreadCount),
@@ -43,14 +42,13 @@ export function getMessageReadState(
 export function markMessagesRead(
   db: Db,
   contactId: string,
-  origin: MessageOrigin,
   throughMessageId: number
 ): MessageReadState {
   const target = db.prepare(
     `SELECT id FROM messages
      WHERE id = ? AND contact_id = ? AND origin = ? AND deleted = 0
        AND COALESCE(json_extract(meta, '$.uiHidden'), 0) != 1`
-  ).get(throughMessageId, contactId, origin) as { id: number } | undefined;
+  ).get(throughMessageId, contactId, 'main') as { id: number } | undefined;
   if (!target) throw new Error('message not found in channel');
 
   db.prepare(
@@ -62,13 +60,12 @@ export function markMessagesRead(
          WHEN excluded.last_read_message_id > last_read_message_id THEN datetime('now')
          ELSE updated_at
        END`
-  ).run(contactId, origin, throughMessageId);
-  return getMessageReadState(db, contactId, origin);
+  ).run(contactId, 'main', throughMessageId);
+  return getMessageReadState(db, contactId);
 }
 
 export function readStatesForContact(db: Db, contactId: string) {
   return {
-    main: getMessageReadState(db, contactId, 'main'),
-    side: getMessageReadState(db, contactId, 'side'),
+    main: getMessageReadState(db, contactId),
   };
 }

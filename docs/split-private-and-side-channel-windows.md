@@ -496,3 +496,19 @@ triage 派单原文最多 16000 字（`triage-worker.mjs:106`），worker 回执
 `GET /api/contacts/:id/messages` 默认只返回 `main`，可传 `origin=side` 或 `origin=all`。
 历史数据不会自动迁移或启发式重分类，migration 只把既有行保守保留在 `main`。同一底层
 会话的上下文不拆；已经完成的 `side` 行在后续 prompt / 滚动摘要中会压成一行后台摘要。
+
+## 2026-08-08 起 side 退役为审计层
+
+副窗不再是用户可见功能：web 已移除 main/side 切换、side 未读、引原文入口和 legacy side
+回执操作卡。`origin` 数据列、既有 side 行、`origin=side` / `origin=all` 查询兼容与
+`agents/sideChannel.ts` 的历史折叠仍保留；side 现在只表示归档审计层，不再维护独立 UI
+或未读游标。
+
+普通 task/system triage 改由 coordination room 的 `room-host` 发 nudge，并计入共享
+coordination 池；被点名成员在群轮次中选择 `[PASS]`、登记观察或 `delegate_to_worker`。
+`[PASS]` 原生静默。目标联系人不是群成员或会议室不可用时，才带「降级投递」前缀回退到
+可见 DM main。Worker 回执在会议室不可用时同样回退到带前缀的 main，不再写 side。
+
+model/effort 切换通知和 legacy background turn 结论仍可写 side 供审计与模型历史折叠；
+`[AI_HUB_NOTIFY]` marker、side/main 路由和通知去重协议已退役。daily 的 hidden main 触发与
+自然回复路径保持不变，房间可信 coordination meta 规则也不放松。

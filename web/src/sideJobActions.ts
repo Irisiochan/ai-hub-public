@@ -1,5 +1,10 @@
 import type { Message, WorkerJob } from './api';
 
+export interface PendingReceiptCard {
+  message: Message;
+  job: WorkerJob;
+}
+
 export function workerReceiptJobId(message: Pick<Message, 'meta' | 'origin' | 'kind'>): string | null {
   if (message.kind !== 'text') return null;
   try {
@@ -11,14 +16,99 @@ export function workerReceiptJobId(message: Pick<Message, 'meta' | 'origin' | 'k
         receipt?: { jobId?: unknown };
       };
     };
-    if (message.origin === 'side' && meta.event === 'worker-receipt') {
-      return typeof meta.jobId === 'string' && meta.jobId.trim() ? meta.jobId.trim() : null;
-    }
     const roomJobId = meta.roomHost?.receipt?.jobId ?? meta.roomHost?.coordination?.jobId;
     return typeof roomJobId === 'string' && roomJobId.trim() ? roomJobId.trim() : null;
   } catch {
     return null;
   }
+}
+
+export function visibleJobsForContact(
+  contactId: string,
+  messages: readonly Pick<Message, 'meta' | 'origin' | 'kind'>[],
+  jobs: readonly WorkerJob[],
+  activeStatuses: ReadonlySet<string>,
+): WorkerJob[] {
+  const receiptJobIds = new Set<string>();
+  for (const message of messages) {
+    const jobId = workerReceiptJobId(message);
+    if (jobId) receiptJobIds.add(jobId);
+  }
+  return jobs.filter(
+    (job) =>
+      receiptJobIds.has(job.id) ||
+      job.origin_contact_id === contactId ||
+      (!job.origin_contact_id && job.requested_by === contactId && activeStatuses.has(job.status))
+  );
+}
+
+export function receiptDeliveryState(
+  job: Pick<WorkerJob, 'delivery_summary' | 'delivery_meta'>,
+): string {
+  const declared = job.delivery_meta?.declared?.stage;
+  const summary = job.delivery_summary?.state;
+  const raw = typeof summary === 'string' && summary.trim()
+    ? summary
+    : typeof declared === 'string' ? declared : '';
+  return raw.toLowerCase().replace(/-/g, '_');
+}
+
+/** Pin bar only lists receipts that still need a human action. */
+export function isActionableReceiptJob(
+  job: Pick<WorkerJob, 'delivery_summary' | 'delivery_meta'>,
+): boolean {
+  return receiptDeliveryState(job) !== 'closed_loop';
+}
+
+export const HANDLED_RECEIPTS_STORAGE_PREFIX = 'ai-hub:handled-receipts:';
+
+export function loadHandledReceiptIds(contactId: string, storage: Pick<Storage, 'getItem'> | null = defaultStorage()): Set<number> {
+  if (!storage || !contactId) return new Set();
+  try {
+    const raw = storage.getItem(`${HANDLED_RECEIPTS_STORAGE_PREFIX}${contactId}`);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((value): value is number => Number.isSafeInteger(value)));
+  } catch {
+    return new Set();
+  }
+}
+
+export function saveHandledReceiptIds(
+  contactId: string,
+  ids: ReadonlySet<number>,
+  storage: Pick<Storage, 'setItem'> | null = defaultStorage(),
+): void {
+  if (!storage || !contactId) return;
+  storage.setItem(
+    `${HANDLED_RECEIPTS_STORAGE_PREFIX}${contactId}`,
+    JSON.stringify([...ids].sort((a, b) => a - b)),
+  );
+}
+
+function defaultStorage(): Storage | null {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
+
+export function pendingReceiptCards(
+  messages: readonly Message[],
+  jobs: readonly WorkerJob[],
+  handledMessageIds: ReadonlySet<number> = new Set(),
+): PendingReceiptCard[] {
+  const jobsById = new Map(jobs.map((job) => [job.id, job]));
+  const pending: PendingReceiptCard[] = [];
+  for (const message of messages) {
+    if (handledMessageIds.has(message.id)) continue;
+    const jobId = workerReceiptJobId(message);
+    const job = jobId ? jobsById.get(jobId) : undefined;
+    if (job && isActionableReceiptJob(job)) pending.push({ message, job });
+  }
+  return pending;
 }
 
 export function reworkIdempotencyKey(jobId: string, receiptMessageId: number): string {

@@ -2,7 +2,11 @@ import express, { type Express } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { type AgentManager } from './agents/manager.js';
-import { coordinationRoomHealth, dispatchCoordinationRoomHost } from './agents/coordinationRoom.js';
+import {
+  coordinationRoomHealth,
+  dispatchCoordinationRoomHost,
+  updateCoordinationRoomReceipt,
+} from './agents/coordinationRoom.js';
 import { AffectRepo } from './agents/affect.js';
 import { type DbBackup } from './backup.js';
 import { type HubConfig } from './config.js';
@@ -28,7 +32,8 @@ import { workersRouter } from './routes/workers.js';
 import { type SseHub } from './sse.js';
 import { type JobStore } from './workers/jobStore.js';
 import { deriveDeliverySummary } from './workers/deliveryStatus.js';
-import { formatCoordinationReceipt, parseCoordinationMarker } from './workers/coordinationReceipt.js';
+import { coordinationMarkerDispatchKey, formatCoordinationReceipt, parseCoordinationMarker } from './workers/coordinationReceipt.js';
+import { formatWorkerReceiptPreview } from './workers/receiptPreview.js';
 import type { WechatChannel } from './wechat/channel.js';
 
 export interface ServerDependencies {
@@ -91,31 +96,24 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
     }
   };
 
-  const workerReceiptText = (job: JobRow): string => {
-    const body = job.result || job.error || '（无输出）';
-    const delivery = deriveDeliverySummary(job);
-    return [
-      '⚙ Worker 任务回执（网关自动通知，User 也看得到这条）',
-      `任务 ${job.id}：${delivery.summary}`,
-      `下一步负责人：${delivery.nextOwner}`,
-      `执行环境：${job.runner} · ${job.workspace}`,
-      '', 'Worker 原始回执（验收依据）：', body.slice(0, 6000), '',
-      '请直接给出验收结论并同步需求账本：以本回执和 worker_job_status 为依据，禁止调用终端/git fetch/VPS 复核。只有本任务要求的验证、commit、push、部署与 post-deploy 验收均完成，或剩余部署已因无 SSH 权限、自断回执风险、等待 exact-target 授权而登记合法 deploy-tail，才 update_task 关闭原 backlog；否则保持 backlog open，并确认自动登记的 worker-tail 写清 workspace、文件、检查、阻塞与下一步。不要条件反射地从头派新任务。',
-    ].filter(Boolean).join('\n');
-  };
-
-  const dispatchCoordinationReceipt = (job: JobRow): boolean => {
+  const dispatchCoordinationReceipt = (job: JobRow): 'sent' | 'unavailable' | 'not-coordination' => {
     const marker = parseCoordinationMarker(job.prompt);
-    if (!marker) return false;
-    const dispatchKey = `coordination:${marker.taskPath}:${marker.planHash}`;
+    if (!marker) return 'not-coordination';
+    const dispatchKey = coordinationMarkerDispatchKey(marker);
     const text = formatCoordinationReceipt(job, marker);
     const outcome = dispatchCoordinationRoomHost({ db, sse, manager, logger }, {
       targetId: 'claude',
       content: text,
       kind: 'receipt',
       exactDispatchKey: dispatchKey,
-      idempotencyKey: `receipt:v1:${job.id}:${job.status}:${job.delivery_state ?? 'unknown'}`,
+      idempotencyKey: `receipt:v1:${job.id}`,
       meta: {
+        receipt: {
+          jobId: job.id,
+          requestedBy: job.requested_by,
+          status: job.status,
+          deliveryState: job.delivery_state ?? 'unknown',
+        },
         coordination: {
           jobId: job.id,
           taskPath: marker.taskPath,
@@ -125,43 +123,97 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
       },
     });
     if (outcome.status === 'unavailable') {
-      logger.warn({ component: 'jobs', jobId: job.id, reason: outcome.reason }, 'coordination receipt fell back to DM');
+      logger.warn({ component: 'jobs', jobId: job.id, reason: outcome.reason }, 'coordination receipt room unavailable');
+      return 'unavailable';
     }
-    return outcome.status !== 'unavailable';
+    return 'sent';
   };
 
-  jobStore.onFinished = (job) => {
-    try {
-      void ensureWorkerTail(job).catch((error) => logger.error({ component: 'jobs', jobId: job.id, err: error }, 'worker tail registration failed'));
-      if (dispatchCoordinationReceipt(job)) return;
-      if (!job.requested_by || job.requested_by === 'User') return;
-      const roomText = `@${job.requested_by} ${workerReceiptText(job)}`;
-      const roomOutcome = dispatchCoordinationRoomHost({ db, sse, manager, logger }, {
-        targetId: job.requested_by,
-        content: roomText,
-        kind: 'receipt',
-        idempotencyKey: `receipt:v1:${job.id}:${job.status}:${job.delivery_state ?? 'unknown'}`,
-        meta: { receipt: { jobId: job.id, requestedBy: job.requested_by } },
-      });
-      if (roomOutcome.status !== 'unavailable') return;
-      logger.warn({
-        component: 'jobs',
-        jobId: job.id,
-        requestedBy: job.requested_by,
-        reason: roomOutcome.reason,
-      }, 'worker receipt fell back to DM side channel');
-      const contact = db.prepare("SELECT * FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'dm'").get(job.requested_by) as ContactRow | undefined;
-      if (!contact) return;
-      const text = workerReceiptText(job);
-      const result = db.prepare(`INSERT INTO messages (contact_id, sender, role, kind, content, status, meta, origin) VALUES (?, 'system', 'user', 'text', ?, 'done', ?, 'side')`).run(contact.id, text, JSON.stringify({ event: 'worker-receipt', jobId: job.id }));
-      const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(result.lastInsertRowid)) as MessageRow;
-      sse.broadcast('message', row);
-      if (manager.get(contact).enqueue({ userMessageId: row.id, text }) === 'full') {
-        logger.warn({ component: 'jobs', contactId: contact.id, jobId: job.id }, 'receipt persisted but continuation queue is full');
-      }
-    } catch (error) {
-      logger.error({ component: 'jobs', err: error }, 'worker completion continuation failed');
+  /** 末次尝试的可见降级：DM 落一条回执。以 meta.jobId 幂等，重启后重放不重复气泡。 */
+  const dispatchDegradedDmReceipt = (job: JobRow): void => {
+    const contact = db.prepare("SELECT * FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'dm'").get(job.requested_by) as ContactRow | undefined;
+    if (!contact) {
+      logger.error({ component: 'jobs', jobId: job.id, requestedBy: job.requested_by }, 'worker receipt dead-end: no room and no DM contact');
+      return;
     }
+    const existing = db.prepare(
+      `SELECT id FROM messages
+       WHERE contact_id = ? AND json_extract(meta, '$.event') = 'worker-receipt'
+         AND json_extract(meta, '$.jobId') = ?
+       ORDER BY id DESC LIMIT 1`
+    ).get(contact.id, job.id);
+    if (existing) return;
+    const text = `【降级投递：会议室不可用】\n${formatWorkerReceiptPreview(job)}`;
+    const result = db.prepare(`INSERT INTO messages (contact_id, sender, role, kind, content, status, meta, origin) VALUES (?, 'system', 'user', 'text', ?, 'done', ?, 'main')`).run(contact.id, text, JSON.stringify({
+      event: 'worker-receipt',
+      jobId: job.id,
+      status: job.status,
+      deliveryState: job.delivery_state ?? 'unknown',
+      degradedDelivery: true,
+    }));
+    const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(result.lastInsertRowid)) as MessageRow;
+    sse.broadcast('message', row);
+    if (manager.get(contact).enqueue({ userMessageId: row.id, text }) === 'full') {
+      logger.warn({ component: 'jobs', contactId: contact.id, jobId: job.id }, 'receipt persisted but continuation queue is full');
+    }
+  };
+
+  // Durable outbox 驱动：抛错 = 可重试（指数退避），finalAttempt 时改走可见降级，
+  // 处理器把仍然失败的行转 dead（outboxCounts 可观测）。回执幂等键保证整个
+  // 重试/重启链路上恰好一条用户可见回执。
+  jobStore.onFinished = async (job, ctx) => {
+    if (!ctx.meta.tailDone) {
+      try {
+        await ensureWorkerTail(job);
+        ctx.setMeta({ tailDone: true });
+      } catch (error) {
+        logger.error({ component: 'jobs', jobId: job.id, err: error }, 'worker tail registration failed');
+        // vault 恢复后重试补 tail；末次尝试放行，让回执仍然送达。
+        if (!ctx.finalAttempt) throw error;
+      }
+    }
+    const receiptUpdate = updateCoordinationRoomReceipt({ db, sse }, {
+      idempotencyKey: `receipt:v1:${job.id}`,
+      status: job.status,
+      deliveryState: job.delivery_state ?? 'unknown',
+      summary: deriveDeliverySummary(job).summary,
+    });
+    if (receiptUpdate.status === 'updated') {
+      logger.info({ component: 'jobs', jobId: job.id, messageId: receiptUpdate.messageId }, 'worker receipt state updated');
+      return;
+    }
+    const coordinationOutcome = dispatchCoordinationReceipt(job);
+    if (coordinationOutcome === 'sent') return;
+    if (coordinationOutcome === 'unavailable' && !ctx.finalAttempt) {
+      throw new Error('coordination room unavailable for receipt; will retry');
+    }
+    if (!job.requested_by || job.requested_by === 'User') return;
+    const roomText = `@${job.requested_by} ${formatWorkerReceiptPreview(job)}`;
+    const roomOutcome = dispatchCoordinationRoomHost({ db, sse, manager, logger }, {
+      targetId: job.requested_by,
+      content: roomText,
+      kind: 'receipt',
+      idempotencyKey: `receipt:v1:${job.id}`,
+      meta: {
+        receipt: {
+          jobId: job.id,
+          requestedBy: job.requested_by,
+          status: job.status,
+          deliveryState: job.delivery_state ?? 'unknown',
+        },
+      },
+    });
+    if (roomOutcome.status !== 'unavailable') return;
+    if (!ctx.finalAttempt) {
+      throw new Error(`worker receipt room unavailable (${roomOutcome.reason ?? 'unknown'}); will retry`);
+    }
+    logger.warn({
+      component: 'jobs',
+      jobId: job.id,
+      requestedBy: job.requested_by,
+      reason: roomOutcome.reason,
+    }, 'worker receipt fell back to visible DM main');
+    dispatchDegradedDmReceipt(job);
   };
 }
 
@@ -185,6 +237,7 @@ export function createServer(deps: ServerDependencies): Express {
       status: 'ok',
       messageCount: count.c,
       coordination: coordinationRoomHealth(db),
+      jobOutbox: jobStore.outboxCounts(),
       ...(deps.wechatChannel ? { wechat: deps.wechatChannel.status() } : {}),
     });
   });
@@ -206,7 +259,11 @@ export function createServer(deps: ServerDependencies): Express {
   app.use('/api/user', userRouter(db, sse));
   app.use('/api', journalRouter(db));
   app.use('/api', workersRouter(db, sse, jobStore, deps.logger));
-  app.use('/api', hubMcpRouter(db, jobStore));
+  app.use('/api', hubMcpRouter(db, jobStore, {
+    hubToken: deps.hubToken,
+    envMode: process.env.HUB_MCP_AUTH_MODE,
+    logger: deps.logger,
+  }));
   app.use('/api/vault', vaultTasksRouter(deps.vault));
   app.use('/api', systemRouter(config));
   app.get('/api/system/backup', (_req, res) => res.json(dbBackup.status()));

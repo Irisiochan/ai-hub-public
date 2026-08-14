@@ -1,17 +1,16 @@
 import crypto from 'node:crypto';
 import type { ContactRow, Db, MessageRow } from '../db.js';
 import type { HubLogger } from '../logger.js';
+import { shanghaiStamp } from '../memory/inject.js';
 import type { SseHub } from '../sse.js';
 
-export type CoordinationRoomMessageKind = 'receipt' | 'background-notification';
+export type CoordinationRoomMessageKind = 'receipt';
 
 export interface CoordinationRoomDispatchInput {
   targetId: string;
   content: string;
   kind: CoordinationRoomMessageKind;
   idempotencyKey?: string;
-  duplicateKey?: string;
-  duplicateMinutes?: number;
   exactDispatchKey?: string;
   meta: Record<string, unknown>;
 }
@@ -23,6 +22,21 @@ export interface CoordinationRoomDispatchResult {
   reason?: string;
 }
 
+export interface CoordinationRoomReceiptUpdateInput {
+  idempotencyKey: string;
+  status: string;
+  deliveryState: string;
+  summary: string;
+}
+
+export interface CoordinationRoomReceiptUpdateResult {
+  status: 'updated' | 'missing';
+  roomId?: string;
+  messageId?: number;
+}
+
+const MAX_RECEIPT_STATE_UPDATES = 5;
+
 interface CoordinationRoomManager {
   imageRoomMembers(room: ContactRow): ContactRow[];
   dispatchRoomMessageTracked(
@@ -30,6 +44,66 @@ interface CoordinationRoomManager {
     content: string,
     options: { targetOverride: ContactRow[]; capture: false; reactionRounds: 0 }
   ): { completion: Promise<unknown> };
+}
+
+function record(value: unknown): Record<string, any> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, any>
+    : {};
+}
+
+function messageMeta(raw: string | null | undefined): Record<string, any> {
+  try { return record(raw ? JSON.parse(raw) : {}); } catch { return {}; }
+}
+
+export function updateCoordinationRoomReceipt(
+  deps: { db: Db; sse: SseHub },
+  input: CoordinationRoomReceiptUpdateInput,
+): CoordinationRoomReceiptUpdateResult {
+  const row = deps.db.prepare(
+    `SELECT messages.* FROM messages
+     JOIN contacts ON contacts.id = messages.contact_id
+     WHERE messages.sender = 'room-host'
+       AND messages.idempotency_key = ?
+       AND contacts.kind = 'room'
+     ORDER BY messages.id DESC LIMIT 1`
+  ).get(input.idempotencyKey) as MessageRow | undefined;
+  if (!row) return { status: 'missing' };
+
+  const sqliteNow = (deps.db.prepare("SELECT datetime('now') AS value").get() as { value: string }).value;
+  const at = `${sqliteNow.replace(' ', 'T')}Z`;
+  const displayTime = shanghaiStamp(sqliteNow).match(/(\d{2}:\d{2}) CST$/)?.[1] ?? '00:00';
+  const summary = input.summary.trim().replace(/\s+/g, ' ').slice(0, 500)
+    || `${input.status} / ${input.deliveryState}`;
+  const meta = messageMeta(row.meta);
+  const roomHost = record(meta.roomHost);
+  const receipt = record(roomHost.receipt);
+  const priorUpdates = Array.isArray(receipt.stateUpdates) ? receipt.stateUpdates : [];
+  const stateUpdate = {
+    at,
+    status: input.status,
+    deliveryState: input.deliveryState,
+    summary,
+  };
+  const nextMeta = {
+    ...meta,
+    roomHost: {
+      ...roomHost,
+      receipt: {
+        ...receipt,
+        status: input.status,
+        deliveryState: input.deliveryState,
+        stateUpdates: [...priorUpdates.slice(-(MAX_RECEIPT_STATE_UPDATES - 1)), stateUpdate],
+      },
+    },
+  };
+  const baseContent = row.content.replace(/(?:\r?\n状态更新 \d{2}:\d{2}：[^\r\n]*)+$/u, '');
+  const content = `${baseContent}\n状态更新 ${displayTime}：${summary}`;
+  deps.db.prepare('UPDATE messages SET content = ?, meta = ? WHERE id = ?')
+    .run(content, JSON.stringify(nextMeta), row.id);
+  const updated = deps.db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow;
+  deps.sse.broadcast('message', updated);
+  return { status: 'updated', roomId: row.contact_id, messageId: row.id };
 }
 
 function configuredCoordinationRoom(db: Db, exactDispatchKey = ''): ContactRow | undefined {
@@ -81,17 +155,6 @@ export function dispatchCoordinationRoomHost(
   if (!target) {
     return { status: 'unavailable', roomId: room.id, reason: `${input.targetId} is not a room member` };
   }
-  const duplicateMinutes = Math.max(0, Number(input.duplicateMinutes ?? 0));
-  if (input.duplicateKey && duplicateMinutes > 0) {
-    const duplicate = deps.db.prepare(
-      `SELECT id FROM messages
-       WHERE contact_id = ? AND sender = 'room-host'
-         AND json_extract(meta, '$.roomHost.notification.key') = ?
-         AND created_at >= datetime('now', ?)
-       ORDER BY id DESC LIMIT 1`
-    ).get(room.id, input.duplicateKey, `-${duplicateMinutes} minutes`);
-    if (duplicate) return { status: 'duplicate', roomId: room.id };
-  }
   if (input.idempotencyKey) {
     const duplicate = deps.db.prepare(
       `SELECT id FROM messages
@@ -127,10 +190,13 @@ export function dispatchCoordinationRoomHost(
     reactionRounds: 0,
   });
   void tracked.completion.then((outcome) => {
+    const current = deps.db.prepare('SELECT meta FROM messages WHERE id = ?').get(row.id) as { meta: string } | undefined;
+    const currentMeta = messageMeta(current?.meta ?? row.meta);
+    const currentRoomHost = record(currentMeta.roomHost);
     const doneMeta = {
-      ...meta,
+      ...currentMeta,
       roomHost: {
-        ...meta.roomHost,
+        ...currentRoomHost,
         status: 'done',
         completedAt: new Date().toISOString(),
         outcome,
@@ -140,10 +206,13 @@ export function dispatchCoordinationRoomHost(
     const doneRow = deps.db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow;
     deps.sse.broadcast('message', doneRow);
   }).catch((error: Error) => {
+    const current = deps.db.prepare('SELECT meta FROM messages WHERE id = ?').get(row.id) as { meta: string } | undefined;
+    const currentMeta = messageMeta(current?.meta ?? row.meta);
+    const currentRoomHost = record(currentMeta.roomHost);
     const failedMeta = {
-      ...meta,
+      ...currentMeta,
       roomHost: {
-        ...meta.roomHost,
+        ...currentRoomHost,
         status: 'error',
         completedAt: new Date().toISOString(),
         error: error.message.slice(0, 500),
@@ -161,17 +230,14 @@ export function coordinationRoomHealth(db: Db): Record<string, number> {
     `SELECT
        COUNT(*) AS total,
        COALESCE(SUM(CASE WHEN json_extract(meta, '$.roomHost.coordinationPool.kind') = 'receipt'
-         THEN 1 ELSE 0 END), 0) AS receipt_count,
-       COALESCE(SUM(CASE WHEN json_extract(meta, '$.roomHost.coordinationPool.kind') = 'background-notification'
-         THEN 1 ELSE 0 END), 0) AS notification_count
+         THEN 1 ELSE 0 END), 0) AS receipt_count
      FROM messages
      WHERE sender = 'room-host'
        AND created_at >= datetime('now', '+8 hours', 'start of day', '-8 hours')
        AND json_type(meta, '$.roomHost.coordinationPool') = 'object'`
-  ).get() as { total: number; receipt_count: number; notification_count: number };
+  ).get() as { total: number; receipt_count: number };
   return {
     total: Number(row.total),
     receipts: Number(row.receipt_count),
-    backgroundNotifications: Number(row.notification_count),
   };
 }

@@ -61,6 +61,24 @@ contract. The Worker inserts that server-provided text into the runner prompt;
 contract wording can therefore change without a PC Worker restart. Runner
 permission flags are generated from the table in `runner.mjs`.
 
+### Codex sandbox and `danger-full-access`
+
+`codexSandboxMode: "danger-full-access"` is a **worker-side, host-level trust
+decision**, and it changes what the workspace allowlist means:
+
+- Under the normal `workspace-write` sandbox, the allowlist is backed by real
+  filesystem isolation — the runner cannot write outside its workspace.
+- Under `danger-full-access`, the allowlist only picks the working directory.
+  It is **no longer a filesystem boundary**: any shell-capable job can touch
+  the whole machine. Enable it only where every allowed requester is trusted.
+- Escalation requires this worker config. Job payloads cannot turn it on —
+  fields like `options.sandbox` or a `codexSandboxMode` smuggled into the job
+  are ignored (pinned by `runner.test.mjs`), and read-only jobs are still
+  forced to `read-only` even when the passthrough is configured.
+- Session resume explicitly re-applies the job's exact sandbox via
+  `-c sandbox_mode="…"` (codex `exec resume` has no `--sandbox` flag), so
+  fresh and resumed runs cannot drift apart.
+
 If the Node Worker restarts with an active job, it first checks the saved child
 PID. A live child is reattached and kept leased. If the child is gone but a
 Claude/Codex/Grok session id was captured, the Worker performs one automatic
@@ -200,11 +218,12 @@ the task/backlog gate:
 
 `taskReminders` is a deterministic scan of memory-vault's open-task snapshot; it
 does not ask the daily companion model whether a dated task is important. A task
-is emitted once when it enters each stage: upcoming within seven days, due today,
-and overdue. The stable key is `task path + due date + stage`, so repeated scans
-are NO_OP while a due-date change creates a new reminder. Tasks without a due
-date and tasks no longer open are ignored, and every queued reminder is checked
-against a fresh snapshot immediately before delivery.
+is emitted once when it enters each stage: due today and overdue. Tasks whose
+due date is still ahead stay quiet until the day itself. The stable key is
+`task path + due date + stage`, so repeated scans are NO_OP while a due-date
+change creates a new reminder. Tasks without a due date and tasks no longer
+open are ignored, and every queued reminder is checked against a fresh snapshot
+immediately before delivery.
 
 The feature is disabled when `taskReminders.enabled` is absent. Deploy the code
 first, run the read-only production shadow, and only then opt in explicitly.
@@ -330,11 +349,8 @@ per-recipient delivery distribution, and the separate daily/idea pool counters.
 
 ### Triage message origin
 
-`HubClient.dispatch` 会把自动来源显式标为 `automated: true`，内部触发指令统一
-`hidden: true`，仍在数据库保留来源、事件 id、分类和优先级供审计。daily 主动陪伴的自然回复
-照常进入主窗；普通 task/system triage 的回复必须带 `[AI_HUB_NOTIFY]` 路由标记：`no_op`
-只留后台审计，未分类结果只进副窗，只有 `state_change`、`due_escalation`、`failure`、
-`delivery_block`、`user_decision` 会上浮主窗。相同 `eventSource + key` 在
-`AI_HUB_BACKGROUND_NOTIFY_DEDUPE_MINUTES`（默认 30 分钟）内只提醒一次；实质状态变化使用
-新 key 后可再次提醒。不要把“是否由 timer/cron 触发”当成分类判据：语义上在和 User 说话的
-daily 属于主窗，机器流水默认保持安静。
+`HubClient.dispatch` 会把自动来源显式标为 `automated: true`，并保留来源、事件 id、分类和
+优先级供审计。daily 主动陪伴照常使用 hidden main 触发并把自然回复送进主窗；普通
+task/system triage 改由会议室 room-host 发 nudge，被点名成员在群轮次中选择 `[PASS]`、
+登记观察或 `delegate_to_worker`。`[PASS]` 由群轮次原生静默；目标不是会议室成员时才带
+「降级投递」前缀回退到可见 DM main。历史 side 行只作为审计与模型上下文保留。

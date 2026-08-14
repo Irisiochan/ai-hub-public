@@ -60,6 +60,7 @@
     "minimumGapMinutes": 180,
     "silentStartHour": 0,
     "silentEndHour": 9,
+    "presenceIdleMinutes": 30,
     "recipients": ["claude", "codex", "aye"]
   },
   "taskReminders": {
@@ -86,6 +87,10 @@
     "hostName": "DS 主持",
     "tasksDir": "/opt/memory-vault/tasks",
     "reminderRoomTags": ["ai-hub", "worker", "deploy", "工程"],
+    "hubAutoHygiene": {
+      "enabled": false,
+      "staleDays": 14
+    },
     "dailyLimit": 8,
     "scanIntervalMinutes": 5
   },

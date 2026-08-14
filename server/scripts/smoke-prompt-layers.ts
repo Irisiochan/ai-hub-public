@@ -60,10 +60,10 @@ const withCwd = contact('withcwd', 'claude-cli', { cwd: 'claude-dir' });
 let out = (await composer.composeStart(ctxFor(withCwd), null)).preamble;
 check('overlay 按 cfg.cwd 解析', out.includes('ALPHA') && !out.includes('WRONG'), out.slice(-200));
 check('overlay 带优先级抬头', out.includes('# 联系人叠层 overlay（网关注入，口吻与交付的最高优先级）'));
+// 时间语义仅在有历史/回放/resume 时注入；本用例无历史，不要求 temporal 在场。
 check(
   'overlay 排在全员块之后',
   out.indexOf('WORKFLOW_PRELOADED') < out.indexOf('ALPHA')
-    && out.indexOf('# 时间语义（网关强制）') < out.indexOf('ALPHA')
 );
 check('overlay 是提示词的最后一段', out.trimEnd().endsWith('ALPHA'), out.slice(-120));
 const blockLogs: string[] = [];

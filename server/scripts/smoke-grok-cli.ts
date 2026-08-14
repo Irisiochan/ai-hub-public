@@ -4,8 +4,24 @@ import { fileURLToPath } from 'node:url';
 import { GrokCliBackend } from '../src/agents/grokCli.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const mockCliPath = path.join(here, 'mock-grok.mjs');
+
+const models = await GrokCliBackend.listModels({
+  cliPath: mockCliPath,
+  cwd: process.cwd(),
+  log: () => {},
+});
+assert.deepEqual(
+  models.map(({ id, isDefault }) => ({ id, isDefault: !!isDefault })),
+  [
+    { id: 'grok-4.6', isDefault: true },
+    { id: 'grok-4.5', isDefault: false },
+  ],
+  'grok models 运行时目录必须保留当前默认和全部可用模型'
+);
+
 const backend = new GrokCliBackend({
-  cliPath: path.join(here, 'mock-grok.mjs'),
+  cliPath: mockCliPath,
   cwd: process.cwd(),
   turnTimeoutMs: 5000,
   log: () => {},
@@ -40,9 +56,14 @@ await backend.stop();
 
 /** 用 mock 回显 argv，断言权限相关 flag 真的到了命令行——漏传是静默失败，
  *  生产里只表现为「阿野说完计划就没了」（stop_reason=cancelled）。 */
-async function argvOf(opts: { allowRules?: string[]; disallowedTools?: string[]; alwaysApprove?: boolean }) {
+async function argvOf(opts: {
+  model?: string;
+  allowRules?: string[];
+  disallowedTools?: string[];
+  alwaysApprove?: boolean;
+}) {
   const cli = new GrokCliBackend({
-    cliPath: path.join(here, 'mock-grok.mjs'),
+    cliPath: mockCliPath,
     cwd: process.cwd(),
     turnTimeoutMs: 5000,
     log: () => {},
@@ -74,6 +95,11 @@ assert(
 
 const plain = await argvOf({});
 assert(!plain.includes('--always-approve'), '没开时不得偷偷带上 --always-approve');
+assert(!plain.includes('-m') && !plain.includes('--model'), '默认模型不得传 model flag');
+
+const selectedModel = await argvOf({ model: 'grok-4.6' });
+const modelFlag = Math.max(selectedModel.indexOf('-m'), selectedModel.indexOf('--model'));
+assert.equal(selectedModel[modelFlag + 1], 'grok-4.6', '选定模型必须真正透传给 Grok CLI');
 
 // tool_call / tool_call_update → 与 claude-cli 同构的 tool_use / tool_result 事件
 const withTools = new GrokCliBackend({

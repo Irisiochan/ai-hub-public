@@ -14,8 +14,17 @@ import {
   type DelegationCfg,
 } from './gatewayTools.js';
 import { GrokCliBackend } from './grokCli.js';
+import { hubMcpBearerToken } from '../middleware/hubMcpAuth.js';
 import type { PromptComposer, PromptContext, StartPrompt } from './promptComposer.js';
 import type { AgentBackend } from './types.js';
+
+/** HUB_TOKEN 存在时为该联系人生成 hub-mcp 的 Authorization header。 */
+function hubMcpAuthHeaders(contactId: string): Record<string, string> | undefined {
+  const hubToken = process.env.HUB_TOKEN;
+  return hubToken
+    ? { Authorization: `Bearer ${hubMcpBearerToken(hubToken, contactId)}` }
+    : undefined;
+}
 
 export interface BackendBuildContext extends PromptContext {
   memberId: string;
@@ -122,6 +131,7 @@ class CodexBuilder implements BackendBuilder {
         enabledTools: ['delegate_to_worker', 'worker_job_status', 'worker_job_cancel', 'worker_job_update_delivery'],
         required: true,
         defaultToolsApprovalMode: 'approve' as const,
+        httpHeaders: hubMcpAuthHeaders(ctx.agent.id),
       }];
       preamble = deps.prompts.withDelegation(preamble, delegation, 'mcp__hub__', ctx.log);
       ctx.log('worker delegation enabled (codex hub MCP)');
@@ -134,6 +144,7 @@ class CodexBuilder implements BackendBuilder {
       developerInstructions: [cfg.developerInstructions, preamble].filter(Boolean).join('\n') || undefined,
       mcpServers,
       sandbox: access.enabled ? 'workspace-write' : 'read-only',
+      nativeCompact: deps.config.codex.nativeCompact,
       turnTimeoutMs: deps.config.codex.turnTimeoutMs,
       log: ctx.log,
     });
@@ -256,7 +267,12 @@ class ManagedMcpConfig {
     }
     if (opts.includeHub) {
       const host = ['0.0.0.0', '::'].includes(config.host) ? '127.0.0.1' : config.host;
-      servers.hub = { type: 'http', url: `http://${host}:${config.port}/api/hub-mcp/${this.agent.id}` };
+      const headers = hubMcpAuthHeaders(this.agent.id);
+      servers.hub = {
+        type: 'http',
+        url: `http://${host}:${config.port}/api/hub-mcp/${this.agent.id}`,
+        ...(headers ? { headers } : {}),
+      };
     }
     if (Object.keys(servers).length === 0) return opts.base;
     // 生成物不能落在代码检出里：M1.5 之后 systemd 用 ProtectSystem=strict 把

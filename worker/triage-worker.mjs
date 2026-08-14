@@ -22,20 +22,28 @@ import {
   EXECUTED_VIA_CONTACT,
   EXECUTED_VIA_NONE,
   EXECUTED_VIA_WORKER,
+  executionDispatchKey,
+  executionFingerprint,
+  fileWatchContentDigest,
   ideaPolicyState,
   formatCoordinationDispatchBlock,
+  formatTaskNudgeRoomNotice,
   formatTaskReminderRoomNotice,
   formatVerificationDispatchBlock,
   isDailyMode,
   isDiaryMode,
   isIdeaMode,
   isShanghaiSilentHour,
+  isSystemTimerEvent,
   isTaskCompletionMessage,
   isTaskReminderMode,
+  isWebhookProbeInput,
   linkedReworkTail,
+  messageTimestampMs,
   nextTimerDelay,
   nextWallClockDelay,
   planBacklogSweep,
+  planHubAutoHygiene,
   normalizeBacklogSweepConfig,
   normalizeCoordinationConfig,
   normalizeDiaryConfig,
@@ -47,6 +55,7 @@ import {
   OUTCOME_LABEL_ENGAGED,
   OUTCOME_LABEL_REJECTED,
   OUTCOME_LABEL_REWORKED,
+  shouldSuppressUnchangedFileWatch,
   shanghaiClock,
   parseCoordinationTask,
   parseVerificationTask,
@@ -57,6 +66,8 @@ import {
   timerSchedule,
   TriageStore,
   validateTriageMode,
+  verificationDispatchKey,
+  legacyVerificationDispatchKey,
 } from './triage-core.mjs';
 import { rollupDay } from './diary-rollup.mjs';
 import {
@@ -77,6 +88,7 @@ import {
   FOLLOWUP_STATUS_QUEUED,
   formatFollowupDispatchBlock,
   formatFollowupFallbackBlock,
+  irisPresenceFromMessages,
   isUserMessage,
   matchesAbsenceKeyword,
   messageNumericId,
@@ -196,11 +208,8 @@ function dispatchPrompt(event, result, {
     '真实事件上下文：',
     event.summary.slice(0, 16_000),
     '',
-    '最终回复第一行必须是路由标记：[AI_HUB_NOTIFY] {"kind":"...","key":"..."}。',
-    'kind 只允许 no_op、state_change、due_escalation、failure、delivery_block、user_decision；key 必须描述稳定的“对象:状态”，同一状态重复使用同一 key，实质变化后才换 key。',
-    '只有 state_change、due_escalation、failure、delivery_block、user_decision 会通知主聊天；no_op 会保留后台审计但不打扰 User。',
     '请只按下面三种路径选一种，不要扩写成第四种：',
-    '1. NO_OP：当前不需要任何动作，kind=no_op，标记后简短说明即可。',
+    '1. [PASS]：当前不需要任何动作，群轮次原生静默。',
     '2. 登记观察：仅记录 User 当时可直接确认的现象、复现路径、原话与时间；用 memory_vault write_inbox 写入 inbox/，source 必须是 frontend-observation。不要创建或更新 tasks/。猜测只能标成“未验证假设”，并写明本机需独立核查。',
     '3. delegate_to_worker：凡是需要读取真实仓库/文件状态、运行测试或 shell、修改代码/文件、构建或部署的，一律调用 delegate_to_worker 转给本机。只传目标、约束和可判定验收标准，不要只凭聊天上下文猜根因、方案、文件或行号。',
     result.needsLocalExec
@@ -214,9 +223,22 @@ const DATE_EVENT_CLAIMS_KEY = 'date-event-claims:v1';
 const COORDINATION_SOURCE = 'coordination-sweep';
 const COORDINATION_STATE_KEY = 'coordination:v1';
 const VERIFICATION_MODE = 'coordination-verification';
+const HUB_AUTO_HYGIENE_MODE = 'hub-auto-hygiene';
 
+function hubAutoHygieneStateKey(date) {
+  return `hub-auto-hygiene:v1:${date}`;
+}
+
+// v2 state/dispatch keys cover verifier so a reassignment with an unchanged
+// due date still re-triggers; legacy v1 keys (due only) are migrated in place
+// when the recorded verifier still matches, so the same semantic dispatch
+// never fires twice across the upgrade.
 function verificationStateKey(task) {
-  return `verification:v1:${task.taskPath}:${task.due}`;
+  return verificationDispatchKey(task);
+}
+
+function legacyVerificationStateKey(task) {
+  return legacyVerificationDispatchKey(task);
 }
 
 class TriageWorker {
@@ -542,7 +564,86 @@ class TriageWorker {
     );
   }
 
-  scanCoordinationIfDue(now = Date.now()) {
+  /** due-today 催办抑制：同日验收派单可能记在 v2 或 legacy v1 key 下。 */
+  verificationDispatchSettled(taskPath, due, verifier) {
+    return Boolean(
+      this.store.getSourceState(verificationDispatchKey({ taskPath, due, verifier }))
+      || this.store.getSourceState(legacyVerificationDispatchKey({ taskPath, due })),
+    );
+  }
+
+  verificationAlreadyDispatched(task) {
+    if (this.store.getSourceState(verificationStateKey(task))) return true;
+    const legacyRaw = this.store.getSourceState(legacyVerificationStateKey(task));
+    if (!legacyRaw) return false;
+    let legacy = null;
+    try {
+      legacy = JSON.parse(legacyRaw);
+    } catch {
+      legacy = null;
+    }
+    if (String(legacy?.verifier ?? '').trim().toLowerCase() !== task.verifier) return false;
+    // legacy v1 record already covered this verifier: migrate so v2 stays settled
+    this.store.setSourceState(verificationStateKey(task), legacyRaw);
+    return true;
+  }
+
+  /** 执行前复核：以 exact taskPath 重读任务文件，返回当前语义（或 null）。 */
+  rereadCoordinationTaskFile(taskPath, parser) {
+    const normalized = String(taskPath ?? '').trim().replaceAll('\\', '/');
+    if (!/^tasks\/[^/]+\.md$/i.test(normalized)) return null;
+    const config = this.coordinationConfig();
+    let raw = '';
+    try {
+      raw = fs.readFileSync(path.join(config.tasksDir, normalized.slice('tasks/'.length)), 'utf8');
+    } catch {
+      return null;
+    }
+    try {
+      return parser(raw, { taskPath: normalized });
+    } catch {
+      return null;
+    }
+  }
+
+  async scanHubAutoHygieneIfDue(now = Date.now(), remaining = 0) {
+    const coordination = this.coordinationConfig();
+    const hygiene = coordination.hubAutoHygiene;
+    if (!hygiene.enabled || !this.vault.enabled || remaining <= 0) return false;
+    const date = shanghaiDateAt(now);
+    const stateKey = hubAutoHygieneStateKey(date);
+    if (this.store.getSourceState(stateKey)) return false;
+    const inbox = await this.vault.call('list_inbox');
+    const plan = planHubAutoHygiene(inbox, { today: date, staleDays: hygiene.staleDays });
+    if (!plan.digest) {
+      this.store.setSourceState(stateKey, JSON.stringify({
+        status: 'quiet',
+        date,
+        metrics: plan.metrics,
+        checkedAt: now,
+      }));
+      log('info', 'hub-auto hygiene quiet', { date, ...plan.metrics });
+      return false;
+    }
+    const queued = this.enqueue({
+      source: COORDINATION_SOURCE,
+      categoryHint: 'coordination',
+      summary: `hub-auto hygiene digest: ${plan.metrics.staleCount} stale of ${plan.metrics.hubAutoTotal}`,
+      dedupeKey: stateKey,
+      payload: { mode: HUB_AUTO_HYGIENE_MODE, stateKey, plan },
+    });
+    this.store.setSourceState(stateKey, JSON.stringify({
+      status: 'queued',
+      date,
+      eventId: queued.id,
+      metrics: plan.metrics,
+      queuedAt: now,
+    }));
+    log('info', 'hub-auto hygiene queued', { date, eventId: queued.id, ...plan.metrics });
+    return true;
+  }
+
+  async scanCoordinationIfDue(now = Date.now()) {
     const config = this.coordinationConfig();
     if (!config.enabled) return false;
     const intervalMs = config.scanIntervalMinutes * 60_000;
@@ -556,22 +657,34 @@ class TriageWorker {
     const policy = this.coordinationPolicy(now);
     if (policy.poolFull) return false;
     const state = this.coordinationState();
+    let stateDirty = false;
     const plans = this.coordinationPlans()
-      .filter((task) => state[task.taskPath] !== task.planHash)
+      .filter((task) => {
+        const fingerprint = executionFingerprint(task);
+        if (state[task.taskPath] === fingerprint) return false;
+        if (state[task.taskPath] === task.planHash) {
+          // legacy v1 record of this exact Plan: upgrade in place, no re-dispatch
+          state[task.taskPath] = fingerprint;
+          stateDirty = true;
+          return false;
+        }
+        return true;
+      })
       .slice(0, policy.remaining);
+    if (stateDirty) this.saveCoordinationState(state);
     for (const task of plans) {
       this.enqueue({
         source: COORDINATION_SOURCE,
         categoryHint: 'coordination',
-        summary: `Plan-ready coordination dispatch: ${task.taskPath} (${task.planHash.slice(0, 12)})`,
-        dedupeKey: `coordination:${task.taskPath}:${task.planHash}`,
+        summary: `Plan-ready coordination dispatch: ${task.taskPath} (${executionFingerprint(task).slice(0, 12)})`,
+        dedupeKey: executionDispatchKey(task),
         payload: { mode: 'coordination', task },
       });
     }
     const verificationRemaining = Math.max(0, policy.remaining - plans.length);
     const today = shanghaiDateAt(now);
     const verifications = this.verificationTasks()
-      .filter((task) => task.due <= today && !this.store.getSourceState(verificationStateKey(task)))
+      .filter((task) => task.due <= today && !this.verificationAlreadyDispatched(task))
       .slice(0, verificationRemaining);
     for (const task of verifications) {
       const stateKey = verificationStateKey(task);
@@ -583,19 +696,28 @@ class TriageWorker {
         payload: { mode: VERIFICATION_MODE, task },
       });
     }
-    if (plans.length || verifications.length) {
+    const hygieneQueued = await this.scanHubAutoHygieneIfDue(
+      now,
+      Math.max(0, verificationRemaining - verifications.length),
+    );
+    if (plans.length || verifications.length || hygieneQueued) {
       log('info', 'coordination tasks queued', {
         executionCount: plans.length,
         verificationCount: verifications.length,
+        hygieneCount: hygieneQueued ? 1 : 0,
         taskPaths: [...plans, ...verifications].map((task) => task.taskPath),
       });
     }
-    return plans.length + verifications.length > 0;
+    return plans.length + verifications.length + (hygieneQueued ? 1 : 0) > 0;
   }
 
   async processCoordination(event) {
     if (event.payload?.mode === VERIFICATION_MODE) {
       await this.processVerification(event);
+      return;
+    }
+    if (event.payload?.mode === HUB_AUTO_HYGIENE_MODE) {
+      await this.processHubAutoHygiene(event);
       return;
     }
     const config = this.coordinationConfig();
@@ -619,8 +741,9 @@ class TriageWorker {
       });
       return;
     }
+    const eventFingerprint = executionFingerprint(task);
     const state = this.coordinationState();
-    if (state[task.taskPath] === task.planHash) {
+    if (state[task.taskPath] === eventFingerprint || state[task.taskPath] === task.planHash) {
       this.store.finish(event.id, 'noop', {
         triageResult: {
           actionable: false,
@@ -628,7 +751,24 @@ class TriageWorker {
           category: 'coordination',
           priority: 1,
           suggestedRecipient: null,
-          rationale: 'same Plan hash already dispatched',
+          rationale: 'same execution fingerprint already dispatched',
+        },
+      });
+      return;
+    }
+    // 执行前复核：任务在排队/重试期间可能被置 done、改 Plan 或改派。
+    // 只有重读后的当前语义与 event 完全一致才允许派发；否则本 event 以
+    // superseded 收口，新版任务由下一轮扫描重新入队。
+    const current = this.rereadCoordinationTaskFile(task.taskPath, parseCoordinationTask);
+    if (!current || executionFingerprint(current) !== eventFingerprint) {
+      this.store.finish(event.id, 'noop', {
+        triageResult: {
+          actionable: false,
+          needsLocalExec: false,
+          category: 'coordination',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'superseded: task closed or changed after enqueue; rescan will queue the current version',
         },
       });
       return;
@@ -643,38 +783,40 @@ class TriageWorker {
       return;
     }
     const dispatched = await this.hub.dispatchRoomHost(config.roomId, {
-      content: formatCoordinationDispatchBlock(task),
+      content: formatCoordinationDispatchBlock(current),
       hostName: config.hostName,
-      targetIds: [task.executor],
+      targetIds: [current.executor],
       reactionRounds: 0,
-      idempotencyKey: `coordination:${task.taskPath}:${task.planHash}`,
+      idempotencyKey: executionDispatchKey(current),
       coordination: {
         kind: 'execution',
-        taskPath: task.taskPath,
-        branch: task.branch,
-        workspace: task.workspace,
-        planHash: task.planHash,
-        executor: task.executor,
+        taskPath: current.taskPath,
+        branch: current.branch,
+        workspace: current.workspace,
+        planHash: current.planHash,
+        executor: current.executor,
       },
     });
-    state[task.taskPath] = task.planHash;
-    this.saveCoordinationState(state);
-    this.store.recordDelivery(event.id, config.roomId, Date.now(), DELIVERY_POOL_COORDINATION, {
+    // 投递已成功；state/delivery/终态必须一起落（见 settleCoordinationDispatch 注释）。
+    const settledState = this.coordinationState();
+    settledState[current.taskPath] = eventFingerprint;
+    this.store.settleCoordinationDispatch(event.id, {
+      recipientId: config.roomId,
+      pool: DELIVERY_POOL_COORDINATION,
       messageId: dispatched?.messageId,
-      taskPath: task.taskPath,
       executedVia: EXECUTED_VIA_CONTACT,
-    });
-    this.store.finish(event.id, 'dispatched', {
+      taskPath: current.taskPath,
+      sourceStates: [{ key: COORDINATION_STATE_KEY, value: JSON.stringify(settledState) }],
       triageResult: {
         actionable: true,
         needsLocalExec: true,
         category: 'coordination',
         priority: 2,
-        suggestedRecipient: task.executor,
-        rationale: `Plan hash dispatched to @${task.executor}`,
-        taskPath: task.taskPath,
+        suggestedRecipient: current.executor,
+        rationale: `Plan hash dispatched to @${current.executor}`,
+        taskPath: current.taskPath,
       },
-      recipientId: task.executor,
+      finishRecipientId: current.executor,
     });
     log('info', 'coordination plan dispatched', {
       eventId: event.id,
@@ -682,6 +824,102 @@ class TriageWorker {
       planHash: task.planHash,
       executor: task.executor,
       pool: DELIVERY_POOL_COORDINATION,
+    });
+  }
+
+  async processHubAutoHygiene(event) {
+    const config = this.coordinationConfig();
+    const plan = event.payload?.plan;
+    const date = typeof plan?.today === 'string' ? plan.today : '';
+    const stateKey = event.payload?.stateKey === hubAutoHygieneStateKey(date)
+      ? event.payload.stateKey
+      : '';
+    let state = null;
+    try {
+      state = JSON.parse(this.store.getSourceState(stateKey) ?? 'null');
+    } catch {
+      state = null;
+    }
+    if (state?.status === 'dispatched' || state?.status === 'quiet') {
+      this.store.finish(event.id, 'noop', {
+        triageResult: {
+          actionable: false,
+          needsLocalExec: false,
+          category: 'coordination',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'hub-auto hygiene already settled for this Shanghai date',
+        },
+      });
+      return;
+    }
+    const validPlan = stateKey
+      && typeof plan?.digest === 'string'
+      && plan.digest
+      && Number(plan?.metrics?.staleCount) > 0;
+    if (!config.enabled || !config.roomId || !config.hubAutoHygiene.enabled || !validPlan) {
+      this.store.finish(event.id, 'noop', {
+        triageResult: {
+          actionable: false,
+          needsLocalExec: false,
+          category: 'coordination',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'hub-auto hygiene config or payload is no longer valid',
+        },
+      });
+      return;
+    }
+    const proactive = this.proactiveConfig();
+    if (isShanghaiSilentHour(Date.now(), proactive.silentStartHour, proactive.silentEndHour)) {
+      this.store.retry(event.id, 'coordination silent hours', 60 * 60_000);
+      return;
+    }
+    if (this.coordinationPolicy().poolFull) {
+      this.store.retry(event.id, 'coordination daily pool full', 60 * 60_000);
+      return;
+    }
+    const dispatched = await this.hub.dispatchRoomHost(config.roomId, {
+      content: plan.digest,
+      hostName: config.hostName,
+      trigger: false,
+      reactionRounds: 0,
+      capture: false,
+      idempotencyKey: stateKey,
+    });
+    // 投递已成功；state/delivery/终态必须一起落（见 settleCoordinationDispatch 注释）。
+    this.store.settleCoordinationDispatch(event.id, {
+      recipientId: config.roomId,
+      pool: DELIVERY_POOL_COORDINATION,
+      messageId: dispatched?.messageId,
+      executedVia: EXECUTED_VIA_NONE,
+      sourceStates: [{
+        key: stateKey,
+        value: JSON.stringify({
+          status: 'dispatched',
+          date,
+          eventId: event.id,
+          messageId: dispatched?.messageId,
+          metrics: plan.metrics,
+          dispatchedAt: Date.now(),
+        }),
+      }],
+      triageResult: {
+        actionable: true,
+        needsLocalExec: false,
+        category: 'coordination',
+        priority: 1,
+        suggestedRecipient: null,
+        rationale: `hub-auto hygiene digest posted for ${date}`,
+      },
+      finishRecipientId: config.roomId,
+    });
+    log('info', 'hub-auto hygiene dispatched', {
+      eventId: event.id,
+      date,
+      roomId: config.roomId,
+      pool: DELIVERY_POOL_COORDINATION,
+      ...plan.metrics,
     });
   }
 
@@ -708,7 +946,7 @@ class TriageWorker {
       return;
     }
     const stateKey = verificationStateKey(task);
-    if (this.store.getSourceState(stateKey)) {
+    if (this.verificationAlreadyDispatched(task)) {
       this.store.finish(event.id, 'noop', {
         triageResult: {
           actionable: false,
@@ -716,7 +954,22 @@ class TriageWorker {
           category: 'coordination',
           priority: 1,
           suggestedRecipient: null,
-          rationale: 'same task due date already dispatched for verification',
+          rationale: 'same verification key already dispatched',
+        },
+      });
+      return;
+    }
+    // 执行前复核：due 改写、verifier 改派或任务关闭后，旧 event 一律 superseded。
+    const current = this.rereadCoordinationTaskFile(task.taskPath, parseVerificationTask);
+    if (!current || verificationDispatchKey(current) !== verificationDispatchKey(task)) {
+      this.store.finish(event.id, 'noop', {
+        triageResult: {
+          actionable: false,
+          needsLocalExec: false,
+          category: 'coordination',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'superseded: verification task closed or changed after enqueue; rescan will queue the current version',
         },
       });
       return;
@@ -731,9 +984,9 @@ class TriageWorker {
       return;
     }
     const dispatched = await this.hub.dispatchRoomHost(config.roomId, {
-      content: formatVerificationDispatchBlock(task),
+      content: formatVerificationDispatchBlock(current),
       hostName: config.hostName,
-      targetIds: [task.verifier],
+      targetIds: [current.verifier],
       reactionRounds: 0,
       idempotencyKey: stateKey,
       coordination: {
@@ -743,28 +996,32 @@ class TriageWorker {
         verifier: task.verifier,
       },
     });
-    this.store.setSourceState(stateKey, JSON.stringify({
-      taskPath: task.taskPath,
-      due: task.due,
-      verifier: task.verifier,
-      dispatchedAt: Date.now(),
-    }));
-    this.store.recordDelivery(event.id, config.roomId, Date.now(), DELIVERY_POOL_COORDINATION, {
+    // 投递已成功；state/delivery/终态必须一起落（见 settleCoordinationDispatch 注释）。
+    this.store.settleCoordinationDispatch(event.id, {
+      recipientId: config.roomId,
+      pool: DELIVERY_POOL_COORDINATION,
       messageId: dispatched?.messageId,
-      taskPath: task.taskPath,
       executedVia: EXECUTED_VIA_CONTACT,
-    });
-    this.store.finish(event.id, 'dispatched', {
+      taskPath: current.taskPath,
+      sourceStates: [{
+        key: stateKey,
+        value: JSON.stringify({
+          taskPath: current.taskPath,
+          due: current.due,
+          verifier: current.verifier,
+          dispatchedAt: Date.now(),
+        }),
+      }],
       triageResult: {
         actionable: true,
         needsLocalExec: false,
         category: 'coordination',
         priority: 2,
-        suggestedRecipient: task.verifier,
-        rationale: `Due verification dispatched to @${task.verifier}`,
-        taskPath: task.taskPath,
+        suggestedRecipient: current.verifier,
+        rationale: `Due verification dispatched to @${current.verifier}`,
+        taskPath: current.taskPath,
       },
-      recipientId: task.verifier,
+      finishRecipientId: current.verifier,
     });
     log('info', 'coordination verification dispatched', {
       eventId: event.id,
@@ -859,7 +1116,8 @@ class TriageWorker {
 
   async dispatchableBacklog() {
     if (!this.vault.enabled) {
-      return { summary: '', taskPaths: [], allTaskPaths: [], ignored: [] };
+      // Vault unavailable is not "zero tasks" — mark parseOk false so gates fail-open.
+      return { summary: '', taskPaths: [], allTaskPaths: [], ignored: [], parseOk: false };
     }
     const raw = await this.vault.taskContext();
     const claims = this.backlogClaims();
@@ -867,10 +1125,72 @@ class TriageWorker {
       claimedTaskPaths: Object.keys(claims),
       maxChars: Math.max(500, Number(this.deepseek.backlogMaxChars ?? 4000)),
     });
-    const open = new Set(snapshot.allTaskPaths);
-    const pruned = Object.fromEntries(Object.entries(claims).filter(([taskPath]) => open.has(taskPath)));
-    if (JSON.stringify(pruned) !== JSON.stringify(claims)) this.saveBacklogClaims(pruned);
+    // Only prune claims against a well-formed snapshot; garbage must not wipe claims.
+    if (snapshot.parseOk) {
+      const open = new Set(snapshot.allTaskPaths);
+      const pruned = Object.fromEntries(Object.entries(claims).filter(([taskPath]) => open.has(taskPath)));
+      if (JSON.stringify(pruned) !== JSON.stringify(claims)) this.saveBacklogClaims(pruned);
+    }
     return snapshot;
+  }
+
+  /**
+   * $0 presence probe: User herself spoke in any DM within presenceIdleMinutes.
+   * AI output never counts. Fail-open to inactive on any incomplete evidence.
+   */
+  async detectIrisPresence(now = Date.now()) {
+    const idleMinutes = Number(this.proactiveConfig().presenceIdleMinutes);
+    if (!Number.isFinite(idleMinutes) || idleMinutes <= 0) {
+      return { active: false, reason: 'disabled', lastUserMessageAt: null, contactId: null };
+    }
+    if (!this.hub?.baseUrl) {
+      return { active: false, reason: 'hub-unavailable', lastUserMessageAt: null, contactId: null };
+    }
+    let contacts;
+    try {
+      contacts = await this.hub.contacts();
+    } catch (error) {
+      log('warn', 'User presence contact list unavailable', { error: error.message });
+      return { active: false, reason: 'hub-error', lastUserMessageAt: null, contactId: null };
+    }
+    const thresholdMs = idleMinutes * 60_000;
+    const candidates = (Array.isArray(contacts) ? contacts : [])
+      .filter((contact) => contact?.kind === 'dm' || contact?.kind === 'api')
+      .filter((contact) => contact?.config?.routing?.enabled !== false)
+      .map((contact) => {
+        const lastAt = Date.parse(String(contact?.last_at ?? '')) || 0;
+        return { contact, lastAt };
+      })
+      .sort((a, b) => b.lastAt - a.lastAt);
+
+    for (const { contact, lastAt } of candidates) {
+      // last_at is any-party; if even that is older than the window, skip scan.
+      if (lastAt > 0 && now - lastAt > thresholdMs) continue;
+      let messages = [];
+      try {
+        messages = await this.hub.messages(contact.id, null, 40, 'all');
+      } catch (error) {
+        log('warn', 'User presence message scan failed', {
+          contactId: contact.id,
+          error: error.message,
+        });
+        continue;
+      }
+      const presence = irisPresenceFromMessages(messages, {
+        now,
+        idleMinutes,
+        messageTimestampMs,
+      });
+      if (presence.active) {
+        return {
+          active: true,
+          reason: presence.reason,
+          lastUserMessageAt: presence.lastUserMessageAt,
+          contactId: contact.id,
+        };
+      }
+    }
+    return { active: false, reason: 'idle', lastUserMessageAt: null, contactId: null };
   }
 
   async collectOutcomesIfDue(now = Date.now()) {
@@ -1094,7 +1414,7 @@ class TriageWorker {
       if (
         reminder.stage === 'due-today'
         && route.verifier
-        && this.store.getSourceState(`verification:v1:${reminder.taskPath}:${reminder.dueDate}`)
+        && this.verificationDispatchSettled(reminder.taskPath, reminder.dueDate, route.verifier)
       ) {
         verificationSkipped += 1;
         log('info', 'task reminder skipped after same-day verification dispatch', {
@@ -1615,6 +1935,25 @@ class TriageWorker {
         return true;
       }
 
+      // Probe payloads must never reach L1/dispatch (defense in depth for webhook).
+      if (isWebhookProbeInput(event) || isWebhookProbeInput(event.payload)) {
+        const probeResult = triageResult ?? {
+          actionable: false,
+          needsLocalExec: false,
+          category: 'system',
+          priority: 1,
+          suggestedRecipient: null,
+          rationale: 'webhook probe payload; recorded without model dispatch',
+        };
+        this.store.finish(event.id, 'noop', {
+          triageResult: probeResult,
+          costCny,
+          triageLatencyMs,
+        });
+        log('info', 'webhook probe suppressed before L1', { eventId: event.id });
+        return true;
+      }
+
       if (this.isCoordinationEvent(event)) {
         await this.processCoordination(event);
         return true;
@@ -1750,6 +2089,40 @@ class TriageWorker {
         return true;
       }
 
+      // Presence damping (on top of silent hours / minimumGap): if User herself
+      // spoke recently, skip pure proactive assessment. Date-events, guaranteed
+      // forceActionable slots, and followups still go through (no false negatives).
+      if (
+        isDaily
+        && !isFollowup
+        && !triageResult
+        && !hasTodayDateEvent
+        && !initialDailyPolicy.forceActionable
+      ) {
+        const presence = await this.detectIrisPresence(Date.now());
+        if (presence.active) {
+          const presenceResult = {
+            actionable: false,
+            category: 'daily',
+            priority: 1,
+            suggestedRecipient: null,
+            rationale: `User active within ${proactive.presenceIdleMinutes}m; daily proactive damped`,
+          };
+          this.store.finish(event.id, 'noop', {
+            triageResult: presenceResult,
+            costCny,
+            triageLatencyMs,
+          });
+          log('info', 'daily suppressed by User presence', {
+            eventId: event.id,
+            contactId: presence.contactId,
+            lastUserMessageAt: presence.lastUserMessageAt,
+            presenceIdleMinutes: proactive.presenceIdleMinutes,
+          });
+          return true;
+        }
+      }
+
       // Privacy-preserving deterministic path: the commitment goes only to the
       // original companion contact, never through external L1 triage.
       if (fallbackFollowups.length && !triageResult) {
@@ -1794,7 +2167,7 @@ class TriageWorker {
         if (
           current.stage === 'due-today'
           && reminderRoute.verifier
-          && this.store.getSourceState(`verification:v1:${current.taskPath}:${current.dueDate}`)
+          && this.verificationDispatchSettled(current.taskPath, current.dueDate, reminderRoute.verifier)
         ) {
           this.store.finish(event.id, 'noop', {
             triageResult: {
@@ -1871,7 +2244,9 @@ class TriageWorker {
       }
       if (isBacklogSweep) {
         backlogSnapshot = await this.dispatchableBacklog();
-        if (!backlogSnapshot.taskPaths.length) {
+        // Soft-parse failure (empty/garbage snapshot) → fail-open to L1; only a
+        // well-formed explicit-zero eligible set may short-circuit.
+        if (backlogSnapshot.parseOk && !backlogSnapshot.taskPaths.length) {
           const noTaskResult = {
             actionable: false,
             category: 'backlog',
@@ -1891,7 +2266,11 @@ class TriageWorker {
           });
           return true;
         }
-        if (triageResult?.taskPath && !backlogSnapshot.taskPaths.includes(triageResult.taskPath)) {
+        if (
+          backlogSnapshot.parseOk
+          && triageResult?.taskPath
+          && !backlogSnapshot.taskPaths.includes(triageResult.taskPath)
+        ) {
           const staleResult = {
             ...triageResult,
             actionable: false,
@@ -1911,6 +2290,49 @@ class TriageWorker {
           return true;
         }
       }
+
+      // System timer (quarter-hour-check): same eligible-task gate as backlog, $0 before L1.
+      // Vault missing/error OR unparseable snapshot → fail-open to L1 (no false negatives).
+      // Only a well-formed snapshot with explicit zero eligible tasks may short-circuit.
+      if (!isDaily && !isReminder && !isFollowup && !isBacklogSweep && isSystemTimerEvent(event) && !triageResult) {
+        if (this.vault.enabled) {
+          try {
+            backlogSnapshot = await this.dispatchableBacklog();
+            if (!backlogSnapshot.parseOk) {
+              log('warn', 'system timer task snapshot unparseable; fail-open to L1', {
+                eventId: event.id,
+              });
+              backlogSnapshot = null;
+            } else if (!backlogSnapshot.taskPaths.length) {
+              const noTaskResult = {
+                actionable: false,
+                category: 'system',
+                priority: 1,
+                suggestedRecipient: null,
+                rationale: 'system timer: no eligible current task; suppressed before L1',
+                taskPath: null,
+              };
+              this.store.finish(event.id, 'noop', {
+                triageResult: noTaskResult,
+                costCny,
+                triageLatencyMs,
+              });
+              log('info', 'system timer suppressed before L1', {
+                eventId: event.id,
+                ignored: backlogSnapshot.ignored.length,
+              });
+              return true;
+            }
+          } catch (error) {
+            log('warn', 'system timer eligible-task probe failed; fail-open to L1', {
+              eventId: event.id,
+              error: error.message,
+            });
+            backlogSnapshot = null;
+          }
+        }
+      }
+
       if (!triageResult) {
         let backlogSummary = '';
         let triageOptions = {};
@@ -2066,28 +2488,84 @@ class TriageWorker {
         return true;
       }
 
-      const dispatchResult = await this.hub.dispatch(
-        route.contact.id,
-        dispatchPrompt(event, storedResult, {
-          daily: isDaily,
-          reminder: isReminder,
-          todayDateEvents: isDaily && !isFollowup ? dateEvents.unclaimedToday : [],
-          followup: isFollowup ? followupRow : null,
-          fallbackFollowups,
-        }),
-        {
-          origin: isProactive ? 'main' : 'side',
-          hidden: true,
-          idempotencyKey: `automation:${event.source}:${event.id}`,
-          automation: {
-            messageType: isProactive ? 'proactive-trigger' : 'background-event',
-            eventSource: event.source,
-            eventId: event.id,
-            eventCategory: storedResult.category,
-            eventPriority: storedResult.priority,
+      const automationKey = `automation:${event.source}:${event.id}`;
+      let dispatchResult;
+      let deliveryRecipientId = route.contact.id;
+      let deliveryPool = DELIVERY_POOL_DAILY;
+      let deliveryRoute = 'daily-main';
+      if (isProactive) {
+        dispatchResult = await this.hub.dispatch(
+          route.contact.id,
+          dispatchPrompt(event, storedResult, {
+            daily: isDaily,
+            reminder: isReminder,
+            todayDateEvents: isDaily && !isFollowup ? dateEvents.unclaimedToday : [],
+            followup: isFollowup ? followupRow : null,
+            fallbackFollowups,
+          }),
+          {
+            origin: 'main',
+            hidden: true,
+            idempotencyKey: automationKey,
+            automation: {
+              messageType: 'proactive-trigger',
+              eventSource: event.source,
+              eventId: event.id,
+              eventCategory: storedResult.category,
+              eventPriority: storedResult.priority,
+            },
           },
-        },
-      );
+        );
+      } else {
+        const coordination = this.coordinationConfig();
+        const room = contacts.find((contact) => (
+          contact?.id === coordination.roomId
+          && contact?.kind === 'room'
+          && contact?.enabled !== false
+        ));
+        const roomMembers = Array.isArray(room?.config?.members) ? room.config.members : [];
+        const roomTargeted = roomMembers.includes(route.contact.id);
+        if (coordination.enabled && coordination.roomId && coordination.tasksDir
+            && this.coordinationPolicy().poolFull) {
+          this.store.retry(event.id, 'coordination daily pool full', 60 * 60_000, {
+            triageResult: storedResult,
+            costCny,
+            triageLatencyMs,
+          });
+          return true;
+        }
+        const nudge = formatTaskNudgeRoomNotice(event, storedResult, route.contact.id);
+        deliveryPool = DELIVERY_POOL_COORDINATION;
+        if (roomTargeted) {
+          dispatchResult = await this.hub.dispatchRoomHost(coordination.roomId, {
+            content: nudge,
+            hostName: coordination.hostName,
+            targetIds: [route.contact.id],
+            reactionRounds: 0,
+            idempotencyKey: automationKey,
+          });
+          deliveryRecipientId = coordination.roomId;
+          deliveryRoute = 'coordination-room';
+        } else {
+          dispatchResult = await this.hub.dispatch(
+            route.contact.id,
+            `【降级投递：会议室不可用或 @${route.contact.id} 不在群成员中】\n${nudge}`,
+            {
+              origin: 'main',
+              hidden: false,
+              idempotencyKey: automationKey,
+              automation: {
+                messageType: 'automation-trigger',
+                eventSource: event.source,
+                eventId: event.id,
+                eventCategory: storedResult.category,
+                eventPriority: storedResult.priority,
+              },
+            },
+          );
+          deliveryRoute = 'degraded-dm-main';
+        }
+      }
       if (isBacklogSweep) this.claimBacklogTask(storedResult.taskPath, event.id);
       if (isDaily && !isFollowup && dateEvents.unclaimedToday.length) {
         this.claimDateEvents(dateEvents.unclaimedToday, { eventId: event.id });
@@ -2100,11 +2578,12 @@ class TriageWorker {
       if (fallbackFollowups.length) {
         this.store.markFollowupsFallbackReminded(fallbackFollowups.map((item) => item.id));
       }
+      const deliveredAt = Date.now();
       this.store.recordDelivery(
         event.id,
-        route.contact.id,
-        Date.now(),
-        isProactive ? DELIVERY_POOL_DAILY : DELIVERY_POOL_TASK,
+        deliveryRecipientId,
+        deliveredAt,
+        deliveryPool,
         {
           messageId: dispatchResult?.messageId,
           taskPath: storedResult.taskPath ?? null,
@@ -2115,18 +2594,29 @@ class TriageWorker {
               : EXECUTED_VIA_CONTACT,
         },
       );
+      if (!isProactive) {
+        // Two ledgers, one nudge. The row above is attributed to wherever the message
+        // actually landed (the coordination room, or the contact on degraded DM) and burns
+        // the shared coordination pool; outcome collection follows that recipient. The task
+        // pool stays what it always was: the per-contact 24h work quota chooseRecipient
+        // reads through routeOptions. Room-routed nudges never touch the contact's own
+        // recipient_id, so without this ledger row the daily-limit and cooldown branches
+        // could never fire again.
+        this.store.recordDelivery(event.id, route.contact.id, deliveredAt, DELIVERY_POOL_TASK);
+      }
       this.store.finish(event.id, 'dispatched', {
         triageResult: storedResult,
-        recipientId: route.contact.id,
+        recipientId: deliveryRecipientId,
         costCny,
         triageLatencyMs,
       });
       log('info', 'event dispatched', {
         eventId: event.id,
-        recipientId: route.contact.id,
+        recipientId: deliveryRecipientId,
         category: storedResult.category,
         priority: storedResult.priority,
-        pool: isProactive ? DELIVERY_POOL_DAILY : DELIVERY_POOL_TASK,
+        pool: deliveryPool,
+        route: deliveryRoute,
         fallbackUsed,
         dateEvents: isDaily ? dateEvents.unclaimedToday.map((item) => item.key) : undefined,
         costCny,
@@ -2340,6 +2830,9 @@ class TriageWorker {
               ...(source.payload && typeof source.payload === 'object' ? source.payload : {}),
               mode: idea ? 'idea' : daily ? 'daily' : 'task',
               emittedAt: now,
+              // Positive scheduler identity for system-timer wake gate only.
+              // Webhook/http-diff with categoryHint:'system' must NOT carry this.
+              ...(!daily && !idea ? { origin: 'scheduler-timer' } : {}),
               ...(daily && dateEvents.unclaimedToday.length
                 ? { todayDateEvents: dateEvents.unclaimedToday }
                 : {}),
@@ -2371,15 +2864,42 @@ class TriageWorker {
         }
       } else if (source.type === 'file') {
         if (once) continue;
-        const watcher = fs.watch(path.resolve(source.path), { recursive: source.recursive === true }, (eventType, filename) => {
+        const watchRoot = path.resolve(source.path);
+        const watcher = fs.watch(watchRoot, { recursive: source.recursive === true }, (eventType, filename) => {
           const relative = String(filename ?? '');
-          const key = `${source.id}:${eventType}:${relative}:${Math.floor(Date.now() / 1000)}`;
+          const target = relative ? path.resolve(watchRoot, relative) : watchRoot;
+          // mtime/size digest: content unchanged → no downstream triage.
+          // Missing stat (delete/rename race) fails open and still enqueues.
+          let digest = null;
+          try {
+            const st = fs.statSync(target);
+            digest = fileWatchContentDigest(st, relative || path.basename(watchRoot));
+          } catch {
+            digest = null;
+          }
+          const stateKey = `file-watch:${source.id}:${relative || '.'}`;
+          const previous = this.store.getSourceState(stateKey);
+          if (shouldSuppressUnchangedFileWatch(previous, digest)) {
+            log('info', 'file watch suppressed: mtime/size unchanged', {
+              source: source.id,
+              filename: relative,
+              digest,
+            });
+            return;
+          }
+          if (digest) this.store.setSourceState(stateKey, digest);
+          const key = `${source.id}:${eventType}:${relative}:${digest ?? Math.floor(Date.now() / 1000)}`;
           this.enqueue({
             source: source.id,
             categoryHint: source.category ?? 'file-change',
             dedupeKey: key,
             summary: `File event ${eventType}: ${relative || source.path}`,
-            payload: { path: source.path, filename: relative, eventType },
+            payload: {
+              path: source.path,
+              filename: relative,
+              eventType,
+              ...(digest ? { digest } : {}),
+            },
           });
         });
         this.watchers.push(watcher);
@@ -2422,6 +2942,18 @@ class TriageWorker {
       req.on('end', () => {
         try {
           const input = JSON.parse(raw || '{}');
+          // Probe/health payloads: log + ack only; never enqueue for model triage.
+          if (isWebhookProbeInput(input)) {
+            log('info', 'webhook probe acknowledged', {
+              source: input.source ?? 'webhook',
+              kind: input.kind ?? input.payload?.kind ?? 'probe',
+            });
+            return respond(200, {
+              status: 'probe-ok',
+              recorded: true,
+              enqueued: false,
+            });
+          }
           const queued = this.enqueue({
             source: input.source ?? 'webhook',
             summary: input.summary,
@@ -2463,7 +2995,7 @@ class TriageWorker {
     do {
       await this.collectOutcomesIfDue();
       await this.processFollowupsIfDue();
-      this.scanCoordinationIfDue();
+      await this.scanCoordinationIfDue();
       const vaultWorked = await this.processVaultOutboxOne();
       const eventWorked = await this.processOne();
       if (once && !vaultWorked && !eventWorked) break;

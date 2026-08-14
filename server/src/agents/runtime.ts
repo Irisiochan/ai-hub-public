@@ -11,10 +11,6 @@ import type { SseHub } from '../sse.js';
 import type { JobStore } from '../workers/jobStore.js';
 import type { HubLogger } from '../logger.js';
 import { BackendFactory } from './backendFactory.js';
-import {
-  backgroundDedupeMinutes,
-  decideBackgroundNotification,
-} from './backgroundNotification.js';
 import { touchConversationSummary } from './conversationSummary.js';
 import { ConversationSummaryRepo } from './conversationSummaryRepo.js';
 import { contactConfig, openContact } from './configSchemas.js';
@@ -31,10 +27,6 @@ import {
 import { SessionRepo } from './sessionRepo.js';
 import type { AgentBackend, TurnHandle } from './types.js';
 import { AffectService } from './affectService.js';
-import type {
-  CoordinationRoomDispatchInput,
-  CoordinationRoomDispatchResult,
-} from './coordinationRoom.js';
 
 export type RoomTurnOutcome = 'spoke' | 'passed' | 'silent' | 'error';
 
@@ -121,9 +113,6 @@ export interface AgentDeps {
   vault: VaultClient | null;
   jobStore: JobStore | null;
   logger?: HubLogger;
-  dispatchCoordinationRoomHost?: (
-    input: CoordinationRoomDispatchInput
-  ) => CoordinationRoomDispatchResult;
 }
 
 /**
@@ -320,13 +309,7 @@ export class AgentRuntime {
     origin?: MessageOrigin;
   }): MessageRow {
     const background = this.stateTrigger?.messageType === 'background-event';
-    const failure = background && fields.kind === 'error';
-    const failureKey = fields.content.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 120);
-    const baseMeta = background
-      ? failure
-        ? { notification: { kind: 'failure', route: 'main', key: `${this.stateTrigger?.eventSource ?? 'background'}:failure:${failureKey}` } }
-        : { uiHidden: true }
-      : {};
+    const baseMeta = background ? { uiHidden: true } : {};
     const meta = {
       ...baseMeta,
       ...(this.replyToMessageId ? { replyToMessageId: this.replyToMessageId } : {}),
@@ -336,7 +319,7 @@ export class AgentRuntime {
     return this.messages.insert(this.convo.id, this.agent.id, {
       ...fields,
       meta,
-      origin: fields.origin ?? (failure ? 'main' : this.stateOrigin),
+      origin: fields.origin ?? this.stateOrigin,
     });
   }
 
@@ -347,41 +330,6 @@ export class AgentRuntime {
     };
     const enriched = this.stateTrigger ? { ...base, trigger: this.stateTrigger } : base;
     return this.messages.update(id, content, status, enriched);
-  }
-
-  private backgroundNotificationSeen(key: string, beforeId?: number): boolean {
-    const minutes = backgroundDedupeMinutes();
-    if (minutes <= 0) return false;
-    const beforeClause = typeof beforeId === 'number' ? ' AND id < ?' : '';
-    const row = this.deps.db.prepare(
-      `SELECT id FROM messages
-       WHERE contact_id = ? AND origin = 'main'
-         AND json_extract(meta, '$.notification.key') = ?
-         AND created_at >= datetime('now', ?)
-         ${beforeClause}
-       ORDER BY id DESC LIMIT 1`
-    ).get(
-      this.convo.id,
-      key,
-      `-${minutes} minutes`,
-      ...(typeof beforeId === 'number' ? [beforeId] : []),
-    );
-    return row !== undefined;
-  }
-
-  private suppressDuplicateBackgroundFailure(row: MessageRow): boolean {
-    if (this.stateTrigger?.messageType !== 'background-event' || row.kind !== 'error') return false;
-    let meta: Record<string, any> = {};
-    try { meta = JSON.parse(row.meta || '{}'); } catch {}
-    const key = typeof meta.notification?.key === 'string' ? meta.notification.key : '';
-    if (!key || !this.backgroundNotificationSeen(key, row.id)) return false;
-    this.messages.update(row.id, row.content, row.status, {
-      ...meta,
-      uiHidden: true,
-      notification: { ...meta.notification, route: 'suppress', duplicate: true },
-    });
-    this.log('duplicate background failure suppressed', { notificationKey: key });
-    return true;
   }
 
   private async run(): Promise<void> {
@@ -441,10 +389,11 @@ export class AgentRuntime {
    */
   async invalidateCliContext(affectedFromId?: number): Promise<void> {
     const cfg = contactConfig(this.agent);
+    // 群聊共享摘要：touch 共享行 member_id=''；DM 传 undefined 以便整 contact 清理/覆盖遗留行。
     const result = touchConversationSummary(
       this.deps.db,
       this.convo.id,
-      this.isRoom ? this.memberId : undefined,
+      this.isRoom ? '' : undefined,
       affectedFromId ?? 0,
       {
         summaryMaxTokens: Math.max(Number(cfg.summaryMaxTokens ?? 3000), 256),
@@ -636,7 +585,7 @@ export class AgentRuntime {
         status: 'done',
         turnId: null,
       });
-      if (!this.suppressDuplicateBackgroundFailure(row)) sse.broadcast('message', row);
+      if (!backgroundTurn) sse.broadcast('message', row);
       this.setState('error', 'crash lockout');
       this.cancelQueued('连续崩溃锁定');
       settleDm({ outcome: 'error', text: row.content, messageId: row.id });
@@ -675,7 +624,7 @@ export class AgentRuntime {
         status: 'done',
         turnId: null,
       });
-      if (!this.suppressDuplicateBackgroundFailure(row)) sse.broadcast('message', row);
+      if (!backgroundTurn) sse.broadcast('message', row);
       this.setState('error', e.message);
       logTiming('error');
       settleDm({ outcome: 'error', text: row.content, messageId: row.id });
@@ -706,12 +655,12 @@ export class AgentRuntime {
     } else if (this.agent.backend === 'api') {
       // API 群历史含最新消息；稳定 history 不再翻转标签，本轮窗口由 manifest 标出。
       turnText = [
-        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch),
+        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id),
         item.mode === 'reaction' ? reactionSuffix : normalSuffix,
       ].join('\n');
     } else {
       turnText = [
-        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch),
+        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id),
         delivery!.promptText,
         item.mode === 'reaction' ? reactionSuffix : normalSuffix,
       ].join('\n');
@@ -815,63 +764,21 @@ export class AgentRuntime {
             const passed = this.isRoom && PASS_RE.test(finalText.trim());
 
             if (backgroundTurn) {
-              const decision = decideBackgroundNotification(finalText, item.kind === 'dm' ? item.sourceMeta : {});
-              const roomResult = decision.route === 'main'
-                && decision.descriptor?.messageType === 'background-event'
-                && this.deps.dispatchCoordinationRoomHost
-                ? this.deps.dispatchCoordinationRoomHost({
-                    targetId: 'claude',
-                    content: `@claude 后台任务通知\n${decision.content}`,
-                    kind: 'background-notification',
-                    duplicateKey: decision.key,
-                    duplicateMinutes: backgroundDedupeMinutes(),
-                    meta: {
-                      notification: {
-                        kind: decision.kind,
-                        key: decision.key,
-                        source: decision.descriptor?.eventSource ?? 'background',
-                        eventId: decision.descriptor?.eventId,
-                        sourceContactId: this.convo.id,
-                      },
-                    },
-                  })
-                : null;
-              const roomPosted = roomResult?.status === 'posted';
-              const duplicate = roomResult?.status === 'duplicate'
-                || (!roomResult && decision.route === 'main' && this.backgroundNotificationSeen(decision.key));
-              const route = duplicate
-                ? 'suppress'
-                : roomPosted
-                  ? 'coordination-room'
-                  : decision.route;
               const row = this.insertMessage({
                 role: 'assistant',
                 kind: 'text',
-                content: decision.content || 'NO_OP',
+                content: finalText.trim() || 'NO_OP',
                 status: 'done',
                 turnId,
-                origin: route === 'main' ? 'main' : 'side',
+                origin: 'side',
                 meta: {
                   usage: ev.usage,
-                  uiHidden: route === 'suppress' || route === 'coordination-room',
-                  notification: {
-                    kind: decision.kind,
-                    route,
-                    key: decision.key,
-                    duplicate,
-                    source: decision.descriptor?.eventSource ?? 'background',
-                    eventId: decision.descriptor?.eventId,
-                  },
+                  uiHidden: true,
                 },
               });
-              if (route !== 'suppress' && route !== 'coordination-room') sse.broadcast('message', row);
-              this.log('background notification routed', {
-                notificationKind: decision.kind,
-                notificationRoute: route,
-                duplicate,
-                eventSource: decision.descriptor?.eventSource,
-                roomId: roomResult?.roomId,
-                roomFallbackReason: roomResult?.status === 'unavailable' ? roomResult.reason : undefined,
+              this.log('background turn archived', {
+                messageId: row.id,
+                eventSource: this.stateTrigger?.eventSource,
               });
             } else if (passed) {
               // 成员选择沉默：内部气泡无审计价值 → 物理删除 + prune（不走 soft-delete）
@@ -968,7 +875,7 @@ export class AgentRuntime {
               status: 'done',
               turnId,
             });
-            if (!this.suppressDuplicateBackgroundFailure(row)) sse.broadcast('message', row);
+            if (!backgroundTurn) sse.broadcast('message', row);
             settleDm({ outcome: 'error', text: ev.message, messageId: row.id });
             if (ev.fatal) {
               this.recordCrash();

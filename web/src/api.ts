@@ -19,7 +19,6 @@ export interface MessageReadState {
 
 export interface MessageReadStates {
   main: MessageReadState;
-  side: MessageReadState;
 }
 
 export interface Contact {
@@ -143,6 +142,8 @@ export interface GrokQuota {
   detail?: string;
   /** 订阅是全产品共享周池，只有一个窗口 */
   weekly?: QuotaWindow | null;
+  /** true 时 weekly/fetchedAt 是上次成功快照，不是本轮新鲜数据 */
+  stale?: boolean;
   fetchedAt?: string;
 }
 
@@ -313,10 +314,10 @@ export const api = {
     return req<{ messages: Message[]; readState: MessageReadState | null }>(`/api/contacts/${contactId}/messages?${q}`);
   },
 
-  markRead: (contactId: string, origin: MessageOrigin, throughMessageId: number) =>
+  markRead: (contactId: string, throughMessageId: number) =>
     req<{ readState: MessageReadState }>(`/api/contacts/${contactId}/messages/read`, {
       method: 'PATCH',
-      body: JSON.stringify({ origin, throughMessageId }),
+      body: JSON.stringify({ origin: 'main', throughMessageId }),
     }),
 
   send: async (
@@ -348,8 +349,8 @@ export const api = {
       body: JSON.stringify(content ? { content } : {}),
     }),
 
-  deleteMessage: (contactId: string, messageId: number) =>
-    req<{ ok: boolean }>(`/api/contacts/${contactId}/messages/${messageId}`, {
+  deleteMessage: (contactId: string, messageId: number, opts: { scope?: 'turn' } = {}) =>
+    req<{ ok: boolean; ids?: number[] }>(`/api/contacts/${contactId}/messages/${messageId}${opts.scope === 'turn' ? '?scope=turn' : ''}`, {
       method: 'DELETE',
     }),
 

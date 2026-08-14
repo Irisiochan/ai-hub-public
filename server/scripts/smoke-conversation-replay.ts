@@ -181,12 +181,24 @@ try {
     });
   }
   const roomCheng = await composer.composeStart(context(claude, room), null);
-  const chengRoomSummary = summaries.get(room.id, claude.id);
-  assert(chengRoomSummary, '群聊摘要必须写入当前成员自己的 member_id');
-  summaries.update(room.id, claude.id, `${chengRoomSummary!.summary}\nA_PRIVATE_SUMMARY`, chengRoomSummary!.through_message_id);
+  // 方案 A：群聊共享摘要 member_id=''，不再 per-member 各滚各的
+  const sharedRoomSummary = summaries.get(room.id, '');
+  assert(sharedRoomSummary, '群聊摘要必须写入共享 member_id=\'\'');
+  assert.equal(sharedRoomSummary!.member_id, '', '群摘要存储键必须是空串');
+  summaries.update(
+    room.id,
+    '',
+    `${sharedRoomSummary!.summary}\nSHARED_ROOM_SUMMARY_MARK`,
+    sharedRoomSummary!.through_message_id
+  );
   const roomCove = await composer.composeStart(context(codex, room), null);
-  assert.doesNotMatch(roomCove.preamble, /A_PRIVATE_SUMMARY/, '群聊成员不得读取另一成员的摘要状态');
-  assert(summaries.get(room.id, codex.id), '第二位群成员应有独立摘要行');
+  // 共享后两位成员读同一行；视角差异只在原文 role 包装，不在摘要存储
+  assert.match(roomCove.preamble, /SHARED_ROOM_SUMMARY_MARK/, '群聊成员应读取同一份共享摘要');
+  assert.equal(
+    summaries.get(room.id, '')?.summary,
+    summaries.getSharedOrLegacy(room.id, codex.id)?.summary,
+    'getSharedOrLegacy 对第二成员应解析到同一共享行'
+  );
   assert.match(roomCheng.preamble, /# 群聊模式/);
 
   const apiPrompt = await composer.composeStart(context(api), null);
@@ -209,7 +221,7 @@ try {
     },
     isolation: {
       dmRows: [claude.id, codex.id, aye.id].map((id) => summaries.get(id, '')?.contact_id),
-      roomMembers: [claude.id, codex.id].map((id) => summaries.get(room.id, id)?.member_id),
+      roomSharedMemberId: summaries.get(room.id, '')?.member_id ?? null,
     },
   }));
 } finally {

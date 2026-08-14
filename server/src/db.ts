@@ -91,7 +91,7 @@ export interface JobRow {
   id: string;
   requested_by: string | null;
   worker_id: string | null;
-  runner: 'codex' | 'claude';
+  runner: 'codex' | 'claude' | 'grok';
   workspace: string;
   prompt: string;
   status: string;
@@ -107,7 +107,7 @@ export interface JobRow {
   delivery_meta: string | null;
   origin_contact_id: string | null;
   origin_anchor_id: number | null;
-  /** JSON: {model?, reasoning?} — 派单时指定的模型和推理强度覆盖 */
+  /** JSON: 执行选项（model/reasoning）与服务端路由审计元数据。 */
   options: string;
   /** 1 = 任务窗口已软删/隐藏（UI 不再展示；行与审计日志保留） */
   deleted: number;

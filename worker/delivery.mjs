@@ -53,11 +53,13 @@ function untrackedFingerprint(cwd, rawStatus) {
 export async function snapshotRepo(cwd) {
   const inside = await runGit(cwd, ['rev-parse', '--is-inside-work-tree']);
   if (inside?.trim() !== 'true') return null;
-  const [head, status, diff, aheadRaw] = await Promise.all([
+  const [head, status, diff, aheadRaw, behindRaw, branchRaw] = await Promise.all([
     runGit(cwd, ['rev-parse', 'HEAD']),
     runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']),
     runGit(cwd, ['diff', '--binary', 'HEAD']),
     runGit(cwd, ['rev-list', '--count', '@{upstream}..HEAD']),
+    runGit(cwd, ['rev-list', '--count', 'HEAD..@{upstream}']),
+    runGit(cwd, ['branch', '--show-current']),
   ]);
   if (head === null || status === null || diff === null) return null;
   const fingerprint = crypto
@@ -73,7 +75,27 @@ export async function snapshotRepo(cwd) {
     dirty: status.length > 0,
     dirtyFiles: statusFiles(status),
     ahead: aheadRaw === null ? null : Number(aheadRaw.trim()) || 0,
+    behind: behindRaw === null ? null : Number(behindRaw.trim()) || 0,
+    branch: branchRaw?.trim() || null,
     fingerprint,
+  };
+}
+
+export function repoDeliveryEvidence(before, after) {
+  return {
+    git: after ? {
+      head: after.head,
+      dirty: after.dirty,
+      dirtyFiles: [...after.dirtyFiles],
+      ahead: after.ahead ?? null,
+      behind: after.behind ?? null,
+      branch: after.branch ?? null,
+    } : null,
+    before: before ? {
+      head: before.head,
+      dirty: before.dirty,
+      ahead: before.ahead ?? null,
+    } : null,
   };
 }
 

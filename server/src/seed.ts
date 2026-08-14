@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { HubConfig } from './config.js';
 import type { Db } from './db.js';
+import type { HubLogger } from './logger.js';
 
 function writeIfMissing(file: string, lines: string[]): void {
   if (fs.existsSync(file)) return;
@@ -9,7 +10,7 @@ function writeIfMissing(file: string, lines: string[]): void {
 }
 
 /** Public first boot: generic contacts only; Compose provides memory automatically. */
-export function seedIfEmpty(db: Db, config: HubConfig): void {
+export function seedIfEmpty(db: Db, config: HubConfig, logger?: HubLogger): void {
   const count = db.prepare('SELECT COUNT(*) AS c FROM contacts').get() as { c: number };
   if (count.c > 0) return;
 
@@ -42,11 +43,11 @@ export function seedIfEmpty(db: Db, config: HubConfig): void {
     })
   );
 
-  console.log('  seeded contact: Claude (claude-cli)');
+  logger?.info({ component: 'seed', contactId: 'claude' }, 'contact seeded');
 }
 
 /** Add a generic Codex contact without modifying existing contacts or sessions. */
-export function ensureCodexContact(db: Db, config: HubConfig): void {
+export function ensureCodexContact(db: Db, config: HubConfig, logger?: HubLogger): void {
   const codexDir = path.join(config.agentsDir, 'codex');
   fs.mkdirSync(codexDir, { recursive: true });
   writeIfMissing(path.join(codexDir, 'AGENTS.md'), [
@@ -78,5 +79,32 @@ export function ensureCodexContact(db: Db, config: HubConfig): void {
     })
   );
 
-  console.log('  seeded contact: Codex (codex)');
+  logger?.info({ component: 'seed', contactId: 'codex' }, 'contact seeded');
+}
+
+/** Add a generic Grok CLI contact without modifying existing contacts or sessions. */
+export function ensureGrokContact(db: Db, config: HubConfig, logger?: HubLogger): void {
+  const grokDir = path.join(config.agentsDir, 'grok');
+  fs.mkdirSync(grokDir, { recursive: true });
+
+  const existing = db.prepare('SELECT id FROM contacts WHERE id = ?').get('grok');
+  if (existing) return;
+
+  db.prepare(
+    `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
+     VALUES (?, ?, ?, ?, ?, 'dm', ?, 2)`
+  ).run(
+    'grok',
+    'Grok Build',
+    '⚡',
+    '#6e7681',
+    'grok-cli',
+    JSON.stringify({
+      cwd: 'grok',
+      appendSystemPrompt:
+        'You are chatting through ai-hub. Keep replies natural and direct. Do not use shell or file-writing tools unless project access is explicitly enabled.',
+    })
+  );
+
+  logger?.info({ component: 'seed', contactId: 'grok' }, 'contact seeded');
 }

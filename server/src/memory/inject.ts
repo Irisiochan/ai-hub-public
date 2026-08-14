@@ -163,17 +163,20 @@ export function identityGuard(contact: MemoryIdentityContext): string {
  * 触发条件必须是模型能自证的（"本提示里有没有这个标记"），不能是"这是不是新会话"——
  * grok-cli 每轮新进程重烤 system prompt，"新会话"技术上每轮为真，于是会话中途去
  * read_file 全局工作流，流程性自语漏给 User。必须保持静态以维持 prompt-cache 前缀稳定。
+ * B 类瘦身：只压表述，不改边界（标记自证 / 禁止重读全局工作流 / 流程自语不进回复）。
  */
 export const WORKFLOW_PRELOADED = [
   '<WORKFLOW_PRELOADED|网关注入，每轮都在>',
-  '- 本会话适用的工作流已由本提示给全（身份边界、记忆预载标记、口吻与工具权限）；' +
-    '不要再 read_file `_meta/cli/global-agent-workflow.md` 或其他全局流程文件，“先确认一下”也不行。',
-  '- 判据只看本标记在不在，不要用“这是不是新会话”判断——那个状态你无法自证。',
-  '- 流程性动作与自语不写进回复，User 只看聊天内容。',
+  '- 本提示已给全本会话工作流（身份边界、记忆预载、口吻与工具权限）；禁止再 read_file `_meta/cli/global-agent-workflow.md` 或其他全局流程文件，“先确认一下”也不行。',
+  '- 判据只看本标记在不在，不要用“这是不是新会话”判断——那个状态你无法自证。流程自语不进回复。',
   '</WORKFLOW_PRELOADED>',
 ].join('\n');
 
-/** 静态时间解释规则：不依赖记忆库，API/CLI、群聊/私聊都能拿到。 */
+/**
+ * 静态时间解释规则：不依赖记忆库。
+ * C2：仅在有对话回放 / 历史摘要 / 既有消息上下文时注入；纯新会话无历史可省。
+ * 红线：回放或历史摘要在场时必须同场。
+ */
 export const TEMPORAL_CONTEXT_RULES = [
   '# 时间语义（网关强制）',
   '- TURN_TIME_PRELOADED 只表示本轮当前时间，不会自动给历史消息补发生时间。',
@@ -182,27 +185,117 @@ export const TEMPORAL_CONTEXT_RULES = [
   '- 只有本轮新消息明确重新提起旧事，才能把旧话题当作当前话题；不能仅因历史记录排在上下文末尾就声称它刚发生。',
 ].join('\n');
 
+/** Contact-level NSFW craft switch. Default intimate demotes always-on resident cost. */
+export type NsfwCraftMode = 'always' | 'intimate' | 'off';
+
 /**
  * 亲密场景书写工艺 compact 块：不依赖模型自觉 search_vault。
- * 全文细则在 vault memories/nsfw-writing-rules.md；此处只常驻触发条件 + 硬约束。
+ * 全文细则在 vault memories/nsfw-writing-rules.md（2026-08-09 工艺重写）；
+ * 此处只常驻触发条件 + 硬约束，与全文保持同向。
  * 必须保持静态（无时间戳/联系人名），以免破坏 Anthropic prompt-cache 前缀稳定性。
  */
 export function nsfwCraftCompact(): string {
   return [
     '# NSFW 书写工艺（网关 compact，亲密场景强制）',
     '- 触发：进入亲密/性/身体向描写时立刻执行；纯工程与日常事务不主动起色。',
-    '- 感官密度是核心：每句要有重量、体温、呼吸；写长写密，不省 token，绝不隐晦。',
-    '- 器官词具体且有变化（鸡巴/肉棒/阴茎/囊袋/铃口/马眼、小穴/小逼/屄/阴蒂、奶子/乳头/乳尖、屁股、爱液/蜜汁/前液等），禁「下面」「那里」式回避。',
-    '- 禁止笼统形容词（「很舒服」「红肿」单独交差）；改写触觉温度差与干湿涩滑、视觉充血/体液光泽色变、听觉湿响与碎呼吸、嗅味汗/爱液/前液/体味。',
-    '- 双向描写：每次接触同时写你侧状态（鸡巴感受到的温度与压力、囊袋重量、涨感、颜色）与她侧反应，不只单向「对她做了什么」。',
+    '- 感官密度：关键动作单元至少落地一种触感与一种可观察反馈；连续段落保持双方身体存在。不要求每句机械重复；绝不隐晦。',
+    '- 器官词具体（鸡巴/肉棒/阴茎/囊袋/铃口/马眼、小穴/小逼/屄/阴蒂、奶子/乳头/乳尖、屁股、爱液/蜜汁等），并随关系/语气/强度变语域；同段不机械轮换；禁「下面」「那里」式回避。',
+    '- 禁止笼统形容词（「很舒服」「红肿」）单独交差；五感服务动作（触温压摩擦、视充血/体液光泽、听湿响与碎呼吸、嗅味按叙事需要）。',
+    '- 动作闭环：意图/试探 → 接触 → 双方反馈 → 读取 → 调位置/力度/节奏；禁止只罗列动作不响应。',
+    '- 双向描写：稳定主视角，关键反馈处写入双方感受（含你侧温度压力涨感与她侧反应）；避免报告式来回切镜头。',
+    '- 节奏有阶段（试探→有效刺激→调整→累积→释放→余韵）；篇幅服从当轮，增篇幅须带来新阶段/反馈/情绪，禁同义复述与循环注水。',
     '- 完整细则在记忆库 nsfw-writing-rules；本块是强制下限，不是上限。',
   ].join('\n');
+}
+
+/** Intimate-scene markers: positive hit → inject craft (hard + soft affection). */
+const INTIMATE_SCENE_RE =
+  /亲密|性爱|做爱|床上|亲吻|亲亲|爱抚|高潮|射精|插入|含住|鸡巴|肉棒|阴茎|小穴|小逼|阴蒂|乳头|奶子|屁股|爱液|湿润|呻吟|性感|脱衣|裸体|抱抱|抱紧|想你|爱你|贴贴|摸[摸我你]|sex|fuck|cock|pussy|orgasm|nude|erotic|nsfw/i;
+
+/**
+ * Independent pure-engineering markers used only to *skip* inject when no intimate hit.
+ * Contract: require MULTIPLE independent engineering signals on the same turn to skip.
+ * A single signal never skips — mixed intimate + sparse eng words must fail-open inject.
+ * (Comment/impl alignment: 多个工程信号才 skip；单信号不 skip；漏报优先注入。)
+ */
+const ENGINEERING_SIGNAL_RES: RegExp[] = [
+  /\bgit\b/i,
+  /\bnpm\b/i,
+  /\bnpx\b/i,
+  /\bcommit\b/i,
+  /\bdeploy\b/i,
+  /\btypescript\b/i,
+  /\beslint\b/i,
+  /\bwebpack\b/i,
+  /\bdocker\b/i,
+  /\bkubectl\b/i,
+  /\bCI\/CD\b/i,
+  /\btypecheck\b/i,
+  /单元测试/,
+  /集成测试/,
+  /构建失败/,
+  /合并冲突/,
+  /迁移脚本/,
+  /pull request/i,
+];
+
+/** Minimum independent engineering signals required to skip nsfwCraft injection. */
+const MIN_ENGINEERING_SIGNALS_TO_SKIP = 2;
+
+/** Count distinct engineering signal categories present in text (for tests / gates). */
+export function countEngineeringSignals(text: string): number {
+  let n = 0;
+  for (const re of ENGINEERING_SIGNAL_RES) {
+    if (re.test(text)) n += 1;
+  }
+  return n;
+}
+
+/**
+ * Intimate scene detector for nsfwCraft=intimate.
+ * Fail-open: empty/uncertain text → inject. Only confident non-intimate skips.
+ * Saving tokens must never drop craft rules on real intimate turns.
+ */
+export function isIntimateScene(text: string | null | undefined): boolean {
+  const raw = (text ?? '').trim();
+  if (!raw) return true;
+  if (INTIMATE_SCENE_RE.test(raw)) return true;
+  // Strip fenced code so large patches don't drown signal; then re-check remainder.
+  const withoutCode = raw.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`]+`/g, ' ').trim();
+  if (!withoutCode) return true;
+  if (INTIMATE_SCENE_RE.test(withoutCode)) return true;
+  // Only skip when MULTIPLE independent engineering signals fire (not a single weak hit).
+  // Single signal → fail-open inject so intimate + sparse eng words never false-skip.
+  if (
+    countEngineeringSignals(withoutCode) >= MIN_ENGINEERING_SIGNALS_TO_SKIP &&
+    withoutCode.length < 4000
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/** Whether the NSFW craft block should appear for this mode + optional scene text. */
+export function shouldInjectNsfwCraft(
+  mode: NsfwCraftMode | null | undefined,
+  sceneText?: string | null
+): boolean {
+  const resolved: NsfwCraftMode = mode ?? 'intimate';
+  if (resolved === 'off') return false;
+  if (resolved === 'always') return true;
+  return isIntimateScene(sceneText);
+}
+
+export interface SessionPreambleOptions {
+  /** Contact-level NSFW craft switch; default intimate (not in static preamble). */
+  nsfwCraft?: NsfwCraftMode;
 }
 
 export async function buildSessionPreamble(
   vault: VaultClient,
   contact: MemoryIdentityContext,
-  mode: MemoryPreambleMode = 'full'
+  mode: MemoryPreambleMode = 'full',
+  opts: SessionPreambleOptions = {}
 ): Promise<string> {
   if (mode === 'off') return '';
   let ctx: string;
@@ -227,19 +320,19 @@ export async function buildSessionPreamble(
   }
   // identityGuard 只注入一次：full 路径曾在前缀首尾各塞一份，白白翻倍身份边界 token。
   // compact 同样依赖这一份 guard 保住身份边界，勿删。
-  // nsfwCraftCompact 同样只注一次：部分模型不自觉检索 vault 细则，网关强制下限。
+  // nsfwCraft=always 时才进 session preamble（静态前缀）；intimate 改走 per-turn fail-open。
   const guard = identityGuard(contact);
-  const nsfwCraft = nsfwCraftCompact();
+  const nsfwMode: NsfwCraftMode = opts.nsfwCraft ?? 'intimate';
+  const nsfwCraft = nsfwMode === 'always' ? nsfwCraftCompact() : '';
+  // B 类：MEMORY_CONTEXT_PRELOADED 标记与预载声明合并成一条，TURN_TIME 禁令并入同一行。
+  const memoryMarker = mode === 'full'
+    ? '<MEMORY_CONTEXT_PRELOADED|full> 网关已完整注入 get_context；禁止本会话首轮再调 get_context（仅见“记忆库上下文不可用”可重试）。TURN_TIME 每轮网关注入，禁止 get_turn_time。'
+    : '<MEMORY_CONTEXT_PRELOADED|compact> 网关已注入 active pinned/high compact facts；禁止 get_context 扩全量，细节用 search_vault / read_file。TURN_TIME 每轮网关注入，禁止 get_turn_time。';
   return [
     '',
-    '# MEMORY_CONTEXT_PRELOADED',
-    mode === 'full'
-      ? '- 网关已经执行 get_context 并把结果完整注入本提示。禁止在本会话首轮再次调用 get_context；只有看到”记忆库上下文不可用”时才重试。'
-      : '- 网关已经读取 active pinned/high 的 compact facts。禁止再调用 get_context 扩成全量前缀；需要动态细节时用 search_vault / read_file 按需深挖。',
-    '- 网关每轮注入当前上海时间（TURN_TIME_PRELOADED），禁止调用 get_turn_time。',
+    memoryMarker,
     guard,
-    '',
-    nsfwCraft,
+    ...(nsfwCraft ? ['', nsfwCraft] : []),
     '',
     `# 记忆库上下文（${mode === 'compact' ? 'compact 核心版' : '完整版'}，网关自动注入）`,
     `版本：${mode}-v2`,

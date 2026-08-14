@@ -9,7 +9,10 @@ import {
 import type { GatewayTool } from '../gatewayTools.js';
 import { estimateTokens } from '../tokenEstimate.js';
 import { chooseKeepFrom } from '../historyPolicy.js';
-import { ConversationSummaryRepo } from '../conversationSummaryRepo.js';
+import {
+  ConversationSummaryRepo,
+  SHARED_SUMMARY_MEMBER_ID,
+} from '../conversationSummaryRepo.js';
 import { MessageRepo } from '../messageRepo.js';
 import { quotedRoomMessage } from '../roomPrompt.js';
 import { historicalMessageText } from '../sideChannel.js';
@@ -33,8 +36,16 @@ import type {
   PromptCachePolicy,
 } from './provider.js';
 import { ProviderHttpError } from './provider.js';
+import {
+  compressToolResultForInjection,
+  TOOL_RESULT_MAX_CHARS,
+} from '../selectiveCompress.js';
 
 export { estimateTokens } from '../tokenEstimate.js';
+export {
+  compressToolResultForInjection,
+  TOOL_RESULT_MAX_CHARS,
+} from '../selectiveCompress.js';
 
 export interface DirectApiBackendOpts {
   provider: 'anthropic' | 'openai-compat' | 'gemini';
@@ -86,17 +97,17 @@ export interface DirectApiBackendOpts {
 
 /** 每轮 turn 内最多几趟工具往返，防模型翻档案翻上瘾 */
 export const MAX_TOOL_ROUNDS = 4;
-/**
- * 单次工具结果回填上限（字符）。
- * 12k × 最多 4 轮会把后续 prompt 再撑十几～几十 k；5k 仍够装一段核心记忆
- * / 检索片段，截断后模型可继续用 search_vault / read_file 按需深挖。
- */
-export const TOOL_RESULT_MAX_CHARS = 5_000;
 
 /**
  * 摘要触发后一次压到低水位，给后续 turn 留出 headroom。
  * 这样 rolling summary 不会在达到 maxHistoryMessages 后每轮改写，API provider
  * 才能连续复用 system + summary + recent history 的相同前缀。
+ *
+ * Cache 前缀保护（token round2 主线 1）：
+ * - system/memory static 与 tools JSON 在整个会话内字节稳定；
+ * - 已冻结 summary 在两次 rollover 之间字节稳定（见 compactSummaryText 追加语义）；
+ * - rollover 只把被淘汰的原文压进 summary 后缀区，不得重写 static preamble；
+ * - 无变更时 summaries.upsert 不 bump version。
  */
 export const SUMMARY_ROLLOVER_KEEP_RATIO = 0.8;
 
@@ -410,8 +421,14 @@ export class DirectApiBackend implements AgentBackend {
     currentMessageId?: number,
     roomMessageIds: readonly number[] = []
   ): HistoryBuild {
-    const memberId = this.opts.memberId ?? '';
-    let saved = this.summaries.get(this.opts.contactId, memberId);
+    // 群聊共享摘要（方案 A）：一律写/读 member_id=''，不再按 agent 各存一份。
+    // opts.memberId 仅作遗留 per-member 行的只读回落键。
+    const storageMemberId = SHARED_SUMMARY_MEMBER_ID;
+    const legacyMemberId = this.opts.roomMode ? (this.opts.memberId ?? '') : '';
+    let saved = this.summaries.getSharedOrLegacy(
+      this.opts.contactId,
+      legacyMemberId || undefined
+    );
     if (saved && summaryNeedsTimeAnchorUpgrade(saved.summary)) {
       const sourceRows = this.summaries.rowsThrough(
         this.opts.contactId,
@@ -419,18 +436,26 @@ export class DirectApiBackend implements AgentBackend {
       );
       if (sourceRows.length > 0) {
         const rebuilt = this.compactSummary('', sourceRows);
-        this.summaries.update(
+        // 必须 upsert 到共享键：遗留 per-member 行存在时 shared 行可能尚不存在，
+        // 纯 UPDATE 会变成空操作，旧摘要永远升不了 time-anchor-v1。
+        this.summaries.upsert(
           this.opts.contactId,
-          memberId,
+          storageMemberId,
           rebuilt,
           sourceRows[sourceRows.length - 1].id
         );
         this.opts.log(`history summary upgraded to time-anchor-v1 rows=${sourceRows.length}`);
       } else {
-        this.summaries.delete(this.opts.contactId, memberId);
+        this.summaries.delete(this.opts.contactId, storageMemberId);
+        if (legacyMemberId && legacyMemberId !== storageMemberId) {
+          this.summaries.delete(this.opts.contactId, legacyMemberId);
+        }
         this.opts.log('history summary upgrade dropped an expired legacy summary');
       }
-      saved = this.summaries.get(this.opts.contactId, memberId);
+      saved = this.summaries.getSharedOrLegacy(
+        this.opts.contactId,
+        legacyMemberId || undefined
+      );
       this.historyCache = null;
     }
     const summaryVersion = saved?.version ?? 0;
@@ -447,17 +472,34 @@ export class DirectApiBackend implements AgentBackend {
     );
 
     const room = this.opts.roomMode;
+    const currentRoomMessageIds = new Set(roomMessageIds);
+    const roomRowText = (row: MessageRow): string => currentRoomMessageIds.has(row.id)
+      ? row.content
+      : historicalMessageText(row);
+    // 成员视角序列化：自己→assistant 原文，他人→引用包装（仅影响最终发给模型的原文区）。
     const serializedRowText = (row: MessageRow): string => {
       if (!room) return timestampedMessage(historicalMessageText(row), row.created_at, '历史消息');
       return row.sender === room.selfId
-        ? timestampedMessage(row.content, row.created_at, '历史消息')
+        ? timestampedMessage(roomRowText(row), row.created_at, '历史消息')
         : quotedRoomMessage({
           senderId: row.sender,
           senderName: room.nameOf(row.sender),
-          content: row.content,
+          content: roomRowText(row),
           createdAt: row.created_at,
           temporal: '历史消息',
         });
+    };
+    // 共享摘要合约：keepFrom/预算选择用成员中立序列化，避免 N 成员因 self 包装差异
+    // 算出不同 drop 窗口 thrash 共享 version。
+    const budgetRowText = (row: MessageRow): string => {
+      if (!room) return timestampedMessage(historicalMessageText(row), row.created_at, '历史消息');
+      return quotedRoomMessage({
+        senderId: row.sender,
+        senderName: room.nameOf(row.sender),
+        content: roomRowText(row),
+        createdAt: row.created_at,
+        temporal: '历史消息',
+      });
     };
 
     let summary = saved?.summary ?? '';
@@ -478,7 +520,7 @@ export class DirectApiBackend implements AgentBackend {
       const rawBudget = this.effectiveHistoryBudget(summaryBlock);
       const tokenBudget = Math.max(512, Math.floor(rawBudget * budgetRatio));
       return chooseKeepFrom(
-        rows.map((row) => ({ content: serializedRowText(row) })),
+        rows.map((row) => ({ content: budgetRowText(row) })),
         minimum,
         maxMessages,
         tokenBudget
@@ -487,6 +529,8 @@ export class DirectApiBackend implements AgentBackend {
 
     keepFrom = selectKeepFrom();
     // extractive / external 都走本地滚动摘要；external 仅表示「允许将来接 LLM」，当前不外发
+    // 实证（P2 第 0 步）：upsert 只在 keepFrom>0（真正需要 rollover）时触发，
+    // 并非每次 history() 无条件调用；但顶满水位后每轮新消息都会 keepFrom>0 → 每轮 upsert。
     while (this.opts.historySummaryStrategy !== 'off' && keepFrom > 0) {
       // 高水位触发后不要只丢本轮溢出的 1–2 条，否则 summary/version 会每轮变化，
       // 把 Gemini/Anthropic 可复用的 request prefix 逐轮打碎。一次压到 80% 的消息/预算
@@ -510,13 +554,16 @@ export class DirectApiBackend implements AgentBackend {
       const dropped = rows.splice(0, dropCount);
       summary = this.compactSummary(summary, dropped);
       const through = dropped[dropped.length - 1].id;
-      this.summaries.upsert(this.opts.contactId, memberId, summary, through);
+      this.summaries.upsert(this.opts.contactId, storageMemberId, summary, through);
       keepFrom = selectKeepFrom();
     }
 
     // strategy=off 时仍按预算/条数裁掉旧原文，只是不持久化摘要。
     const kept = rows.slice(keepFrom);
-    const finalSaved = this.summaries.get(this.opts.contactId, memberId);
+    const finalSaved = this.summaries.getSharedOrLegacy(
+      this.opts.contactId,
+      legacyMemberId || undefined
+    );
     this.historyCache = {
       summaryVersion: finalSaved?.version ?? 0,
       throughMessageId: finalSaved?.through_message_id ?? 0,
@@ -666,7 +713,6 @@ export class DirectApiBackend implements AgentBackend {
     if (extra) {
       try {
         out = await extra.exec(input);
-        out = { ...out, text: out.text.slice(0, TOOL_RESULT_MAX_CHARS) };
       } catch (e: any) {
         out = { ok: false, text: `工具调用失败：${e.message}` };
       }
@@ -675,10 +721,21 @@ export class DirectApiBackend implements AgentBackend {
     } else {
       try {
         const text = await this.opts.vault.call(name, input, 0);
-        out = { ok: true, text: text.slice(0, TOOL_RESULT_MAX_CHARS) || '(空结果)' };
+        out = { ok: true, text: text || '(空结果)' };
       } catch (e: any) {
         out = { ok: false, text: `工具调用失败：${e.message}` };
       }
+    }
+    // 注入前选择性压缩：猛砍 dump/重复日志，保护失败断言/路径/diff（禁止无差别砍 80%）。
+    const compressed = compressToolResultForInjection(out.text, { maxChars: TOOL_RESULT_MAX_CHARS });
+    out = { ...out, text: compressed.text };
+    if (compressed.meta.truncated) {
+      this.opts.log(
+        `tool ${name} selective-compress ` +
+        `${compressed.meta.originalChars}→${compressed.meta.finalChars}` +
+        ` dupes=${compressed.meta.collapsedDupes}` +
+        ` protected=${compressed.meta.protectedLinesKept}`
+      );
     }
     this.opts.log(`tool ${name}(${JSON.stringify(input).slice(0, 120)}) → ${out.ok ? 'ok' : 'fail'}`);
     queue.push({ type: 'tool_result', name, ok: out.ok, summary: out.text.slice(0, 120) });

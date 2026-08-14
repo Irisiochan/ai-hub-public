@@ -53,17 +53,19 @@ check('工具清单 4 件套', tools.tools.map((t) => t.name).sort().join(',') =
 const delegateSchema: any = tools.tools.find((tool) => tool.name === 'delegate_to_worker')?.inputSchema;
 check('Hub MCP 委派 schema 暴露 ssh 参数', delegateSchema?.properties?.ssh?.type === 'boolean');
 check('Hub MCP 委派 schema 暴露 write 参数', delegateSchema?.properties?.write?.type === 'boolean');
+check('Hub MCP 委派 schema 要求 route_class', delegateSchema?.required?.includes('route_class'));
+check('Hub MCP 委派 schema 的 runner 可选', !delegateSchema?.required?.includes('runner'));
 
 const bad: any = await client.callTool({
   name: 'delegate_to_worker',
-  arguments: { runner: 'claude', workspace: '/etc', prompt: 'x' },
+  arguments: { route_class: 'implement', workspace: '/etc', prompt: 'x' },
 });
 check('越界调用 isError', bad.isError === true && String(bad.content?.[0]?.text).includes('白名单'));
 
 const good: any = await client.callTool({
   name: 'delegate_to_worker',
   arguments: {
-    runner: 'claude',
+    route_class: 'implement',
     workspace: ws,
     prompt: '把 README 错别字修了并 commit，然后部署到测试 VPS',
     ssh: true,

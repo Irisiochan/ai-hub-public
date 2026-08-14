@@ -10,8 +10,10 @@ import {
   extractDeliveryDeclaration,
   isGitAncestor,
   reconciliationDecision,
+  repoDeliveryEvidence,
   snapshotRepo,
 } from './delivery.mjs';
+import { acquireInstanceLock } from './instance-lock.mjs';
 import { buildRunnerSpec, supportsResume } from './runner.mjs';
 import { loadState, saveWorkerSpool } from './state-store.mjs';
 
@@ -63,35 +65,34 @@ const workspaceEntries = (cfg.workspaces ?? []).flatMap((entry) => {
 const auth = { Authorization: `Bearer ${cfg.token}`, 'Content-Type': 'application/json' };
 
 // Two live worker processes against one worker row ping-pong the gateway's
-// boot_id and double-claim capacity, so refuse to start when the state file's
-// lock holder is still alive (2026-08-06 pause-doesn't-stick incident).
+// boot_id and double-claim capacity (2026-08-06 pause-doesn't-stick incident).
+// Atomic 'wx' acquire + heartbeat lease lives in instance-lock.mjs; stale
+// crash leftovers self-expire, so no manual lock deletion in the normal path.
 // `${statePath}.lock` is taken by the state-store's short-lived write lease.
 const lockPath = `${statePath}.instance.lock`;
-function acquireSingleInstanceLock() {
-  try {
-    const existing = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    if (existing?.pid && existing.pid !== process.pid) {
-      let alive = false;
-      try { process.kill(existing.pid, 0); alive = true; } catch {}
-      if (alive) {
-        console.error(
-          `another PC Worker (pid ${existing.pid}, since ${existing.startedAt}) already uses ${statePath}; ` +
-          `exiting. If that pid is not a worker, delete ${lockPath} and retry.`
-        );
-        process.exit(3);
-      }
-    }
-  } catch {}
-  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }), 'utf8');
+const instanceLock = acquireInstanceLock(lockPath);
+if (!instanceLock.acquired) {
+  const holder = instanceLock.holder ?? {};
+  console.error(
+    `another PC Worker (pid ${holder.pid ?? 'unknown'}, since ${holder.startedAt ?? 'unknown'}) already uses ${statePath}; ` +
+    `exiting. A crashed holder expires by itself within its lease; only delete ${lockPath} if you are sure no worker is running.`
+  );
+  process.exit(3);
 }
-function releaseSingleInstanceLock() {
+const instanceLockHeartbeat = setInterval(() => {
   try {
-    const existing = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    if (existing?.pid === process.pid) fs.unlinkSync(lockPath);
-  } catch {}
-}
-acquireSingleInstanceLock();
-process.on('exit', releaseSingleInstanceLock);
+    if (instanceLock.refresh()) return;
+    console.error('instance lock was taken over by another worker process; exiting to avoid double-claiming');
+    process.exit(3);
+  } catch (error) {
+    console.error(`instance lock heartbeat failed: ${error.message}`);
+  }
+}, 10_000);
+instanceLockHeartbeat.unref();
+process.on('exit', () => {
+  clearInterval(instanceLockHeartbeat);
+  instanceLock.release();
+});
 const estimatedBootMs = Date.now() - os.uptime() * 1000;
 const bootId = process.env.AI_HUB_WORKER_BOOT_ID
   || `${os.hostname()}:${Math.round(estimatedBootMs / 60_000)}`;
@@ -432,10 +433,13 @@ async function execute(job, options = {}) {
   }
   if (stdout.trim()) parseLine(job, stdout, state);
   const repoAfter = await snapshotRepo(job.workspace);
-  const delivery = classifyDelivery(repoBefore, repoAfter, exit.code, {
-    deliveryMode: workspace.deliveryMode,
-    declaration: state.deliveryDeclared,
-  });
+  const delivery = {
+    ...classifyDelivery(repoBefore, repoAfter, exit.code, {
+      deliveryMode: workspace.deliveryMode,
+      declaration: state.deliveryDeclared,
+    }),
+    ...repoDeliveryEvidence(repoBefore, repoAfter),
+  };
   if (state.action === 'pause') return { status: 'paused', result: state.result, delivery };
   if (state.action === 'cancel') return { status: 'interrupted', result: state.result, delivery };
   if (delivery.state === 'blocked_local_changes' || delivery.state === 'blocked_unpushed') {

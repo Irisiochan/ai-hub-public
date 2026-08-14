@@ -63,6 +63,9 @@ const commonShape = {
     valence: z.coerce.number().min(-0.6).max(1).default(0),
     arousal: z.coerce.number().min(0).max(1).default(0.15),
   }).default({}),
+  // NSFW craft block: always = session preamble; intimate = per-turn fail-open scene gate; off = never.
+  // Default intimate demotes the old always-on resident cost; partners keep craft via fail-open detection.
+  nsfwCraft: z.enum(['always', 'intimate', 'off']).default('intimate'),
   maxSessionInputTokens: positiveInt(120_000, 10_000_000),
   roomDeliveryMaxChars: positiveInt(12_000, 200_000),
   roomDeliveryMaxMessages: positiveInt(40, 200),

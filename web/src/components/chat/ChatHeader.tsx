@@ -2,29 +2,24 @@ import { useEffect, useState } from 'react';
 import {
   type Contact,
   type ContactStatus,
-  type MessageOrigin,
 } from '../../api';
 import { statusText } from '../../statusText';
 
 interface Props {
   contact: Contact;
   status: ContactStatus;
-  channel: MessageOrigin;
-  sideUnread: boolean;
-  sideCount?: number;
   runtimeOpen: boolean;
   onBack(): void;
-  onToggleChannel(): void;
   onToggleRuntime(): void;
 }
 
 /**
- * 方案 1b：header 只剩「返回 · 名字 · 状态点 · 主窗/后台分段 · 运行时」。
+ * 方案 1b：header 只剩「返回 · 名字 · 状态点 · 运行时」。
  * 模型、推理强度、批量、额度、token、联系人设置全部搬进 RuntimeDrawer；
  * 打断挪到 Composer 的发送键位（.send-btn.stop）。
  */
 export default function ChatHeader(props: Props) {
-  const { contact, status, channel } = props;
+  const { contact, status } = props;
   const isRoom = contact.kind === 'room';
   const busy =
     status.state === 'thinking' || status.state === 'streaming' || status.state.startsWith('tool:');
@@ -52,31 +47,6 @@ export default function ChatHeader(props: Props) {
         <span className="chat-status">{statusLabel}</span>
       </div>
       <div className="chat-header-controls">
-        {!isRoom && (
-          <div className="seg" role="tablist" aria-label="主窗 / 后台">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={channel === 'main'}
-              className={'seg-btn' + (channel === 'main' ? ' selected' : '')}
-              onClick={() => channel !== 'main' && props.onToggleChannel()}
-            >
-              主窗
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={channel === 'side'}
-              className={'seg-btn' + (channel === 'side' ? ' selected' : '')}
-              onClick={() => channel !== 'side' && props.onToggleChannel()}
-            >
-              后台
-              {channel === 'main' && props.sideUnread && (
-                <span className="side-unread-dot" aria-label="后台有未读消息" />
-              )}
-            </button>
-          </div>
-        )}
         <button
           type="button"
           className={'runtime-btn' + (props.runtimeOpen ? ' open' : '')}

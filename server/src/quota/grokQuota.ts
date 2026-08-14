@@ -15,6 +15,8 @@ export interface GrokQuotaStatus {
   detail?: string;
   /** 订阅制是全产品共享的周池（百分比计），只有这一个窗口 */
   weekly?: GrokQuotaWindow | null;
+  /** 最近一次轮询失败或样本不完整；weekly/fetchedAt 是 last-good 快照 */
+  stale?: boolean;
   fetchedAt?: string;
 }
 
@@ -113,11 +115,42 @@ export interface GrokCreditsParse {
   resetsAtSec: number | null;
 }
 
+export type GrokQuotaMissingField = 'usedPercent' | 'resetsAt';
+
+export type GrokQuotaSample =
+  | { ok: true; weekly: GrokQuotaWindow }
+  | { ok: false; missingFields: GrokQuotaMissingField[] };
+
+/** 只有百分比与重置时间都真实出现时才发布，避免把 proto3 缺省值猜成满池。 */
+export function normalizeGrokQuotaSample(parsed: GrokCreditsParse): GrokQuotaSample {
+  const missingFields: GrokQuotaMissingField[] = [];
+  if (parsed.usedPercent === null) missingFields.push('usedPercent');
+  if (parsed.resetsAtSec === null) missingFields.push('resetsAt');
+  if (missingFields.length > 0) return { ok: false, missingFields };
+  const usedPercent = parsed.usedPercent as number;
+  const resetsAtSec = parsed.resetsAtSec as number;
+
+  return {
+    ok: true,
+    weekly: {
+      remainingPct: Math.max(0, Math.min(100, Math.round(100 - usedPercent))),
+      resetsAt: new Date(resetsAtSec * 1000).toISOString(),
+    },
+  };
+}
+
+class GrokCreditsParseError extends Error {
+  constructor() {
+    super('unparseable credits response');
+    this.name = 'GrokCreditsParseError';
+  }
+}
+
 /**
  * GetGrokCreditsConfig 响应（gRPC-web framed 或裸 protobuf）→ 用量。
  * 端点未公开，字段号是从真机样本 + CLI 二进制字段名反推的，全部宽容解析：
  * - creditUsagePercent：顶层 config 的 field 1；线上当前是 float，
- *   兼容旧样本中的 double（0% 时按 proto3 被省略）
+ *   兼容旧样本中的 double；0% 省略时无法和字段缺失区分，因此不猜默认值
  * - 兜底：两个 {val} 包装（monthlyLimit/totalUsed）能除出百分比就用
  * - resetsAt：config 里能解出的最大 Timestamp（周期结束）
  */
@@ -183,14 +216,12 @@ export function parseGrokCredits(body: Buffer): GrokCreditsParse {
         const [limit, used] = wrappers;
         if (limit.val > 0) usedPercent = Math.min(100, (used.val / limit.val) * 100);
       }
-      // 0% 时 creditUsagePercent 整个被省略——解析成功但没数就是 0
-      if (usedPercent === null) usedPercent = 0;
       return { usedPercent, resetsAtSec };
     } catch {
       continue;
     }
   }
-  throw new Error('unparseable credits response');
+  throw new GrokCreditsParseError();
 }
 
 /**
@@ -203,13 +234,23 @@ export function parseGrokCredits(body: Buffer): GrokCreditsParse {
  */
 export class GrokQuotaPoller {
   private data: { weekly: GrokQuotaWindow | null; fetchedAt: string } | null = null;
+  private stale = false;
   private timer: NodeJS.Timeout | null = null;
   private failures = 0;
   private skipUntil = 0;
   private lastReason: GrokQuotaReason | undefined;
   private lastDetail: string | undefined;
 
-  constructor(private log: (msg: string) => void) {}
+  constructor(
+    private log: (msg: string) => void,
+    private warn: (msg: string, fields: {
+      at: string;
+      contact: string;
+      backend?: string;
+      missingFields: string[];
+      detail?: string;
+    }) => void = (msg, fields) => log(`${msg}: ${JSON.stringify(fields)}`),
+  ) {}
 
   start(intervalMs = 300_000): void {
     void this.poll();
@@ -222,7 +263,14 @@ export class GrokQuotaPoller {
   }
 
   get(): GrokQuotaStatus {
-    if (this.data) return { available: true, weekly: this.data.weekly, fetchedAt: this.data.fetchedAt };
+    if (this.data) {
+      return {
+        available: true,
+        weekly: this.data.weekly,
+        fetchedAt: this.data.fetchedAt,
+        ...(this.stale ? { stale: true, detail: this.lastDetail } : {}),
+      };
+    }
     return { available: false, reason: this.lastReason ?? 'no-token', detail: this.lastDetail };
   }
 
@@ -237,6 +285,7 @@ export class GrokQuotaPoller {
   private async poll(): Promise<void> {
     const token = this.token();
     if (!token) {
+      this.stale = this.data !== null;
       this.lastReason = 'no-token';
       this.lastDetail = undefined;
       return;
@@ -261,18 +310,42 @@ export class GrokQuotaPoller {
       }
       const body = Buffer.from(await res.arrayBuffer());
       const parsed = parseGrokCredits(body);
+      const fetchedAt = new Date().toISOString();
+      const sample = normalizeGrokQuotaSample(parsed);
+      if (!sample.ok) {
+        this.stale = this.data !== null;
+        this.failures = 0;
+        this.skipUntil = 0;
+        this.lastReason = 'error';
+        this.lastDetail = `missing fields: ${sample.missingFields.join(', ')}`;
+        this.warn('grok quota response incomplete', {
+          at: fetchedAt,
+          contact: 'aye',
+          backend: 'grok-cli',
+          missingFields: sample.missingFields,
+        });
+        return;
+      }
       this.data = {
-        weekly: {
-          remainingPct: Math.max(0, Math.min(100, Math.round(100 - (parsed.usedPercent ?? 0)))),
-          resetsAt: parsed.resetsAtSec ? new Date(parsed.resetsAtSec * 1000).toISOString() : null,
-        },
-        fetchedAt: new Date().toISOString(),
+        weekly: sample.weekly,
+        fetchedAt,
       };
+      this.stale = false;
       this.failures = 0;
       this.skipUntil = 0;
       this.lastReason = undefined;
       this.lastDetail = undefined;
     } catch (e: any) {
+      this.stale = this.data !== null;
+      if (e instanceof GrokCreditsParseError) {
+        this.warn('grok quota response shape changed', {
+          at: new Date().toISOString(),
+          contact: 'aye',
+          backend: 'grok-cli',
+          missingFields: ['parseableResponse'],
+          detail: e.message,
+        });
+      }
       this.failures++;
       if (this.lastReason === undefined) {
         this.lastReason = 'error';

@@ -19,6 +19,10 @@ export interface HubConfig {
   codex: {
     cliPath: string;
     turnTimeoutMs: number;
+    nativeCompact?: {
+      enabled?: boolean;
+      inputTokens?: number;
+    };
   };
   grok: {
     cliPath: string;
@@ -43,6 +47,11 @@ export interface MemoryConfig {
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+// 200k is deliberately conservative: about 74% of a 272k Codex context.
+// Keep it explicit because app-server supports multiple models and the gateway
+// has no single model-window constant that is valid for every contact.
+export const DEFAULT_CODEX_NATIVE_COMPACT_INPUT_TOKENS = 200_000;
+
 const defaults: HubConfig = {
   port: 3900,
   host: '127.0.0.1',
@@ -58,6 +67,10 @@ const defaults: HubConfig = {
   codex: {
     cliPath: 'codex',
     turnTimeoutMs: 300_000,
+    nativeCompact: {
+      enabled: true,
+      inputTokens: DEFAULT_CODEX_NATIVE_COMPACT_INPUT_TOKENS,
+    },
   },
   grok: {
     cliPath: 'grok',
@@ -100,7 +113,14 @@ export function loadConfig(): HubConfig {
     ...defaults,
     ...user,
     claude: { ...defaults.claude, ...(user.claude ?? {}) },
-    codex: { ...defaults.codex, ...(user.codex ?? {}) },
+    codex: {
+      ...defaults.codex,
+      ...(user.codex ?? {}),
+      nativeCompact: {
+        ...defaults.codex.nativeCompact,
+        ...(user.codex?.nativeCompact ?? {}),
+      },
+    },
     grok: { ...defaults.grok, ...(user.grok ?? {}) },
     memory: { ...defaults.memory, ...(user.memory ?? {}) },
     backup: { ...defaults.backup, ...(user.backup ?? {}) },
@@ -111,6 +131,13 @@ export function loadConfig(): HubConfig {
   if (process.env.HUB_HOST) cfg.host = process.env.HUB_HOST;
   if (process.env.HUB_WEB_DIST) cfg.webDist = process.env.HUB_WEB_DIST;
   if (process.env.HUB_RELEASES_DIR) cfg.releasesDir = process.env.HUB_RELEASES_DIR;
+  const nativeCompactInputTokens = Number(cfg.codex.nativeCompact?.inputTokens);
+  cfg.codex.nativeCompact = {
+    enabled: cfg.codex.nativeCompact?.enabled !== false,
+    inputTokens: Number.isFinite(nativeCompactInputTokens) && nativeCompactInputTokens > 0
+      ? Math.floor(nativeCompactInputTokens)
+      : DEFAULT_CODEX_NATIVE_COMPACT_INPUT_TOKENS,
+  };
   const dataDir = process.env.HUB_DATA_DIR;
   if (dataDir) {
     cfg.dbPath = path.join(dataDir, 'hub.db');

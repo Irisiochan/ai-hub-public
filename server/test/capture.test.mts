@@ -8,11 +8,16 @@ import { detectTrigger, isSystemReceipt, stripQuotedLines } from '../src/memory/
  */
 
 const receipt = [
-  '⚙ Worker 任务回执（网关自动通知，User 也看得到这条）',
+  '⚙ Worker 任务回执',
   '任务 tasks/demo.md → done',
   '提醒我明天复查',
   '交付状态：全绿',
 ].join('\n');
+
+const legacyReceipt = receipt.replace(
+  '⚙ Worker 任务回执',
+  '⚙ Worker 任务回执（网关自动通知，User 也看得到这条）',
+);
 
 const quotedDigest = [
   '> [副窗 · 网关 · Worker 回执 · 2026-07-29 19:30]',
@@ -20,6 +25,12 @@ const quotedDigest = [
 ].join('\n');
 
 assert.equal(isSystemReceipt(receipt), true, 'a full receipt is still caught by the metadata-free gate');
+assert.equal(isSystemReceipt(legacyReceipt), true, 'historical receipt headers remain classified');
+assert.equal(
+  isSystemReceipt('Worker 任务回执 · 网关自动通知 · 交付状态：全绿'),
+  false,
+  'the obsolete three-substring fallback must not classify arbitrary prose as a receipt'
+);
 assert.equal(
   isSystemReceipt(quotedDigest),
   false,

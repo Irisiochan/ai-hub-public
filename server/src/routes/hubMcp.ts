@@ -5,6 +5,8 @@ import { z } from 'zod';
 import { buildDelegateTools, type DelegationCfg } from '../agents/gatewayTools.js';
 import { contactConfig } from '../agents/configSchemas.js';
 import type { ContactRow, Db } from '../db.js';
+import type { HubLogger } from '../logger.js';
+import { hubMcpAuthMode, hubMcpBearerMatches } from '../middleware/hubMcpAuth.js';
 import type { JobStore } from '../workers/jobStore.js';
 
 /**
@@ -12,14 +14,18 @@ import type { JobStore } from '../workers/jobStore.js';
  * delegate tools to CLI backends. Claude CLI contacts get it merged into
  * their --mcp-config by the manager; Codex app-server gets per-process
  * mcp_servers.hub overrides, so no global config.toml edit is needed.
- * Stateless streamable-http: one server+transport per POST, identity comes
- * from the URL (gateway binds the tailnet, same trust level as the rest of
- * the HTTP API).
+ * Stateless streamable-http: one server+transport per POST.
+ * Identity = URL contactId + per-contact HMAC bearer（见 middleware/hubMcpAuth.ts；
+ * session auth 对本前缀的豁免仅指 hub session cookie 不适用，不再等于无认证）。
  */
 
 const INPUT_SHAPES = {
   delegate_to_worker: {
-    runner: z.enum(['claude', 'codex', 'grok']).describe('本机执行方'),
+    route_class: z.enum(['implement', 'fix', 'review', 'recon', 'mechanical']).describe(
+      '默认路由表：implement/fix→codex；review/recon/mechanical→grok；偏离默认必须显式传非空 runner_override_reason。'
+    ),
+    runner: z.enum(['claude', 'codex', 'grok']).optional().describe('可选；不填时按 route_class 默认路由表推出'),
+    runner_override_reason: z.string().optional().describe('偏离默认 runner 时必填的非空理由；会写入 job 元数据'),
     workspace: z.string().describe('PC 上的项目路径，必须在白名单内'),
     prompt: z.string().describe('自包含的任务描述（目标/约束/验收标准）'),
     write: z.boolean().optional().describe('是否允许修改文件；默认 true，只读任务必须显式 false'),
@@ -35,6 +41,8 @@ const INPUT_SHAPES = {
   },
   worker_job_status: {
     job_id: z.string().describe('delegate_to_worker 返回的任务 id'),
+    result_offset: z.number().int().min(0).optional().describe('完整回执起始字符 offset；默认 0'),
+    result_limit: z.number().int().min(1).max(12000).optional().describe('本页字符数；默认 4000，最大 12000'),
   },
   worker_job_cancel: {
     job_id: z.string().describe('要取消的任务 id'),
@@ -54,13 +62,39 @@ const INPUT_SHAPES = {
   },
 } as Record<string, z.ZodRawShape>;
 
-export function hubMcpRouter(db: Db, jobs: JobStore): Router {
+export interface HubMcpAuthOptions {
+  hubToken?: string;
+  /** HUB_MCP_AUTH_MODE：warn = 只审计不拒绝（存量客户端迁移窗口）；默认 enforce。 */
+  envMode?: string;
+  logger?: HubLogger;
+}
+
+export function hubMcpRouter(db: Db, jobs: JobStore, auth: HubMcpAuthOptions = {}): Router {
   const r = Router();
+  const mode = hubMcpAuthMode(auth.hubToken, auth.envMode);
 
   r.post('/hub-mcp/:contactId', async (req, res) => {
+    const contactId = req.params.contactId;
+    if (mode !== 'disabled' && !hubMcpBearerMatches(auth.hubToken!, contactId, req.header('authorization'))) {
+      // 审计：伪造/缺失凭证的调用方、来源与声称身份都要留痕
+      auth.logger?.warn({
+        component: 'hub-mcp',
+        contactId,
+        remoteAddress: req.ip || req.socket.remoteAddress || 'unknown',
+        hasAuthorization: Boolean(req.header('authorization')),
+        mode,
+      }, mode === 'enforce' ? 'hub-mcp bearer rejected' : 'hub-mcp bearer missing/invalid (warn mode, allowed)');
+      if (mode === 'enforce') {
+        return res.status(401).json({
+          jsonrpc: '2.0',
+          error: { code: -32001, message: 'missing or invalid hub-mcp bearer for this contact' },
+          id: null,
+        });
+      }
+    }
     const contact = db
       .prepare("SELECT * FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'dm'")
-      .get(req.params.contactId) as ContactRow | undefined;
+      .get(contactId) as ContactRow | undefined;
     const delegation: DelegationCfg = contact
       ? contactConfig(contact).delegation
       : {};
@@ -73,7 +107,7 @@ export function hubMcpRouter(db: Db, jobs: JobStore): Router {
     }
 
     const server = new McpServer({ name: 'ai-hub', version: '0.1.0' });
-    for (const tool of buildDelegateTools(jobs, db, contact.id, delegation)) {
+    for (const tool of buildDelegateTools(jobs, db, contact.id, delegation, contact.id, auth.logger)) {
       server.registerTool(
         tool.name,
         { description: tool.description, inputSchema: INPUT_SHAPES[tool.name] },

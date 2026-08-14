@@ -168,7 +168,7 @@ legacy.close();
 
 const upgraded = openDb(upgradePath);
 try {
-  assert.equal(upgraded.pragma('user_version', { simple: true }), 21);
+  assert.equal(upgraded.pragma('user_version', { simple: true }), 22);
   const messageColumns = upgraded.pragma('table_info(messages)') as Array<{ name: string }>;
   assert.ok(messageColumns.some((column) => column.name === 'idempotency_key'));
   const outbox = upgraded.prepare('SELECT * FROM memory_outbox').get() as {

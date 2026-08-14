@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import { JsonlProcess } from './jsonlProcess.js';
 import {
   AsyncQueue,
@@ -10,6 +12,43 @@ import {
   type TurnHandle,
   type TurnInput,
 } from './types.js';
+
+const execFileAsync = promisify(execFile);
+
+export interface GrokModelOption {
+  id: string;
+  label: string;
+  isDefault?: boolean;
+}
+
+function parseModelList(output: string): GrokModelOption[] {
+  const lines = output.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, '').split(/\r?\n/);
+  const defaultModel = lines
+    .map((line) => line.match(/^Default model:\s*(\S+)\s*$/i)?.[1] ?? '')
+    .find(Boolean) ?? '';
+  const models: GrokModelOption[] = [];
+  let inModels = false;
+  for (const line of lines) {
+    if (/^Available models:\s*$/i.test(line.trim())) {
+      inModels = true;
+      continue;
+    }
+    if (!inModels) continue;
+    const match = line.match(/^\s*([*-])\s+([^\s(]+)(?:\s+\(([^)]+)\))?\s*$/);
+    if (!match) continue;
+    const id = match[2].trim();
+    if (!id || models.some((model) => model.id === id)) continue;
+    models.push({
+      id,
+      label: id,
+      isDefault: match[1] === '*' || /\bdefault\b/i.test(match[3] ?? '') || id === defaultModel,
+    });
+  }
+  if (defaultModel && !models.some((model) => model.id === defaultModel)) {
+    models.unshift({ id: defaultModel, label: defaultModel, isDefault: true });
+  }
+  return models;
+}
 
 export interface GrokCliBackendOpts {
   cliPath: string;
@@ -137,6 +176,27 @@ export class GrokCliBackend implements AgentBackend {
   private pendingTool: string | null = null;
 
   constructor(private opts: GrokCliBackendOpts) {}
+
+  /** Query Grok Build's account-aware picker catalog without starting a chat session. */
+  static async listModels(opts: {
+    cliPath: string;
+    cwd: string;
+    log: (msg: string) => void;
+  }): Promise<GrokModelOption[]> {
+    const command = opts.cliPath.endsWith('.mjs') ? process.execPath : opts.cliPath;
+    const args = opts.cliPath.endsWith('.mjs') ? [opts.cliPath, 'models'] : ['models'];
+    const { stdout } = await execFileAsync(command, args, {
+      cwd: opts.cwd,
+      encoding: 'utf8',
+      timeout: 20_000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+    const models = parseModelList(String(stdout));
+    if (!models.length) throw new Error('grok models 没有返回可用模型');
+    opts.log(`loaded ${models.length} Grok models from CLI`);
+    return models;
+  }
 
   // ── lifecycle ──────────────────────────────────────────
 

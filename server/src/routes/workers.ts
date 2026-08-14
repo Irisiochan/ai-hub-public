@@ -10,7 +10,9 @@ import {
   workspaceAllowed,
 } from '../workers/jobStore.js';
 import { publicJob } from '../workers/deliveryStatus.js';
+import { buildDeliveryChecks } from '../workers/deliveryChecks.js';
 import type { HubLogger } from '../logger.js';
+import { parsePositiveIntegerQuery } from '../queryParams.js';
 
 // jobs.deleted = 1 is presentation soft-delete; claim/list hide those rows.
 
@@ -172,7 +174,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
 
   r.get('/jobs', (req, res) => {
     jobs.reap();
-    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 300);
+    const limit = parsePositiveIntegerQuery(req.query.limit, 100, 300);
     const rows = db
       .prepare('SELECT * FROM jobs WHERE deleted = 0 ORDER BY created_at DESC LIMIT ?')
       .all(limit) as JobRow[];
@@ -234,6 +236,13 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
     if ('error' in created) {
       const code = created.error === 'duplicate idempotency key' ? 409 : 400;
       return res.status(code).json({ error: created.error });
+    }
+    if (created.merged) {
+      return res.status(200).json({
+        ...publicJob(created.job),
+        merged: true,
+        message: '已并入在途 job',
+      });
     }
     res.status(201).json(publicJob(created.job));
   });
@@ -550,7 +559,11 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
     const deliveryState = delivery && allowedDeliveryStates.has(String(delivery.state))
       ? String(delivery.state)
       : null;
-    const deliveryMeta = delivery ? JSON.stringify(delivery).slice(0, 100_000) : null;
+    const deliveryWithChecks = delivery ? {
+      ...delivery,
+      checks: buildDeliveryChecks(job, deliveryState, delivery),
+    } : null;
+    const deliveryMeta = deliveryWithChecks ? JSON.stringify(deliveryWithChecks).slice(0, 100_000) : null;
     const outcome = jobs.complete(job, req.body?.status, result, error, deliveryState, deliveryMeta);
     if ('error' in outcome) return res.status(409).json({ error: outcome.error });
     updateWorkerRuntimeStatus(worker.id);

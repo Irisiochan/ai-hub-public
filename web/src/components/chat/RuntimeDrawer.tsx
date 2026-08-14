@@ -27,6 +27,17 @@ function fmtReset(resetsAt: string | null | undefined): string {
   }).format(new Date(resetsAt))} 重置`;
 }
 
+function fmtLastGood(fetchedAt: string | null | undefined): string {
+  if (!fetchedAt) return '数据可能过期';
+  return `数据可能过期 · 上次成功于 ${new Intl.DateTimeFormat('zh-CN', {
+    timeZone: DISPLAY_TIME_ZONE,
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(fetchedAt))}`;
+}
+
 interface QuotaBar {
   label: string;
   pct: number;
@@ -81,10 +92,14 @@ export default function RuntimeDrawer(props: Props) {
       bars.push({ label: '7 天', pct: codexQuota.sevenDay.remainingPct, note: fmtReset(codexQuota.sevenDay.resetsAt), week: true });
   }
   if (contact.backend === 'grok-cli') {
-    if (grokQuota?.available && grokQuota.weekly)
-      bars.push({ label: '周池', pct: grokQuota.weekly.remainingPct, note: fmtReset(grokQuota.weekly.resetsAt), week: true });
+    if (grokQuota?.available && grokQuota.weekly) {
+      const note = [fmtReset(grokQuota.weekly.resetsAt)];
+      if (grokQuota.stale) note.push(fmtLastGood(grokQuota.fetchedAt));
+      bars.push({ label: '周池', pct: grokQuota.weekly.remainingPct, note: note.join(' · '), week: true });
+    }
     else if (grokQuota?.reason === 'login-expired') notes.push('额度不可用：grok 登录过期');
     else if (grokQuota?.reason === 'no-token') notes.push('额度不可用：VPS 没有 grok 登录态');
+    else if (grokQuota?.reason === 'error') notes.push('额度暂不可用');
   }
 
   const hasModels = !isRoom && !!modelCatalog && modelCatalog.models.length > 0;

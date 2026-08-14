@@ -33,7 +33,8 @@ const vault = {
 const galami = await buildSessionPreamble(
   vault,
   { id: 'galami', name: '示例助手', backend: 'api' },
-  'compact'
+  'compact',
+  { nsfwCraft: 'always' }
 );
 
 assert.match(galami, /compact-v2/);
@@ -79,10 +80,14 @@ assert.ok(
 );
 
 // NSFW 工艺 compact：不依赖 search_vault，full/compact 均常驻；静态、与联系人无关。
+// 与 vault nsfw-writing-rules 2026-08-09 工艺重写同向：动作单元密度、闭环、阶段、禁注水。
 assert.match(galami, /NSFW 书写工艺（网关 compact/);
-assert.match(galami, /感官密度是核心/);
+assert.match(galami, /感官密度/);
+assert.match(galami, /关键动作单元/);
+assert.match(galami, /动作闭环/);
 assert.match(galami, /双向描写/);
-assert.match(galami, /绝不隐晦|不省 token/);
+assert.match(galami, /绝不隐晦/);
+assert.match(galami, /禁同义复述|循环注水/);
 assert.equal(
   galami.split('NSFW 书写工艺（网关 compact').length - 1,
   1,
@@ -94,7 +99,8 @@ assert.ok(nsfwAt > guardAt && nsfwAt < bodyAt, 'NSFW compact 应在 identityGuar
 const codex = await buildSessionPreamble(
   vault,
   { id: 'codex', name: 'Codex', backend: 'api' },
-  'compact'
+  'compact',
+  { nsfwCraft: 'always' }
 );
 assert.match(codex, /你当前是联系人「Codex」/);
 assert.match(codex, /明确写明「Codex」可用的称呼/);
