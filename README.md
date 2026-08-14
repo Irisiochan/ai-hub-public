@@ -1,41 +1,51 @@
 # ai-hub
 
-自托管的 AI 聊天网关与长期记忆库：像 IM 一样跟 Claude Code、Codex、Grok CLI 和任意 API 模型聊天。
-手机/电脑浏览器访问，历史全同步，CLI 后端走订阅额度，还能把编码任务派回自己的 PC 执行。
+自托管的 multi-agent harness，也是面向个人长期运行的 AI 基础设施。它把 Claude Code、Codex、
+Grok CLI 和任意 API 模型接进同一套持久会话、长期记忆、任务委派与协作总线，并自带 IM 式前端。
+
+它不只是一个多模型聊天页面：网关管理 agent 会话与权限，Memory Vault 提供长期记忆，
+PC Worker 在个人设备执行任务，triage worker 处理主动事件，会议室负责可信派单、handoff 和回执。
+Web、Electron 桌面端和 Android 客户端只是这套 harness 的交互入口。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
 > 但不承诺支持、不保证响应 issue，PR 随缘。拿去用、拿去改都欢迎（MIT）。
 
-## 能干什么
+## 核心能力
 
-- **IM 式永续会话**：每个 AI 是一个联系人，一条永远聊下去的对话；改名、换头像、换颜色
-- **四类后端**：`claude` CLI（stream-json 持久子进程 + resume）、`codex app-server`（JSON-RPC）、
-  Grok CLI，以及 API 直连（Anthropic / OpenAI-compatible / Gemini 原生协议，UI 里自助添加任意供应商）
-- **群聊**：拉现有联系人建群，`@名字` / `@all` 调度，每成员独立会话
-- **图片**：选图/粘贴截图直接发，API 联系人可按需配独立视觉模型
-- **内置长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，支持 full / compact / off 三档
+- **多 Agent 宿主**：把 `claude` CLI（stream-json 持久子进程 + resume）、
+  `codex app-server`（JSON-RPC）、Grok CLI 和 API 直连模型（Anthropic / OpenAI-compatible /
+  Gemini 原生协议）组织成长期在线的独立联系人；每个联系人保留自己的会话、人格、权限与工作目录
+- **协作与 handoff**：拉现有联系人建群，用 `@名字` / `@all` 调度；Plan 就绪的任务可进入会议室工作总线，
+  由网关签发可信派单，成员接单、委派、交付，协调指纹和完成回执防止正文伪造状态
 - **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
   任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
-- **订阅额度可见**：Claude / Codex 标题栏实时显示 5h / 周窗口剩余
+- **长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，
+  支持 full / compact / off 三档，并通过独立、版本化的 MCP 契约接入
 - **自主 triage worker**：VPS 常驻事件分诊——daily 主动陪伴、纪念日/生日提醒、任务到期催办、
   临时离开跟进，全部走廉价 flash 模型把关后才打扰人
-- **会议室工作总线**：Plan 就绪的任务自动在群里派单 → AI 接单委派回 PC Worker 执行 →
-  回执与验收贴回群（coordination 模式，派单走网关签发的可信 meta，成员正文无法伪造）
+- **IM 式交互入口**：每个 AI 是一个联系人，一条持续演进的对话；历史跨设备同步，支持群聊、
+  改名、头像与主题色，Web、Electron 和 Android 共用同一套网关
+- **图片与模型能力**：选图或粘贴截图直接发送，API 联系人可按需配置独立视觉模型；
+  Claude / Codex 标题栏可显示 5h / 周窗口剩余
 - **运维内建**：token 门控的一键部署端点（拉取/构建/重启/健康检查/失败自动回滚）、
   SQLite 在线定时备份（integrity 校验 + 保留窗口）、发布状态面板
 
 ## 架构
 
 ```
-浏览器 (React IM UI)
+客户端 (Web / Electron / Android IM UI)
    │  REST + SSE
-网关 (Node/TS, :3900)  ←  SQLite (contacts / messages / sessions / jobs)
+AI Hub harness / 网关 (Node/TS, :3900)
+   ├─ SQLite (contacts / messages / sessions / jobs / coordination)
+   ├─ Memory Vault (MCP, :8900) → vault-data/ (Markdown)
+   ├─ triage worker → 主动事件与通知闸门
+   ├─ 会议室工作总线 → 可信派单 / handoff / 回执
+   │
    │  每个联系人一个持久子进程或 API 客户端
    ├─ claude --input-format stream-json --output-format stream-json [--resume]
    ├─ codex app-server (JSON-RPC over stdio, thread/resume)
    ├─ grok (CLI stream events, session/resume)
-   ├─ 直连 API (anthropic / openai-compat / gemini)
-   └─ Memory Vault (MCP, :8900) → vault-data/ (Markdown)
+   └─ 直连 API (anthropic / openai-compat / gemini)
 
 PC Worker (主动出站长轮询，无入站端口)
    └─ 网关 jobs 队列 → 本机 codex exec / claude -p → 流式事件与结果回传
