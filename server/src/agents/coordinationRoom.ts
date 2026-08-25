@@ -3,11 +3,14 @@ import type { ContactRow, Db, MessageRow } from '../db.js';
 import type { HubLogger } from '../logger.js';
 import { shanghaiStamp } from '../memory/inject.js';
 import type { SseHub } from '../sse.js';
+import { contactConfig } from './configSchemas.js';
+import { resolveRoomOrchestratorId } from './roomPrompt.js';
 
 export type CoordinationRoomMessageKind = 'receipt';
 
 export interface CoordinationRoomDispatchInput {
-  targetId: string;
+  /** Explicit recipient; defaults to the room's configured coordination.orchestrator. */
+  targetId?: string;
   content: string;
   kind: CoordinationRoomMessageKind;
   idempotencyKey?: string;
@@ -151,9 +154,10 @@ export function dispatchCoordinationRoomHost(
 ): CoordinationRoomDispatchResult {
   const room = configuredCoordinationRoom(deps.db, input.exactDispatchKey);
   if (!room) return { status: 'unavailable', reason: 'coordination room is not configured or enabled' };
-  const target = deps.manager.imageRoomMembers(room).find((member) => member.id === input.targetId);
+  const targetId = input.targetId ?? resolveRoomOrchestratorId(contactConfig(room));
+  const target = deps.manager.imageRoomMembers(room).find((member) => member.id === targetId);
   if (!target) {
-    return { status: 'unavailable', roomId: room.id, reason: `${input.targetId} is not a room member` };
+    return { status: 'unavailable', roomId: room.id, reason: `${targetId} is not a room member` };
   }
   if (input.idempotencyKey) {
     const duplicate = deps.db.prepare(
@@ -223,6 +227,51 @@ export function dispatchCoordinationRoomHost(
     deps.sse.broadcast('message', failedRow);
   });
   return { status: 'posted', roomId: room.id, messageId: row.id };
+}
+
+export interface RoomOrchestratorConfigIssue {
+  roomId: string;
+  orchestrator: string;
+  reason: string;
+}
+
+/**
+ * Startup validation for room config `coordination.orchestrator`: the configured
+ * contact must be a well-formed id, listed in the room's members, and an enabled
+ * DM contact. Rooms without the key are fine (resolver falls back to the default).
+ * Misconfigurations are reported, not fatal — the gateway keeps serving, and the
+ * dispatch path surfaces the same problem as "X is not a room member".
+ */
+export function auditRoomOrchestratorConfigs(db: Db): RoomOrchestratorConfigIssue[] {
+  const rooms = db.prepare(
+    `SELECT * FROM contacts WHERE kind = 'room' AND enabled = 1`
+  ).all() as ContactRow[];
+  const issues: RoomOrchestratorConfigIssue[] = [];
+  for (const room of rooms) {
+    const cfg = contactConfig(room);
+    const coordination = cfg.coordination;
+    if (!coordination || typeof coordination !== 'object' || Array.isArray(coordination)) continue;
+    const raw = (coordination as Record<string, unknown>).orchestrator;
+    if (raw === undefined || raw === null) continue;
+    const configured = typeof raw === 'string' ? raw : String(raw);
+    const resolved = resolveRoomOrchestratorId(cfg);
+    if (resolved !== configured) {
+      issues.push({ roomId: room.id, orchestrator: configured, reason: `invalid contact id; falling back to ${resolved}` });
+      continue;
+    }
+    const members: string[] = Array.isArray(cfg.members) ? cfg.members : [];
+    if (!members.includes(configured)) {
+      issues.push({ roomId: room.id, orchestrator: configured, reason: 'not listed in room members' });
+      continue;
+    }
+    const contact = db.prepare(
+      `SELECT id FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'dm'`
+    ).get(configured);
+    if (!contact) {
+      issues.push({ roomId: room.id, orchestrator: configured, reason: 'not an enabled dm contact' });
+    }
+  }
+  return issues;
 }
 
 export function coordinationRoomHealth(db: Db): Record<string, number> {

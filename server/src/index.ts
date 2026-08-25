@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { cleanupOrphanUploads } from './attachments.js';
+import { auditRoomOrchestratorConfigs } from './agents/coordinationRoom.js';
 import { AgentManager } from './agents/manager.js';
 import { DbBackup } from './backup.js';
 import { loadConfig } from './config.js';
@@ -14,6 +15,7 @@ import { GrokQuotaPoller } from './quota/grokQuota.js';
 import { ensureCodexContact, ensureGrokContact, seedIfEmpty } from './seed.js';
 import { createServer } from './server.js';
 import { SseHub } from './sse.js';
+import { VaultTaskProjection } from './tasks/vaultProjection.js';
 import { JobStore } from './workers/jobStore.js';
 import { DeployReceiptPoller } from './workers/deployReceipt.js';
 import { loadWechatChannelConfig } from './wechat/config.js';
@@ -27,10 +29,16 @@ ensureCodexContact(db, config, logger);
 ensureGrokContact(db, config, logger);
 const orphanUploads = cleanupOrphanUploads(db, config.uploadsDir);
 if (orphanUploads > 0) logger.info({ component: 'uploads', count: orphanUploads }, 'orphan uploads cleaned');
+for (const issue of auditRoomOrchestratorConfigs(db)) {
+  logger.error({ component: 'coordination', ...issue }, 'room coordination.orchestrator misconfigured');
+}
 
 const sse = new SseHub();
 const vault = config.memory.mcpUrl
   ? new VaultClient(config.memory.mcpUrl, db, logMessage(logger, 'vault'), process.env.VAULT_TOKEN ?? null)
+  : null;
+const taskProjection = vault
+  ? new VaultTaskProjection(db, vault, logMessage(logger, 'task-projection'))
   : null;
 const jobStore = new JobStore(db, sse);
 const deployReceipts = new DeployReceiptPoller(
@@ -82,6 +90,7 @@ quotaPoller.start();
 codexQuotaPoller.start();
 grokQuotaPoller.start();
 deployReceipts.start();
+taskProjection?.start();
 jobStore.startOutOfBandResolver();
 const outboxBackfilled = jobStore.startOutboxProcessor();
 if (outboxBackfilled > 0) {
@@ -114,6 +123,7 @@ async function shutdown(signal: string): Promise<void> {
   codexQuotaPoller.stop();
   grokQuotaPoller.stop();
   deployReceipts.stop();
+  taskProjection?.stop();
   jobStore.stopOutOfBandResolver();
   jobStore.stopOutboxProcessor();
   await vault?.close();

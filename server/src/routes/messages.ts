@@ -11,6 +11,7 @@ import {
   withAttachments,
   withAttachmentsMany,
 } from '../attachments.js';
+import { CaptionService } from '../captionService.js';
 import type { ContactRow, Db, MessageOrigin, MessageRow } from '../db.js';
 import type { SseHub } from '../sse.js';
 import { UsageRepo } from '../agents/usageRepo.js';
@@ -29,8 +30,16 @@ import {
   verificationDispatchKey,
 } from '../workers/coordinationKeys.js';
 import { parsePositiveIntegerQuery } from '../queryParams.js';
+import type { JobStore } from '../workers/jobStore.js';
 
-export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploadsDir: string): Router {
+export function messagesRouter(
+  db: Db,
+  sse: SseHub,
+  manager: AgentManager,
+  uploadsDir: string,
+  captions: CaptionService = new CaptionService(db, uploadsDir),
+  jobs?: JobStore,
+): Router {
   const r = Router();
   const usageRepo = new UsageRepo(db);
   // Room execution is in-memory, but its observable status is durable. Any
@@ -261,6 +270,13 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
     }
 
     const roundId = crypto.randomUUID();
+    const workflow = coordination?.kind === 'execution' && jobs
+      ? jobs.workflowProfiles.snapshot({
+          stage: 'execute',
+          taskPath: coordination.taskPath,
+          problemFingerprint: coordination.planHash,
+        })
+      : undefined;
     const initialMeta = {
       roomHost: {
         name: hostName,
@@ -272,6 +288,7 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
           ? Math.min(Math.max(Number(req.body?.reactionRounds ?? 2), 0), 3)
           : 0,
         coordination: coordination || undefined,
+        workflow,
       },
     };
     const result = db.prepare(
@@ -503,6 +520,9 @@ export function messagesRouter(db: Db, sse: SseHub, manager: AgentManager, uploa
       db.prepare('DELETE FROM messages WHERE id = ?').run(row.id);
       return res.status(400).json({ error: (error as Error).message });
     }
+    // caption 旁路 fire-and-forget：转写落库后由 meta.$.captions 流入文字化链路，
+    // 失败/无 key 只影响 caption_status，消息主流程零感知。
+    if (files.length > 0) void captions.captureMessage(row.id);
     const message = withAttachments(db, row);
     if (!hidden) sse.broadcast('message', message);
 

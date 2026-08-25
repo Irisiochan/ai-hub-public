@@ -55,7 +55,13 @@ export function codexAppServerArgs(servers: CodexMcpServerConfig[] = []): string
       );
     }
     if (server.httpHeaders && Object.keys(server.httpHeaders).length) {
-      args.push('--config', `${key}.http_headers=${JSON.stringify(server.httpHeaders)}`);
+      // codex -c 的 value 按 TOML 解析：JSON 对象字面量解析失败会退化成字符串，
+      // 反序列化再报 "expected a map"，且报错原文带出 header 值（bearer 泄漏）。
+      // 必须发 TOML inline table；JSON.stringify 的字符串转义与 TOML basic string 兼容。
+      const table = Object.entries(server.httpHeaders)
+        .map(([name, value]) => `${JSON.stringify(name)} = ${JSON.stringify(value)}`)
+        .join(', ');
+      args.push('--config', `${key}.http_headers={ ${table} }`);
     }
   }
   return args;

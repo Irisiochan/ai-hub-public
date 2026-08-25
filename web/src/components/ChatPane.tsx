@@ -24,6 +24,7 @@ import {
   followupIdempotencyKey,
   reworkIdempotencyKey,
   type FollowupJobInput,
+  vaultTaskAlreadySettled,
   visibleJobsForContact,
   workerReceiptJobId,
 } from '../sideJobActions';
@@ -402,21 +403,30 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
   const markTaskDone = async (message: Message, job: WorkerJob, taskPath: string): Promise<void> => {
     setSendError(null);
     try {
-      await api.setVaultTaskStatus({
-        path: taskPath,
-        status: 'done',
-        note: [
-          `User 通过 AI Hub 会议室回执验收 Worker job \`${job.id}\` 并点击「置 done」。`,
-          `回执 message id：\`${message.id}\`。`,
-          '',
-          '### 验收回执',
-          message.content.slice(0, 2000),
-        ].join('\n'),
-      });
+      let alreadyDone = false;
+      try {
+        const result = await api.setVaultTaskStatus({
+          path: taskPath,
+          status: 'done',
+          note: [
+            `User 通过 AI Hub 会议室回执验收 Worker job \`${job.id}\` 并点击「置 done」。`,
+            `回执 message id：\`${message.id}\`。`,
+            '',
+            '### 验收回执',
+            message.content.slice(0, 2000),
+          ].join('\n'),
+        });
+        alreadyDone = result.alreadyDone === true;
+      } catch (error) {
+        if (!vaultTaskAlreadySettled(error)) throw error;
+        alreadyDone = true;
+      }
       try {
         await api.updateJobDelivery(job.id, {
           stage: 'closed_loop',
-          summary: `User 会议室置 done：${taskPath}`,
+          summary: alreadyDone
+            ? `User 会议室收口验收卡：${taskPath} 已是 done/归档`
+            : `User 会议室置 done：${taskPath}`,
           nextOwner: '无需后续动作',
         });
       } catch {

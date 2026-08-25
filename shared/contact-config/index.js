@@ -59,6 +59,8 @@ const commonShape = {
   routing: RoutingConfigSchema,
   projectAccess: ProjectAccessSchema,
   affect: z.enum(['on', 'off']).default('off'),
+  // Cross-contact life events (P3): extract from this contact's DM + inject other contacts' events per turn.
+  lifeEvents: z.enum(['on', 'off']).default('off'),
   affectBaseline: z.object({
     valence: z.coerce.number().min(-0.6).max(1).default(0),
     arousal: z.coerce.number().min(0).max(1).default(0.15),
@@ -108,6 +110,13 @@ export const ApiContactConfigSchema = z.object({
   promptCache: z.enum(['auto', 'off']).default('auto'),
   maxTokens: positiveInt(8192, 1_000_000),
   contextWindowTokens: z.coerce.number().int().min(0).max(10_000_000).default(128_000),
+  harness: z.object({
+    enabled: z.boolean().default(false),
+    command: trimmed(1000).default('dsh'),
+    home: trimmed(4000).default('/var/lib/ai-hub/dsh'),
+    workspace: trimmed(4000).default('/var/lib/ai-hub/dsh/jingwan-workspace'),
+    port: z.coerce.number().int().min(1024).max(65535).default(3080),
+  }).passthrough().default({}),
 }).passthrough();
 
 export const RoomContactConfigSchema = z.object({

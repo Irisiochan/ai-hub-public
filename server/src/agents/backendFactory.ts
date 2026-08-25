@@ -8,6 +8,7 @@ import { ClaudeCliBackend } from './claudeCli.js';
 import { CodexAppServerBackend } from './codexAppServer.js';
 import { contactConfig } from './configSchemas.js';
 import { DirectApiBackend } from './directApi.js';
+import { DshHarnessBackend } from './dshHarness.js';
 import {
   PROJECT_WRITE_GIT_GUARD,
   buildDelegateTools,
@@ -198,6 +199,31 @@ class ApiBuilder implements BackendBuilder {
       ? 'anthropic'
       : cfg.provider === 'gemini' ? 'gemini' : 'openai-compat';
     const systemPrompt = [cfg.systemPrompt, preamble].filter(Boolean).join('\n');
+    if (cfg.harness?.enabled === true) {
+      if (provider !== 'openai-compat') {
+        throw new Error('DSH harness 当前只支持 DeepSeek openai-compatible 联系人');
+      }
+      if (delegationOn) {
+        throw new Error('DSH harness 已有自己的工具链，先关闭 AI Hub worker delegation');
+      }
+      if (cfg.projectAccess?.enabled) {
+        throw new Error('DSH harness 使用独立沙箱 workspace，不能同时开启项目写权限');
+      }
+      const apiKey = cfg.apiKey || (cfg.apiKeyRef ? process.env[cfg.apiKeyRef] ?? '' : '');
+      if (!apiKey) throw new Error('DSH harness 缺少 DeepSeek API key');
+      return new DshHarnessBackend({
+        command: cfg.harness.command,
+        home: cfg.harness.home,
+        workspace: cfg.harness.workspace,
+        port: cfg.harness.port,
+        model: cfg.model ?? '',
+        apiKey,
+        baseUrl: cfg.baseUrl ?? 'https://api.deepseek.com/v1/chat/completions',
+        systemPrompt: systemPrompt || undefined,
+        turnTimeoutMs: deps.config.claude.turnTimeoutMs,
+        log: ctx.log,
+      });
+    }
     return new DirectApiBackend({
       provider,
       baseUrl: cfg.baseUrl ?? (

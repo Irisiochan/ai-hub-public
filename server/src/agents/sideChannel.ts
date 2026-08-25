@@ -1,3 +1,4 @@
+import { captionsFromMeta } from '../captionService.js';
 import type { MessageRow } from '../db.js';
 import { normalizeAutomationDescriptor, parseMessageMeta } from './messageSource.js';
 
@@ -89,7 +90,13 @@ export function historicalMessageText(row: HistoricalMessageRow): string {
       category ? ` · ${category}` : ''
     }`;
   }
-  if (row.origin === 'main' && row.sender === 'user') return row.content;
+  if (row.origin === 'main' && row.sender === 'user') {
+    // caption 旁路（P3 S1）：图片消息的转写从 meta.$.captions 并入正文，
+    // 让摘要/回放/日记等只读文本的链路看得到图里发生了什么。
+    const captions = captionsFromMeta(row.meta);
+    if (captions.length === 0) return row.content;
+    return [row.content, ...captions.map((c) => `[图片内容：${c}]`)].join('\n');
+  }
   if (row.origin === 'main' && row.sender !== 'user' && row.role === 'user') {
     const rationale = field(row.content, '分诊理由');
     return `[主动消息触发]${rationale ? ` ${compact(rationale, 180)}` : ''}`;

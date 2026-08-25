@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import path from 'node:path';
 import type { HubConfig, MemoryConfig } from '../config.js';
 import { attachmentPathsForMessages, hardDeleteMessages } from '../attachments.js';
 import type { ContactRow, Db, MessageOrigin, MessageRow } from '../db.js';
@@ -20,13 +21,16 @@ import { PromptComposer, type PromptContext } from './promptComposer.js';
 import {
   normalizeRoomCoordinationDispatch,
   quotedRoomMessage,
+  resolveRoomOrchestratorId,
   roomTurnNotice,
   type RoomCoordinationDispatch,
   type RoomTurnSender,
 } from './roomPrompt.js';
+import { redactSecrets } from './redactSecrets.js';
 import { SessionRepo } from './sessionRepo.js';
 import type { AgentBackend, TurnHandle } from './types.js';
 import { AffectService } from './affectService.js';
+import { LifeEventService } from './lifeEvents.js';
 
 export type RoomTurnOutcome = 'spoke' | 'passed' | 'silent' | 'error';
 
@@ -138,18 +142,21 @@ export class AgentRuntime {
   private readonly sessions: SessionRepo;
   private readonly prompts: PromptComposer;
   private readonly affect: AffectService;
+  private readonly lifeEvents: LifeEventService;
   private readonly backendFactory: BackendFactory;
 
   constructor(private convo: ContactRow, private agent: ContactRow, private deps: AgentDeps) {
     this.messages = new MessageRepo(deps.db);
     this.sessions = new SessionRepo(deps.db);
     this.affect = new AffectService(deps.db, (message) => this.log(message));
+    this.lifeEvents = new LifeEventService(deps.db, (message) => this.log(message));
     this.prompts = new PromptComposer(
       deps.vault,
       this.messages,
       deps.config.agentsDir,
       new ConversationSummaryRepo(deps.db),
-      this.affect
+      this.affect,
+      this.lifeEvents
     );
     this.backendFactory = new BackendFactory({
       db: deps.db,
@@ -617,15 +624,16 @@ export class AgentRuntime {
     } catch (e: any) {
       this.recordCrash();
       this.backend = null;
+      const failure = redactSecrets(e.message);
       const row = this.insertMessage({
         role: 'system',
         kind: 'error',
-        content: `${this.isRoom ? `${this.agent.name} ` : ''}后端启动失败：${e.message}`,
+        content: `${this.isRoom ? `${this.agent.name} ` : ''}后端启动失败：${failure}`,
         status: 'done',
         turnId: null,
       });
       if (!backgroundTurn) sse.broadcast('message', row);
-      this.setState('error', e.message);
+      this.setState('error', failure);
       logTiming('error');
       settleDm({ outcome: 'error', text: row.content, messageId: row.id });
       settle('error');
@@ -655,12 +663,12 @@ export class AgentRuntime {
     } else if (this.agent.backend === 'api') {
       // API 群历史含最新消息；稳定 history 不再翻转标签，本轮窗口由 manifest 标出。
       turnText = [
-        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id),
+        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id, resolveRoomOrchestratorId(contactConfig(this.convo))),
         item.mode === 'reaction' ? reactionSuffix : normalSuffix,
       ].join('\n');
     } else {
       turnText = [
-        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id),
+        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id, resolveRoomOrchestratorId(contactConfig(this.convo))),
         delivery!.promptText,
         item.mode === 'reaction' ? reactionSuffix : normalSuffix,
       ].join('\n');
@@ -829,6 +837,10 @@ export class AgentRuntime {
             if (affectUserTurn && !passed && finalText.trim()) {
               void this.affect.scoreAfterTurn(this.agent, sourceText, finalText);
             }
+            // P3 S2：跨联系人生活事件旁路提取。与 affect 同边界：DM + User 原话。
+            if (!this.isRoom && item.kind === 'dm' && item.userAuthored) {
+              void this.lifeEvents.extractAfterTurn(this.agent, item.userMessageId, sourceText);
+            }
             // 自动捕捉只在 DM 里跑：群消息由派发层按"User 原话、群级一次"捕捉，
             // 成员发言（带名字前缀的 transcript）永不参与——防记忆污染
             if (!this.isRoom && item.kind === 'dm' && item.userAuthored && this.deps.vault && mem.capture) {
@@ -836,6 +848,9 @@ export class AgentRuntime {
               void maybeWriteBackTask(
                 this.deps.db,
                 this.deps.vault,
+                this.deps.config.memory.repoPath
+                  ? path.join(this.deps.config.memory.repoPath, 'tasks')
+                  : null,
                 contact,
                 item.userMessageId,
                 sourceText,
@@ -868,20 +883,21 @@ export class AgentRuntime {
             if (textRow) {
               sse.broadcast('message', this.updateMessage(textRow.id, textBuf, 'interrupted'));
             }
+            const failure = redactSecrets(ev.message);
             const row = this.insertMessage({
               role: 'system',
               kind: 'error',
-              content: this.isRoom ? `${this.agent.name}：${ev.message}` : ev.message,
+              content: this.isRoom ? `${this.agent.name}：${failure}` : failure,
               status: 'done',
               turnId,
             });
             if (!backgroundTurn) sse.broadcast('message', row);
-            settleDm({ outcome: 'error', text: ev.message, messageId: row.id });
+            settleDm({ outcome: 'error', text: failure, messageId: row.id });
             if (ev.fatal) {
               this.recordCrash();
               this.backend = null;
             }
-            this.setState('error', ev.message);
+            this.setState('error', failure);
             logTiming('error', sourceText.length, textBuf.length);
             settle('error');
             terminalEventSeen = true;

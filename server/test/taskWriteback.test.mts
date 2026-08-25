@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import Database from 'better-sqlite3';
 import { loadMigrations } from '../src/migrations.js';
 import {
@@ -7,24 +10,41 @@ import {
   type TaskWritebackReview,
   type TaskWritebackVault,
 } from '../src/memory/taskWriteback.js';
+import { TaskStateService } from '../src/tasks/taskStateService.js';
+import { VaultTaskProjection } from '../src/tasks/vaultProjection.js';
 
 const TASK_PATH = 'tasks/rent-new-home-2026-07.md';
 const SEARCH_RESULT = JSON.stringify({
-  result: `找到 1 个匹配：\n\n- **为新工作外出租房** (\`${TASK_PATH}\`)\n  > User 明天出去看房、租房。`,
+  result: `找到 1 个匹配：\n\n- **为新工作外出租房** (\`${TASK_PATH}\`)`,
 });
-const OPEN_TASK = [
-  '---',
-  'type: task',
-  "due: '2026-07-30'",
-  'status: open',
-  '---',
-  '',
-  '# 为新工作外出租房',
-  '',
-  'User 明天出去看房、租房。',
-].join('\n');
 
-function makeDb() {
+function taskText(due = '2026-07-30', body = 'User 明天出去看房、租房。'): string {
+  return [
+    '---',
+    'type: task',
+    `due: '${due}'`,
+    'status: open',
+    '---',
+    '',
+    '# 为新工作外出租房',
+    '',
+    body,
+  ].join('\n');
+}
+
+interface Fixture {
+  db: Database.Database;
+  root: string;
+  tasksDir: string;
+  taskFile: string;
+}
+
+function makeFixture(): Fixture {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-task-writeback-'));
+  const tasksDir = path.join(root, 'tasks');
+  const taskFile = path.join(tasksDir, path.basename(TASK_PATH));
+  fs.mkdirSync(tasksDir);
+  fs.writeFileSync(taskFile, taskText(), 'utf8');
   const db = new Database(':memory:');
   db.pragma('foreign_keys = ON');
   for (const migration of loadMigrations()) db.exec(migration);
@@ -33,7 +53,12 @@ function makeDb() {
       "INSERT INTO contacts (id, name, backend, kind, config) VALUES (?, ?, 'api', 'dm', '{}')"
     ).run(id, name);
   }
-  return db;
+  return { db, root, tasksDir, taskFile };
+}
+
+function closeFixture(fixture: Fixture): void {
+  fixture.db.close();
+  fs.rmSync(fixture.root, { recursive: true, force: true });
 }
 
 function addMessage(db: Database.Database, contactId: string, content: string): number {
@@ -44,25 +69,30 @@ function addMessage(db: Database.Database, contactId: string, content: string): 
 }
 
 class FakeVault implements TaskWritebackVault {
-  raw = OPEN_TASK;
-  writes: Array<{ name: string; args: Record<string, unknown> }> = [];
-  writeResult: 'ok' | 'queued' = 'ok';
-  mutateOnWrite = true;
-  beforeWrite?: () => Promise<void>;
+  raw = taskText();
+  calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  afterRead?: () => void;
 
-  async call(name: string): Promise<string> {
+  constructor(private readonly projectedTaskFile?: string) {}
+
+  async call(name: string, args?: Record<string, unknown>): Promise<string> {
     if (name === 'search_vault') return SEARCH_RESULT;
-    if (name === 'read_file') return JSON.stringify({ result: this.raw });
-    throw new Error(`unexpected call ${name}`);
-  }
-
-  async write(name: string, args: Record<string, unknown>): Promise<'ok' | 'queued'> {
-    this.writes.push({ name, args });
-    await this.beforeWrite?.();
-    if (this.writeResult === 'ok' && this.mutateOnWrite) {
-      this.raw += `\n\n## 更新\n${String(args.note ?? '')}`;
+    if (name === 'read_file') {
+      const result = JSON.stringify({ result: this.raw });
+      this.afterRead?.();
+      this.afterRead = undefined;
+      return result;
     }
-    return this.writeResult;
+    if (name === 'update_task') {
+      this.calls.push({ name, args });
+      if (this.projectedTaskFile) {
+        const current = fs.readFileSync(this.projectedTaskFile, 'utf8').trimEnd();
+        this.raw = `${current}\n\n## 更新\n${String(args?.note ?? '')}\n`;
+        fs.writeFileSync(this.projectedTaskFile, this.raw, 'utf8');
+      }
+      return 'updated';
+    }
+    throw new Error(`unexpected call ${name}`);
   }
 }
 
@@ -82,167 +112,212 @@ const progressReview: TaskWritebackReview = {
 };
 
 {
-  const db = makeDb();
-  const vault = new FakeVault();
+  const fixture = makeFixture();
+  const { db, tasksDir, taskFile } = fixture;
+  const vault = new FakeVault(taskFile);
   const text = '租房要过几天再去看，等 8 月 10 日发工资后再安排。';
   const messageId = addMessage(db, 'claude', text);
   const outcome = await maybeWriteBackTask(
-    db,
-    vault,
-    { id: 'claude', name: 'Claude' },
-    messageId,
-    text,
-    () => {},
-    async () => rescheduleReview
+    db, vault, tasksDir, { id: 'claude', name: 'Claude' }, messageId, text, () => {}, async () => rescheduleReview
   );
   assert.equal(outcome.status, 'applied');
   assert.equal(outcome.taskPath, TASK_PATH);
-  assert.equal(vault.writes.length, 1);
   assert.deepEqual(
-    { name: vault.writes[0].name, path: vault.writes[0].args.path, status: vault.writes[0].args.status, source: vault.writes[0].args.source },
-    { name: 'update_task', path: TASK_PATH, status: 'open', source: 'claude' }
+    db.prepare('SELECT due, version, status FROM work_items WHERE source_path = ?').get(TASK_PATH),
+    { due: '2026-08-10', version: 2, status: 'open' },
   );
-  assert.match(String(vault.writes[0].args.note), /User 原话：租房要过几天再去看/);
-  assert.match(String(vault.writes[0].args.note), /消息引用：ai-hub:claude\/messages\//);
-  assert.match(String(vault.writes[0].args.note), /幂等键：chat-task:claude:/);
-  assert.match(String(vault.writes[0].args.note), /新时间承诺：2026-08-10/);
+  const event = db.prepare(
+    'SELECT event_id, kind, previous_status, next_status, payload FROM task_events WHERE task_id = ?'
+  ).get('rent-new-home-2026-07') as {
+    event_id: string;
+    kind: string;
+    previous_status: string;
+    next_status: string;
+    payload: string;
+  };
+  assert.equal(event.kind, 'task_rescheduled');
+  assert.equal(event.previous_status, 'open');
+  assert.equal(event.next_status, 'open');
+  assert.match(event.payload, /"nextDue":"2026-08-10"/);
+  const writeback = db.prepare(
+    'SELECT status, command_id, event_id, detail FROM task_writebacks WHERE message_id = ?'
+  ).get(messageId) as { status: string; command_id: string; event_id: string; detail: string };
+  assert.equal(writeback.status, 'applied');
+  assert.equal(writeback.command_id, outcome.idempotencyKey);
+  assert.equal(writeback.event_id, event.event_id);
+  assert.match(writeback.detail, /SQLite/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM memory_outbox').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_outbox').get().count, 1);
+
+  const projection = new VaultTaskProjection(db, vault, () => {});
+  assert.equal(await projection.flushOutbox(), 1);
+  assert.equal(vault.calls.length, 1);
+  assert.equal(vault.calls[0].name, 'update_task');
+  assert.equal(vault.calls[0].args?.status, 'open');
+  assert.match(String(vault.calls[0].args?.note), /幂等键：chat-task:claude:/);
+  assert.match(String(vault.calls[0].args?.note), /新时间承诺：2026-08-10/);
+  assert.match(fs.readFileSync(taskFile, 'utf8'), /due: '2026-07-30'/);
 
   const duplicate = await maybeWriteBackTask(
-    db,
-    vault,
-    { id: 'claude', name: 'Claude' },
-    messageId,
-    text,
-    () => {},
+    db, vault, tasksDir, { id: 'claude', name: 'Claude' }, messageId, text, () => {},
     async () => { throw new Error('duplicate must not review again'); }
   );
   assert.equal(duplicate.status, 'duplicate');
-  assert.equal(vault.writes.length, 1);
-  db.close();
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_events').get().count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_outbox').get().count, 1);
+
+  const progressText = '租房已经开始联系中介了。';
+  const progress = await maybeWriteBackTask(
+    db, vault, tasksDir, { id: 'claude', name: 'Claude' }, addMessage(db, 'claude', progressText), progressText,
+    () => {}, async () => progressReview
+  );
+  assert.equal(progress.status, 'applied');
+  assert.deepEqual(
+    db.prepare('SELECT due, version, status FROM work_items WHERE source_path = ?').get(TASK_PATH),
+    { due: '2026-08-10', version: 4, status: 'open' },
+  );
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_events').get().count, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_outbox').get().count, 2);
+  console.log('task writeback round-trip: reschedule due=2026-08-10 event=1 outbox=1 projected=1; follow-up progress due=2026-08-10 conflict=0');
+  closeFixture(fixture);
 }
 
 {
-  const db = makeDb();
+  const fixture = makeFixture();
+  const { db, tasksDir } = fixture;
   const vault = new FakeVault();
   const text = '租房要过几天再去看，改到 8 月 10 日。';
   const messageId = addMessage(db, 'claude', text);
   let reviews = 0;
   const outcome = await maybeWriteBackTask(
-    db,
-    vault,
-    { id: 'claude', name: 'Claude' },
-    messageId,
-    text,
-    () => {},
-    async () => {
-      reviews++;
+    db, vault, tasksDir, { id: 'claude', name: 'Claude' }, messageId, text, () => {}, async () => {
+      reviews += 1;
       return reviews === 1
         ? { decision: 'pending', confidence: null, action: null, taskQuery: null, due: null, detail: 'transient' }
         : rescheduleReview;
     }
   );
-  assert.equal(reviews, 2, 'a pending review gets one bounded retry');
+  assert.equal(reviews, 2);
   assert.equal(outcome.status, 'applied');
-  db.close();
+  closeFixture(fixture);
 }
 
 {
-  assert.equal(ownTaskUpdateText('> Claude说租房完成了'), null, 'quoted content is not User-authored');
-  assert.equal(ownTaskUpdateText('他说打算把租房改到下周'), null, 'somebody else’s plan is rejected');
-  assert.equal(ownTaskUpdateText('我没说要把租房任务改期'), null, 'meta-negation is rejected');
-
-  const db = makeDb();
+  assert.equal(ownTaskUpdateText('> Claude说租房完成了'), null);
+  assert.equal(ownTaskUpdateText('他说打算把租房改到下周'), null);
+  assert.equal(ownTaskUpdateText('我没说要把租房任务改期'), null);
+  const fixture = makeFixture();
   const vault = new FakeVault();
-  for (const text of ['我还没完成租房任务。', '这破事什么时候能搞定啊，哈哈。']) {
-    const messageId = addMessage(db, 'claude', text);
-    const outcome = await maybeWriteBackTask(
-      db,
-      vault,
-      { id: 'claude', name: 'Claude' },
-      messageId,
-      text,
-      () => {},
-      async () => ({ decision: 'reject', confidence: 0.05, action: null, taskQuery: null, due: null })
-    );
-    assert.equal(outcome.status, 'rejected');
-  }
-  assert.equal(vault.writes.length, 0);
-  db.close();
+  const text = '我还没完成租房任务。';
+  const outcome = await maybeWriteBackTask(
+    fixture.db, vault, fixture.tasksDir, { id: 'claude', name: 'Claude' },
+    addMessage(fixture.db, 'claude', text), text, () => {},
+    async () => ({ decision: 'reject', confidence: 0.05, action: null, taskQuery: null, due: null })
+  );
+  assert.equal(outcome.status, 'rejected');
+  closeFixture(fixture);
 }
 
 {
-  const db = makeDb();
+  const fixture = makeFixture();
   const vault = new FakeVault();
   const text = '租房的事情已经全部搞定了。';
-  const messageId = addMessage(db, 'claude', text);
   const outcome = await maybeWriteBackTask(
-    db,
-    vault,
-    { id: 'claude', name: 'Claude' },
-    messageId,
-    text,
-    () => {},
-    async () => ({ ...progressReview, action: 'done' })
+    fixture.db, vault, fixture.tasksDir, { id: 'claude', name: 'Claude' },
+    addMessage(fixture.db, 'claude', text), text, () => {}, async () => ({ ...progressReview, action: 'done' })
   );
   assert.equal(outcome.status, 'proposed');
-  assert.equal(vault.writes.length, 0, 'done is never auto-applied');
-  const row = db.prepare('SELECT * FROM task_writebacks WHERE message_id = ?').get(messageId) as { status: string; source_quote: string };
-  assert.equal(row.status, 'proposed');
-  assert.equal(row.source_quote, text);
-  db.close();
+  assert.equal(fixture.db.prepare('SELECT COUNT(*) AS count FROM task_commands').get().count, 0);
+  closeFixture(fixture);
 }
 
 {
-  const db = makeDb();
+  const fixture = makeFixture();
   const vault = new FakeVault();
-  let releaseWrite!: () => void;
-  let writeStarted!: () => void;
-  const started = new Promise<void>((resolve) => { writeStarted = resolve; });
-  const gate = new Promise<void>((resolve) => { releaseWrite = resolve; });
-  vault.beforeWrite = async () => {
-    writeStarted();
-    await gate;
+  const text = '租房已经开始联系中介了。';
+  const outcome = await maybeWriteBackTask(
+    fixture.db, vault, null, { id: 'claude', name: 'Claude' },
+    addMessage(fixture.db, 'claude', text), text, () => {}, async () => progressReview
+  );
+  assert.equal(outcome.status, 'ambiguous');
+  assert.match(outcome.detail ?? '', /任务目录未配置/);
+  assert.equal(fixture.db.prepare('SELECT COUNT(*) AS count FROM task_commands').get().count, 0);
+  closeFixture(fixture);
+}
+
+{
+  const fixture = makeFixture();
+  const { db, tasksDir, taskFile } = fixture;
+  const service = new TaskStateService(db);
+  assert.equal(service.refreshTask(tasksDir, TASK_PATH).version, 1);
+  const vault = new FakeVault();
+  vault.afterRead = () => {
+    fs.writeFileSync(taskFile, taskText('2026-07-30', '候选生成后任务正文发生变化。'), 'utf8');
   };
-  const text1 = '租房已经开始联系中介看房了。';
-  const text2 = '租房刚刚又约了一次看房。';
-  const id1 = addMessage(db, 'claude', text1);
-  const id2 = addMessage(db, 'codex', text2);
-  const first = maybeWriteBackTask(db, vault, { id: 'claude', name: 'Claude' }, id1, text1, () => {}, async () => progressReview);
-  await started;
-  const second = await maybeWriteBackTask(db, vault, { id: 'codex', name: 'Codex' }, id2, text2, () => {}, async () => progressReview);
-  assert.equal(second.status, 'conflict');
-  assert.match(second.detail ?? '', /另一联系人/);
-  releaseWrite();
-  assert.equal((await first).status, 'applied');
-  assert.equal(vault.writes.length, 1, 'concurrent contact must not overwrite the active write');
-  db.close();
+  const text = '租房已经开始联系中介了。';
+  const outcome = await maybeWriteBackTask(
+    db, vault, tasksDir, { id: 'claude', name: 'Claude' }, addMessage(db, 'claude', text), text,
+    () => {}, async () => progressReview
+  );
+  assert.equal(outcome.status, 'conflict');
+  assert.match(outcome.detail ?? '', /task_content_changed_after_review/);
+  assert.equal(db.prepare('SELECT version FROM work_items WHERE source_path = ?').get(TASK_PATH).version, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_commands').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_events').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_outbox').get().count, 0);
+  closeFixture(fixture);
 }
 
 {
-  const db = makeDb();
+  const fixture = makeFixture();
+  const { db, tasksDir, taskFile } = fixture;
+  const service = new TaskStateService(db);
+  assert.equal(service.refreshTask(tasksDir, TASK_PATH).version, 1);
+  const before = db.prepare(
+    'SELECT version, due, spec_fingerprint, content_fingerprint FROM work_items WHERE source_path = ?'
+  ).get(TASK_PATH);
+  const refreshedText = taskText('2026-07-30', '投影后的正文，refresh 本来会更新 work_items。');
+  fs.writeFileSync(taskFile, refreshedText, 'utf8');
   const vault = new FakeVault();
-  vault.writeResult = 'queued';
-  const text = '租房已经开始联系中介了。';
-  const messageId = addMessage(db, 'claude', text);
-  const outcome = await maybeWriteBackTask(db, vault, { id: 'claude', name: 'Claude' }, messageId, text, () => {}, async () => progressReview);
-  assert.equal(outcome.status, 'queued');
-  assert.match(outcome.detail ?? '', /尚未同步/);
-  const row = db.prepare('SELECT status, detail FROM task_writebacks WHERE message_id = ?').get(messageId) as { status: string; detail: string };
-  assert.equal(row.status, 'queued');
-  assert.match(row.detail, /尚未同步/);
-  db.close();
+  vault.raw = refreshedText;
+  db.exec(`
+    CREATE TRIGGER force_writeback_command_conflict
+    AFTER INSERT ON task_commands
+    BEGIN
+      UPDATE work_items SET version = version + 1 WHERE task_id = NEW.task_id;
+    END;
+  `);
+  const text = '租房刚刚又联系了一家中介。';
+  const outcome = await maybeWriteBackTask(
+    db, vault, tasksDir, { id: 'claude', name: 'Claude' }, addMessage(db, 'claude', text), text,
+    () => {}, async () => progressReview
+  );
+  assert.equal(outcome.status, 'conflict');
+  assert.match(outcome.detail ?? '', /version_conflict/);
+  assert.deepEqual(
+    db.prepare('SELECT version, due, spec_fingerprint, content_fingerprint FROM work_items WHERE source_path = ?')
+      .get(TASK_PATH),
+    before,
+    'a rejected Controller command must roll back every refreshTask work_items write',
+  );
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_commands').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_events').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM task_outbox').get().count, 0);
+  closeFixture(fixture);
 }
 
 {
-  const db = makeDb();
+  const fixture = makeFixture();
   const vault = new FakeVault();
-  vault.mutateOnWrite = false;
-  const text = '租房已经开始联系中介了。';
-  const messageId = addMessage(db, 'claude', text);
-  const outcome = await maybeWriteBackTask(db, vault, { id: 'claude', name: 'Claude' }, messageId, text, () => {}, async () => progressReview);
-  assert.equal(outcome.status, 'failed');
-  assert.match(outcome.detail ?? '', /回读验证失败/);
-  db.close();
+  const text = '租房改期，日期稍后再定。';
+  const outcome = await maybeWriteBackTask(
+    fixture.db, vault, fixture.tasksDir, { id: 'claude', name: 'Claude' },
+    addMessage(fixture.db, 'claude', text), text, () => {},
+    async () => ({ ...rescheduleReview, due: null })
+  );
+  assert.equal(outcome.status, 'ambiguous');
+  assert.match(outcome.detail ?? '', /缺少明确日期/);
+  closeFixture(fixture);
 }
 
 console.log('chat task writeback checks passed');

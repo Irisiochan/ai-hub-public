@@ -5,7 +5,7 @@ import process from 'node:process';
 
 const SESSION_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 const MODEL_RE = /^[a-zA-Z0-9._-]{1,100}$/;
-const REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
 const CLAUDE_PERMISSIONS = {
   read: { allowed: ['Read', 'Grep', 'Glob'], denied: ['Bash'] },

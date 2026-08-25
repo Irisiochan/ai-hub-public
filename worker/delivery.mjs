@@ -53,18 +53,15 @@ function untrackedFingerprint(cwd, rawStatus) {
 export async function snapshotRepo(cwd) {
   const inside = await runGit(cwd, ['rev-parse', '--is-inside-work-tree']);
   if (inside?.trim() !== 'true') return null;
-  const [head, status, diff, divergenceRaw, branchRaw] = await Promise.all([
+  const [head, status, diff, aheadRaw, behindRaw, branchRaw] = await Promise.all([
     runGit(cwd, ['rev-parse', 'HEAD']),
     runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']),
     runGit(cwd, ['diff', '--binary', 'HEAD']),
-    runGit(cwd, ['rev-list', '--left-right', '--count', 'HEAD...@{upstream}']),
+    runGit(cwd, ['rev-list', '--count', '@{upstream}..HEAD']),
+    runGit(cwd, ['rev-list', '--count', 'HEAD..@{upstream}']),
     runGit(cwd, ['branch', '--show-current']),
   ]);
   if (head === null || status === null || diff === null) return null;
-  const branch = branchRaw?.trim()
-    || (await runGit(cwd, ['symbolic-ref', '--quiet', '--short', 'HEAD']))?.trim()
-    || null;
-  const divergence = divergenceRaw?.trim().split(/\s+/).map(Number) ?? null;
   const fingerprint = crypto
     .createHash('sha256')
     .update(status)
@@ -77,9 +74,9 @@ export async function snapshotRepo(cwd) {
     head: head.trim(),
     dirty: status.length > 0,
     dirtyFiles: statusFiles(status),
-    ahead: divergence === null ? null : divergence[0] || 0,
-    behind: divergence === null ? null : divergence[1] || 0,
-    branch,
+    ahead: aheadRaw === null ? null : Number(aheadRaw.trim()) || 0,
+    behind: behindRaw === null ? null : Number(behindRaw.trim()) || 0,
+    branch: branchRaw?.trim() || null,
     fingerprint,
   };
 }

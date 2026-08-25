@@ -29,7 +29,7 @@ legacy.close();
 
 const db = openDb(dbPath);
 try {
-  assert.equal(db.pragma('user_version', { simple: true }), 22);
+  assert.equal(db.pragma('user_version', { simple: true }), 27);
   assert.equal(getMessageReadState(db, 'codex').unreadCount, 0, 'upgrade seeds old main history as read');
 
   const insert = db.prepare(
@@ -60,7 +60,7 @@ try {
 
 const reopened = openDb(dbPath);
 try {
-  assert.equal(reopened.pragma('user_version', { simple: true }), 22, 'migration remains idempotent on reopen');
+  assert.equal(reopened.pragma('user_version', { simple: true }), 27, 'migration remains idempotent on reopen');
 } finally {
   reopened.close();
   fs.rmSync(tempDir, { recursive: true, force: true });

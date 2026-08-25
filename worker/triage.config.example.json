@@ -61,7 +61,12 @@
     "silentStartHour": 0,
     "silentEndHour": 9,
     "presenceIdleMinutes": 30,
-    "recipients": ["claude", "codex", "aye"]
+    "safetyEvents": {
+      "enabled": true,
+      "freshnessHours": 12,
+      "maxPerEventPerDay": 2
+    },
+    "recipients": ["claude", "codex", "grok"]
   },
   "taskReminders": {
     "enabled": true,
@@ -73,7 +78,7 @@
     "enabled": false,
     "writeDiary": true,
     "roomId": "room-contact-id",
-    "hostName": "DS 主持",
+    "hostName": "Coordinator",
     "dailyDispatchLimit": 1,
     "reactionRounds": 2,
     "recentTopicLimit": 12,
@@ -84,7 +89,7 @@
   "coordination": {
     "enabled": false,
     "roomId": "room-contact-id",
-    "hostName": "DS 主持",
+    "hostName": "Coordinator",
     "tasksDir": "/opt/memory-vault/tasks",
     "reminderRoomTags": ["ai-hub", "worker", "deploy", "工程"],
     "hubAutoHygiene": {
@@ -93,6 +98,15 @@
     },
     "dailyLimit": 8,
     "scanIntervalMinutes": 5
+  },
+  "agenda": {
+    "enabled": true,
+    "atHour": 9,
+    "atMinute": 0,
+    "maxAuto": 2,
+    "maxAsk": 3,
+    "jobsLimit": 300,
+    "resurfaceDays": 7
   },
   "diary": {
     "enabled": false,

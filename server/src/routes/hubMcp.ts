@@ -22,7 +22,7 @@ import type { JobStore } from '../workers/jobStore.js';
 const INPUT_SHAPES = {
   delegate_to_worker: {
     route_class: z.enum(['implement', 'fix', 'review', 'recon', 'mechanical']).describe(
-      '默认路由表：implement/fix→codex；review/recon/mechanical→grok；偏离默认必须显式传非空 runner_override_reason。'
+      '默认 runner/model/effort 由当前 Workflow Profile 决定；偏离必须显式传非空 runner_override_reason。'
     ),
     runner: z.enum(['claude', 'codex', 'grok']).optional().describe('可选；不填时按 route_class 默认路由表推出'),
     runner_override_reason: z.string().optional().describe('偏离默认 runner 时必填的非空理由；会写入 job 元数据'),
@@ -35,9 +35,10 @@ const INPUT_SHAPES = {
     ssh: z.boolean().optional().describe('是否允许 SSH/VPS 操作；联系人 delegation.allowSsh 也必须开启'),
     priority: z.number().optional().describe('-10~10，默认 0'),
     model: z.string().optional().describe(
-      '覆盖默认模型（不填时 claude=claude-opus-5、codex=gpt-5.6-sol）。Claude 固定版本写 Opus 4.6 或 claude-opus-4-6；指定版本时禁止用 opus/sonnet 泛化。Codex 如 gpt-5.6-sol'
+      '覆盖当前 Workflow Profile 的模型。Claude 固定版本写 Opus 4.7 或 claude-opus-4-7；指定版本时禁止用 opus/sonnet 泛化。Codex 如 gpt-5.6-sol'
     ),
-    effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional().describe('推理强度；不填时 claude/codex 默认 high'),
+    effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().describe('推理强度；不填时按当前 Workflow Profile'),
+    problem_fingerprint: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe('同一问题稳定 sha256；用于三轮质量熔断'),
   },
   worker_job_status: {
     job_id: z.string().describe('delegate_to_worker 返回的任务 id'),

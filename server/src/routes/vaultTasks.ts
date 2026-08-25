@@ -1,32 +1,54 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { Router } from 'express';
-
-export interface VaultTaskClient {
-  call(name: string, args?: Record<string, unknown>, retries?: number): Promise<string>;
-}
+import type { Db } from '../db.js';
+import {
+  LIVE_JOB_STATUSES,
+  taskPathFromOptions,
+} from '../tasks/invariants.js';
+import {
+  TaskStateService,
+  type TaskTransitionResult,
+} from '../tasks/taskStateService.js';
 
 const TASK_PATH = /^tasks\/[a-z0-9][a-z0-9-]*\.md$/;
 const TAIL_PATH = /^tasks\/(?:worker-tail-|deploy-)/;
 
-function vaultText(raw: string): string {
-  try {
-    const parsed = JSON.parse(raw) as { result?: unknown };
-    return typeof parsed.result === 'string' ? parsed.result : raw;
-  } catch {
-    return raw;
-  }
+interface VaultTasksDependencies {
+  db: Db;
+  tasksDir: string | null;
 }
 
-function isOpenTask(raw: string): boolean {
-  const frontmatter = vaultText(raw).match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-  return !!frontmatter && /^status:\s*['"]?open['"]?\s*$/im.test(frontmatter[1]);
+interface JobPathRow {
+  id: string;
+  status: string;
+  options: string;
 }
 
-export function vaultTasksRouter(vault: VaultTaskClient | null): Router {
+type CloseOutcome =
+  | { kind: 'already-done' }
+  | { kind: 'transition'; transition: TaskTransitionResult };
+
+function liveJobForTask(db: Db, taskPath: string): JobPathRow | null {
+  const rows = db.prepare(
+    'SELECT id, status, options FROM jobs WHERE deleted = 0 ORDER BY created_at, id'
+  ).all() as JobPathRow[];
+  return rows.find((job) => (
+    LIVE_JOB_STATUSES.has(job.status)
+    && taskPathFromOptions(job.options) === taskPath
+  )) ?? null;
+}
+
+export function vaultTasksRouter({ db, tasksDir }: VaultTasksDependencies): Router {
   const r = Router();
   const activeWrites = new Set<string>();
+  const taskState = new TaskStateService(db);
 
   r.post('/task-status', async (req, res) => {
-    if (!vault) return res.status(503).json({ error: 'memory vault is not configured' });
+    if (!tasksDir) {
+      return res.status(503).json({ error: 'MEMORY_VAULT_REPO is not configured; canonical tasks are unavailable' });
+    }
     const taskPath = typeof req.body?.path === 'string' ? req.body.path.trim().toLowerCase() : '';
     const status = req.body?.status;
     const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 4000) : '';
@@ -39,33 +61,58 @@ export function vaultTasksRouter(vault: VaultTaskClient | null): Router {
     if (activeWrites.has(taskPath)) {
       return res.status(409).json({ error: '这个任务正在更新，请勿重复点击' });
     }
+    const liveJob = liveJobForTask(db, taskPath);
+    if (liveJob) {
+      return res.status(409).json({
+        error: `任务仍有关联的 ${liveJob.status} job ${liveJob.id}，请先处理该 job`,
+      });
+    }
 
     activeWrites.add(taskPath);
     try {
+      let outcome: CloseOutcome;
       try {
-        const current = await vault.call('read_file', { path: taskPath }, 0);
-        if (!isOpenTask(current)) {
-          return res.status(409).json({ error: '任务不是 open 状态，未执行置 done' });
-        }
+        // Keep an async boundary so a concurrent double-click can observe the
+        // in-process guard before the atomic, synchronous SQLite transaction.
+        await fs.promises.access(path.join(tasksDir, taskPath.slice('tasks/'.length)));
+        outcome = db.transaction((): CloseOutcome => {
+          const current = taskState.refreshTask(tasksDir, taskPath);
+          if (current.status !== 'open') {
+            return { kind: 'already-done' };
+          }
+          const transition = taskState.transition({
+            commandId: crypto.randomUUID(),
+            idempotencyKey: `vault-task-status:${current.taskId}:${current.version}:done`,
+            taskId: current.taskId,
+            expectedVersion: current.version,
+            toStatus: 'done',
+            actor: 'User',
+            source: 'vault-task-status-route',
+            reason: note,
+            evidence: { note, taskPath },
+            projection: { path: taskPath, note, source: 'User' },
+          });
+          return { kind: 'transition', transition };
+        })();
       } catch (error) {
-        return res.status(404).json({
-          error: `任务读取失败：${error instanceof Error ? error.message : String(error)}`,
-        });
+        const detail = error instanceof Error ? error.message : String(error);
+        if (/ENOENT|文件不存在|not found/i.test(detail)) {
+          return res.json({ ok: true, path: taskPath, status: 'done', alreadyDone: true });
+        }
+        return res.status(404).json({ error: `任务读取失败：${detail}` });
       }
 
-      try {
-        await vault.call('update_task', {
-          path: taskPath,
-          status: 'done',
-          note,
-          source: 'User',
-        }, 0);
-        return res.json({ ok: true, path: taskPath, status: 'done' });
-      } catch (error) {
-        return res.status(502).json({
-          error: `任务状态写入失败：${error instanceof Error ? error.message : String(error)}`,
+      if (outcome.kind === 'already-done') {
+        return res.json({ ok: true, path: taskPath, status: 'done', alreadyDone: true });
+      }
+      const { transition } = outcome;
+      if (!transition || transition.result !== 'applied') {
+        const detail = transition?.error ?? 'task transition did not complete';
+        return res.status(/version_conflict/.test(detail) ? 409 : 500).json({
+          error: `任务状态更新失败：${detail}`,
         });
       }
+      return res.json({ ok: true, path: taskPath, status: 'done', queued: true });
     } finally {
       activeWrites.delete(taskPath);
     }

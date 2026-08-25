@@ -13,6 +13,8 @@ import { publicJob } from '../workers/deliveryStatus.js';
 import { buildDeliveryChecks } from '../workers/deliveryChecks.js';
 import type { HubLogger } from '../logger.js';
 import { parsePositiveIntegerQuery } from '../queryParams.js';
+import type { WorkflowQuality } from '../workers/workflowProfiles.js';
+import { problemFingerprint, type WorkflowStage } from '../workers/workflowProfiles.js';
 
 // jobs.deleted = 1 is presentation soft-delete; claim/list hide those rows.
 
@@ -121,6 +123,42 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
     res.json({ workers: workers.map(publicWorker) });
   });
 
+  r.get('/workflow-profiles', (req, res) => {
+    const state = jobs.workflowProfiles.state();
+    res.json({
+      active: state.active,
+      previous: state.previous,
+      updatedBy: state.updated_by,
+      updatedAt: state.updated_at,
+      profiles: jobs.workflowProfiles.list(),
+      audit: jobs.workflowProfiles.audit(parsePositiveIntegerQuery(req.query.auditLimit, 20, 100)),
+    });
+  });
+
+  r.post('/workflow-profiles/preview', (req, res) => {
+    const id = typeof req.body?.id === 'string' ? req.body.id : '';
+    const version = Number(req.body?.version);
+    const outcome = jobs.workflowProfiles.preview(id, version);
+    if ('error' in outcome) return res.status(404).json({ error: outcome.error });
+    res.json(outcome);
+  });
+
+  r.post('/workflow-profiles/switch', (req, res) => {
+    const id = typeof req.body?.id === 'string' ? req.body.id : '';
+    const version = Number(req.body?.version);
+    const outcome = jobs.workflowProfiles.switchTo(id, version, 'User');
+    if ('error' in outcome) return res.status(404).json({ error: outcome.error });
+    sse.broadcast('workflow-profile', outcome);
+    res.json(outcome);
+  });
+
+  r.post('/workflow-profiles/rollback', (_req, res) => {
+    const outcome = jobs.workflowProfiles.rollback('User');
+    if ('error' in outcome) return res.status(409).json({ error: outcome.error });
+    sse.broadcast('workflow-profile', outcome);
+    res.json(outcome);
+  });
+
   r.post('/workers', (req, res) => {
     const id = slug(req.body?.id || req.body?.name);
     const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
@@ -174,6 +212,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
 
   r.get('/jobs', (req, res) => {
     jobs.reap();
+    jobs.signalUnservablePendingJobs();
     const limit = parsePositiveIntegerQuery(req.query.limit, 100, 300);
     const rows = db
       .prepare('SELECT * FROM jobs WHERE deleted = 0 ORDER BY created_at DESC LIMIT ?')
@@ -205,13 +244,29 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
   });
 
   r.post('/jobs', (req, res) => {
-    const runner = ['claude', 'codex', 'grok'].includes(req.body?.runner) ? req.body.runner : '';
-    if (!runner) return res.status(400).json({ error: 'runner/workspace/prompt required' });
+    const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : '';
+    const stageValues: WorkflowStage[] = ['plan', 'review', 'execute', 'fix', 'maintenance', 'patrol'];
+    const stage = stageValues.includes(req.body?.stage) ? req.body.stage as WorkflowStage : 'execute';
+    const taskPath = typeof req.body?.taskPath === 'string' ? req.body.taskPath.trim() : '';
+    const suppliedFingerprint = typeof req.body?.problemFingerprint === 'string'
+      && /^[a-f0-9]{64}$/i.test(req.body.problemFingerprint.trim())
+      ? req.body.problemFingerprint.trim().toLowerCase()
+      : undefined;
+    if (req.body?.problemFingerprint !== undefined && !suppliedFingerprint) {
+      return res.status(400).json({ error: 'problemFingerprint must be a 64 character sha256' });
+    }
+    const workflow = jobs.workflowProfiles.snapshot({
+      stage,
+      taskPath,
+      problemFingerprint: suppliedFingerprint ?? problemFingerprint(prompt, taskPath),
+    });
+    const explicitRunner = ['claude', 'codex', 'grok'].includes(req.body?.runner) ? req.body.runner : null;
+    const runner = explicitRunner ?? workflow.selected.runner;
     const created = jobs.create({
       requestedBy: typeof req.body?.requestedBy === 'string' ? req.body.requestedBy : 'User',
       runner,
       workspace: typeof req.body?.workspace === 'string' ? req.body.workspace : '',
-      prompt: typeof req.body?.prompt === 'string' ? req.body.prompt : '',
+      prompt,
       workerId: typeof req.body?.workerId === 'string' && req.body.workerId ? req.body.workerId : null,
       priority: Number(req.body?.priority) || 0,
       ttlMinutes: Number(req.body?.ttlMinutes) || undefined,
@@ -223,6 +278,18 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
         write: req.body?.permissions?.write !== false,
         shell: req.body?.permissions?.shell === true,
         ssh: req.body?.permissions?.ssh === true,
+      },
+      options: {
+        model: runner === workflow.selected.runner ? workflow.selected.model : undefined,
+        reasoning: runner === workflow.selected.runner ? workflow.selected.reasoning : undefined,
+        workflowStage: stage,
+        taskPath,
+        problemFingerprint: workflow.problemFingerprint,
+        workflow,
+        runnerSource: explicitRunner ? 'override' : 'policy',
+        ...(explicitRunner && explicitRunner !== workflow.selected.runner
+          ? { runnerOverrideReason: 'User manual PC Worker panel override' }
+          : {}),
       },
       originContactId:
         typeof req.body?.originContactId === 'string' && req.body.originContactId
@@ -242,9 +309,13 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
         ...publicJob(created.job),
         merged: true,
         message: '已并入在途 job',
+        ...(created.queueWarning ? { queue_warning: created.queueWarning } : {}),
       });
     }
-    res.status(201).json(publicJob(created.job));
+    res.status(201).json({
+      ...publicJob(created.job),
+      ...(created.queueWarning ? { queue_warning: created.queueWarning } : {}),
+    });
   });
 
   r.post('/jobs/:id/action', (req, res) => {
@@ -257,6 +328,25 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
       return res.status(outcome.error === 'job not found' ? 404 : 409).json({ error: outcome.error });
     }
     res.json({ ok: true, status: outcome.status });
+  });
+
+  r.post('/jobs/:id/quality', (req, res) => {
+    const job = jobs.get(req.params.id);
+    if (!job || job.deleted === 1) return res.status(404).json({ error: 'job not found' });
+    if (!['done', 'blocked', 'failed', 'interrupted'].includes(job.status)) {
+      return res.status(409).json({ error: 'quality can only be recorded after a terminal job outcome' });
+    }
+    const quality = req.body?.quality as WorkflowQuality;
+    if (!['success', 'inadequate', 'infrastructure'].includes(quality)) {
+      return res.status(400).json({ error: 'quality must be success, inadequate, or infrastructure' });
+    }
+    const outcome = jobs.workflowProfiles.record(job, {
+      quality,
+      detail: typeof req.body?.detail === 'string' ? req.body.detail : undefined,
+    });
+    if ('error' in outcome) return res.status(409).json({ error: outcome.error });
+    jobs.addMessage(job.id, 'User', 'quality', JSON.stringify({ quality, ...outcome }));
+    res.json({ ok: true, ...outcome });
   });
 
   r.post('/jobs/:id/resolve-out-of-band', (req, res) => {
@@ -308,6 +398,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
     ).run(JSON.stringify(caps), bootId, bootId, worker.id);
     updateWorkerRuntimeStatus(worker.id);
     const updated = db.prepare('SELECT * FROM workers WHERE id = ?').get(worker.id) as WorkerRow;
+    jobs.signalUnservablePendingJobs();
     sse.broadcast('worker', publicWorker(updated));
     res.json({ worker: publicWorker(updated), leaseSeconds: LEASE_SECONDS });
   });
@@ -566,8 +657,19 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
     const deliveryMeta = deliveryWithChecks ? JSON.stringify(deliveryWithChecks).slice(0, 100_000) : null;
     const outcome = jobs.complete(job, req.body?.status, result, error, deliveryState, deliveryMeta);
     if ('error' in outcome) return res.status(409).json({ error: outcome.error });
+    const quality = req.body?.quality?.kind as WorkflowQuality | undefined;
+    let qualityOutcome: ReturnType<typeof jobs.workflowProfiles.record> | undefined;
+    if (outcome.changed && quality && ['success', 'inadequate', 'infrastructure'].includes(quality)) {
+      qualityOutcome = jobs.workflowProfiles.record(jobs.get(job.id)!, {
+        quality,
+        detail: typeof req.body?.quality?.detail === 'string' ? req.body.quality.detail : undefined,
+      });
+      if (!('error' in qualityOutcome)) {
+        jobs.addMessage(job.id, worker.id, 'quality', JSON.stringify({ quality, ...qualityOutcome }));
+      }
+    }
     updateWorkerRuntimeStatus(worker.id);
-    res.json({ ok: true, status: outcome.status });
+    res.json({ ok: true, status: outcome.status, ...(qualityOutcome ? { quality: qualityOutcome } : {}) });
   });
 
   return r;

@@ -94,6 +94,21 @@ selection when rules and the L1 suggestion both miss. Dispatches go through the
 normal AI Hub message API. Unroutable actionable events are parked in Memory
 Vault `inbox/` with the `triage-backlog` tag.
 
+Module layout (split 2026-08-19; behavior-preserving):
+
+- `triage-worker.mjs` — lifecycle only: config load, constructor, run loop,
+  sources/webhook wiring, maintenance mode, shutdown. Domain methods are
+  mounted onto `TriageWorker.prototype` from `worker-*.mjs` mixins
+  (`followups` / `coordination` / `proactive` / `outcomes` / `backlog` /
+  `reminders` / `idea-diary` / `pipeline`), sharing flags, logging, and
+  state-key constants via `worker-shared.mjs`.
+- `triage-core.mjs` — pure domain functions (config normalizers, planners,
+  prompts, parsing). It re-exports `triage-shared.mjs` (constants, stableJson,
+  normalizeEvent, Shanghai day helpers) and `triage-store.mjs` (the SQLite
+  `TriageStore`), so existing imports keep working unchanged.
+- `triage-migrations.mjs` — versioned schema migrations (user_version, one
+  transaction per migration).
+
 Requirements:
 
 - Node.js 22.13 or newer (`node:sqlite` is used for the queue).
@@ -109,9 +124,73 @@ node triage-worker.mjs /etc/ai-hub/triage.json --once
 node triage-worker.mjs /etc/ai-hub/triage.json --metrics
 ```
 
+Run only the daily Agenda shadow once:
+
+```bash
+node triage-worker.mjs /etc/ai-hub/triage.json --once --agenda
+```
+
+Without a local production config, `node triage-worker.mjs --once --agenda`
+prints a health-gate quiet reason and exits without contacting the Hub or Vault.
+
 Set current DeepSeek prices in `deepseek.pricing`; zero means cost metrics are
 unknown rather than guessed. The daily event and cost breakers, per-recipient
 daily limit, and cooldown are all enforced before dispatch.
+
+### Maintenance mode (store open/migration failure)
+
+If the SQLite store cannot be opened or migrated at startup (failed migration,
+schema newer than the binary, corrupt file), the worker no longer crash-loops
+under systemd. It enters maintenance mode instead:
+
+- The webhook stays up. `GET /health` reports `status: "maintenance"` with the
+  failure reason; `POST /event` appends events to
+  `<stateFile>.maintenance-intake.jsonl` and answers
+  `202 {status: "maintenance-intake"}`.
+- Everything on the dispatch side is disabled: no sources, no reminders, no
+  coordination scan, no vault outbox, no event processing. A warning heartbeat
+  is logged every 10 minutes.
+- One-shot commands (`--once`, `--metrics`, `--task-reminders`) fail fast with
+  exit code 1 instead of idling.
+- After the operator fixes the store and restarts, the intake journal is
+  replayed through the normal enqueue path (event ids derive from `dedupeKey`,
+  so replay is idempotent) and archived as `*.replayed-<timestamp>`.
+
+Startup logs `triage db ready {schemaFrom, schemaTo}` on every healthy boot, so
+production migrations leave an auditable journal line.
+
+### Daily Agenda shadow
+
+`agenda` defaults to enabled and runs once per Shanghai wall-clock day at 09:00.
+It inherits `coordination.roomId` and `coordination.hostName`; `agenda.roomId` and
+`agenda.hostName` can override those values. The shadow reads `list_inbox`,
+`get_task_context`, and `GET /api/jobs`, then deterministically sorts by due date,
+P priority, and creation date. It posts at most one three-part digest (`would-auto`,
+`would-ask`, `deferred / 异常`) with `trigger:false`, `capture:false`, and zero
+reaction rounds. `would-auto` is observational only: Agenda never calls a Vault
+write tool and never creates, updates, or dispatches a job.
+
+The per-Shanghai-date state key makes same-day reruns idempotent. A separate v3
+increment cursor in `triage_source_state` remembers each item's fingerprint,
+first-seen date, and last date it was actually expanded, plus equivalent
+job-status observations. Unchanged undated tasks are suppressed for
+`agenda.resurfaceDays` (default 7) and then surface again; today/overdue tasks
+surface daily. Content, mode/tier, priority, due-state, or job-status changes
+surface immediately. Display overflow is never marked shown: unseen entries are
+rotated ahead of previously expanded entries until every item has appeared.
+Reconcile and deferred detail each show at most eight rows. A compact overview
+reports open tasks, expanded and suppressed counts, and oldest pending age.
+Fold counts and naturally changing age values do not affect the digest
+fingerprint, so a next-day run with no real increment stays quiet. Existing v2
+fingerprint-only cursor values are read compatibly and resurface once on upgrade.
+
+When `coordination.tasksDir` is configured, Agenda reads each listed task file
+and classifies its frontmatter first: subject to the existing T2/T3 safety
+patterns, `mode: auto` is a T1 shadow candidate, while `mode: ask` or a readable
+file with no mode is at least T2. An unreadable file falls back to the v1 title
+classifier. Maintenance mode or an unavailable Vault suppresses `would-auto`;
+an unavailable jobs API only adds one degraded reconcile line and does not block
+the task/inbox sections.
 
 ### Backlog dispatch claims
 

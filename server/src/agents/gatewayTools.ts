@@ -3,7 +3,12 @@ import type { HubLogger } from '../logger.js';
 import { canonicalWorkspacePath } from '../workers/coordinationKeys.js';
 import { coordinationMarkerDispatchKey, parseCoordinationMarker } from '../workers/coordinationReceipt.js';
 import { normalizeRoomCoordinationDispatch } from './roomPrompt.js';
-import { JobStore, workspaceAllowed } from '../workers/jobStore.js';
+import { coordinationTaskPath, JobStore, workspaceAllowed } from '../workers/jobStore.js';
+import {
+  problemFingerprint,
+  stageForRouteClass,
+  type WorkflowSnapshot,
+} from '../workers/workflowProfiles.js';
 
 /**
  * Gateway-executed tools exposed to contacts (phase 2 of the PC worker
@@ -40,15 +45,8 @@ type RunnerSource = 'policy' | 'override';
 
 const ROUTE_CLASS_VALUES: RouteClass[] = ['implement', 'fix', 'review', 'recon', 'mechanical'];
 const RUNNER_VALUES: DelegatedRunner[] = ['claude', 'codex', 'grok'];
-const ROUTE_DEFAULT_RUNNER: Record<RouteClass, 'codex' | 'grok'> = {
-  implement: 'codex',
-  fix: 'codex',
-  review: 'grok',
-  recon: 'grok',
-  mechanical: 'grok',
-};
 const ROUTE_POLICY_TEXT =
-  '默认路由表：implement/fix→codex；review/recon/mechanical→grok；偏离默认必须显式传非空 runner_override_reason。';
+  '默认 runner/model/effort 由当前 Workflow Profile 和 route_class 决定；偏离必须显式传非空 runner_override_reason。';
 const ROUTE_CLASS_REQUIRED_ERROR =
   `route_class 必填，且必须是 ${ROUTE_CLASS_VALUES.join(' | ')}。${ROUTE_POLICY_TEXT}`;
 
@@ -88,6 +86,39 @@ function record(value: unknown): Record<string, unknown> {
 
 function parseRecord(value: string | null | undefined): Record<string, unknown> {
   try { return record(value ? JSON.parse(value) : {}); } catch { return {}; }
+}
+
+function pinnedCoordinationWorkflow(
+  db: Db,
+  originChatId: string,
+  contactId: string,
+  taskPath: string,
+  fingerprint: string,
+): WorkflowSnapshot | null {
+  if (!taskPath) return null;
+  const row = db.prepare(
+    `SELECT json_extract(meta, '$.roomHost.workflow') AS workflow
+     FROM messages
+     WHERE contact_id = ? AND sender = 'room-host' AND deleted = 0
+       AND json_extract(meta, '$.roomHost.coordination.kind') = 'execution'
+       AND json_extract(meta, '$.roomHost.coordination.taskPath') = ?
+       AND json_extract(meta, '$.roomHost.coordination.executor') = ?
+       AND json_type(meta, '$.roomHost.workflow') = 'object'
+     ORDER BY id DESC LIMIT 1`
+  ).get(originChatId, taskPath, contactId) as { workflow?: string } | undefined;
+  const value = parseRecord(row?.workflow);
+  const selected = record(value.selected);
+  if (
+    value.taskPath !== taskPath
+    || value.problemFingerprint !== fingerprint
+    || typeof value.profileId !== 'string'
+    || !Number.isSafeInteger(value.profileVersion)
+    || typeof value.workflowFingerprint !== 'string'
+    || !['claude', 'codex', 'grok'].includes(String(selected.runner))
+    || typeof selected.model !== 'string'
+    || typeof selected.reasoning !== 'string'
+  ) return null;
+  return value as unknown as WorkflowSnapshot;
 }
 
 function briefValue(value: unknown, max = 180): string {
@@ -144,13 +175,23 @@ function jobBrief(job: JobRow): string {
   ].join('\n');
 }
 
+/** 派单 authority 的 TTL：旧派单即便未被新版取代，超时后也不再构成授权。 */
+const DEFAULT_DISPATCH_TTL_HOURS = 24;
+const MAX_DISPATCH_TTL_HOURS = 24 * 7;
+
+function coordinationDispatchTtlHours(roomConfig: Record<string, unknown>): number {
+  const value = Number(record(roomConfig.coordination).dispatchTtlHours);
+  if (!Number.isFinite(value)) return DEFAULT_DISPATCH_TTL_HOURS;
+  return Math.min(Math.max(value, 1), MAX_DISPATCH_TTL_HOURS);
+}
+
 /**
  * Coordination-marker prompt 的工具层硬闸（不再只靠 prompt 约束）：
  * 只有会议室里最新一张对应 taskPath 的 room-host 执行派单消息里点名的
  * executor，才能用该 marker 派单；fingerprint/taskPath 不匹配（伪造/跨 task）、
- * 已被新版派单取代（过期）、workspace 与派单不符，一律拒绝并留审计。
- * 派单消息本体由网关生成（roomHost meta 只受服务端控制），是可信 authority
- * 源；member/verifier 无论 prompt 被注入成什么样都拿不到这条授权。
+ * 已被新版派单取代（过期）、超过派单 TTL、workspace 与派单不符，
+ * 一律拒绝并留审计。派单消息本体由网关生成（roomHost meta 只受服务端控制），
+ * 是可信 authority 源；member/verifier 无论 prompt 被注入成什么样都拿不到这条授权。
  */
 function coordinationDelegateGate(
   db: Db,
@@ -174,20 +215,38 @@ function coordinationDelegateGate(
   };
   const dispatchKey = coordinationMarkerDispatchKey(marker);
   const row = db.prepare(
-    `SELECT messages.idempotency_key, messages.meta FROM messages
+    `SELECT messages.idempotency_key, messages.meta, messages.created_at,
+            contacts.config AS room_config
+     FROM messages
      JOIN contacts ON contacts.id = messages.contact_id
      WHERE messages.sender = 'room-host'
        AND contacts.kind = 'room'
        AND json_extract(messages.meta, '$.roomHost.coordination.kind') = 'execution'
        AND json_extract(messages.meta, '$.roomHost.coordination.taskPath') = ?
      ORDER BY messages.id DESC LIMIT 1`
-  ).get(marker.taskPath) as { idempotency_key: string | null; meta: string } | undefined;
+  ).get(marker.taskPath) as {
+    idempotency_key: string | null;
+    meta: string;
+    created_at: string;
+    room_config: string | null;
+  } | undefined;
   if (!row) {
     return reject('找不到这张任务的会议室执行派单；不能凭 marker 自派 coordination 任务');
   }
   if (row.idempotency_key !== dispatchKey) {
     return reject('fingerprint 与最新派单不符（伪造或已被新版任务取代）', {
       latestKey: row.idempotency_key,
+    });
+  }
+  const ttlHours = coordinationDispatchTtlHours(parseRecord(row.room_config));
+  const dispatchedAtMs = Date.parse(`${String(row.created_at ?? '').replace(' ', 'T')}Z`);
+  if (!Number.isFinite(dispatchedAtMs)) {
+    return reject('派单时间戳无效，无法核验 TTL', { dispatchedAt: row.created_at });
+  }
+  if (Date.now() - dispatchedAtMs > ttlHours * 3_600_000) {
+    return reject(`执行派单已过期（超过 ${ttlHours} 小时 TTL）；请 room-host 重新派单后再委派`, {
+      dispatchedAt: row.created_at,
+      ttlHours,
     });
   }
   let dispatch;
@@ -275,9 +334,13 @@ export function buildDelegateTools(
           model: {
             type: 'string',
             description:
-              '覆盖默认模型（不填时 claude=claude-opus-5、codex=gpt-5.6-sol、grok=grok-4.6）。Claude 固定版本必须写清系列和版本，例如 Opus 4.6 或 claude-opus-4-6；用户指定版本时禁止用会漂移的 opus/sonnet 别名代替。Codex 例如 gpt-5.6-sol。',
+              '覆盖当前 Workflow Profile 的模型。Claude 固定版本必须写清系列和版本，例如 Opus 4.7 或 claude-opus-4-7；用户指定版本时禁止用会漂移的 opus/sonnet 别名代替。Codex 例如 gpt-5.6-sol。',
           },
-          effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: '推理强度（claude: effort，codex/grok: reasoning_effort）；不填时各 runner 默认 high' },
+          effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], description: '推理强度（claude: effort，codex/grok: reasoning_effort）；不填时按当前 Workflow Profile' },
+          problem_fingerprint: {
+            type: 'string',
+            description: '可选的同一问题稳定指纹（64 位 sha256）；coordination 任务默认从 planHash 推出',
+          },
         },
         required: ['route_class', 'workspace', 'prompt'],
       },
@@ -287,7 +350,28 @@ export function buildDelegateTools(
         if (!routeClass) return { ok: false, text: ROUTE_CLASS_REQUIRED_ERROR };
         if (workspaces.length === 0)
           return { ok: false, text: '你的委派白名单是空的——让 User 在联系人配置 delegation.workspaces 里加上允许的路径。' };
-        const expectedRunner = ROUTE_DEFAULT_RUNNER[routeClass];
+        const taskPath = coordinationTaskPath(String(input.prompt ?? '')) ?? '';
+        const suppliedProblemFingerprint = typeof input.problem_fingerprint === 'string'
+          && /^[a-f0-9]{64}$/i.test(input.problem_fingerprint.trim())
+          ? input.problem_fingerprint.trim().toLowerCase()
+          : undefined;
+        if (input.problem_fingerprint !== undefined && !suppliedProblemFingerprint) {
+          return { ok: false, text: 'problem_fingerprint 必须是 64 位 sha256。' };
+        }
+        const fingerprint = suppliedProblemFingerprint
+          ?? problemFingerprint(String(input.prompt ?? ''), taskPath);
+        const workflow = pinnedCoordinationWorkflow(
+          db,
+          originChatId,
+          contactId,
+          taskPath,
+          fingerprint,
+        ) ?? store.workflowProfiles.snapshot({
+          stage: stageForRouteClass(routeClass),
+          taskPath,
+          problemFingerprint: fingerprint,
+        });
+        const expectedRunner = workflow.selected.runner;
         const explicitRunner = input.runner === undefined
           ? undefined
           : RUNNER_VALUES.includes(input.runner as DelegatedRunner)
@@ -321,7 +405,9 @@ export function buildDelegateTools(
         );
         if (!coordinationGate.ok) return coordinationGate;
         const wantWrite = input.write !== false;
-        const wantShell = input.shell === true || runner === 'codex';
+        const grokExecutionNeedsShell = runner === 'grok'
+          && (workflow.stage === 'execute' || workflow.stage === 'fix');
+        const wantShell = input.shell === true || runner === 'codex' || grokExecutionNeedsShell;
         if (wantShell && cfg.allowShell !== true)
           return { ok: false, text: 'Shell 能力没开（联系人配置 delegation.allowShell）。claude 任务可以不带 shell 再试。' };
         const wantSsh = input.ssh === true;
@@ -335,12 +421,17 @@ export function buildDelegateTools(
         if (input.model !== undefined && !model) {
           return {
             ok: false,
-            text: 'model 无效。Claude 固定版本请同时写系列和版本，例如 Opus 4.6 或 claude-opus-4-6；不能只写 4.6。',
+            text: 'model 无效。Claude 固定版本请同时写系列和版本，例如 Opus 4.7 或 claude-opus-4-7；不能只写 4.7。',
           };
         }
-        const effort = typeof input.effort === 'string' && ['low', 'medium', 'high', 'xhigh', 'max'].includes(input.effort)
+        const effort = typeof input.effort === 'string' && ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(input.effort)
           ? input.effort : undefined;
-        const defaults = RUNNER_DEFAULTS[runner];
+        if (effort === 'ultra' && runner !== 'codex') {
+          return { ok: false, text: 'ultra 当前只对 Codex runner 开放。' };
+        }
+        const defaults = runner === workflow.selected.runner
+          ? { model: workflow.selected.model, effort: workflow.selected.reasoning }
+          : RUNNER_DEFAULTS[runner];
         const finalModel = model ?? defaults?.model;
         const finalEffort = effort ?? defaults?.effort;
         const created = store.create({
@@ -357,6 +448,10 @@ export function buildDelegateTools(
             routeClass,
             runnerSource,
             ...(overrideReason ? { runnerOverrideReason: overrideReason } : {}),
+            workflowStage: workflow.stage,
+            taskPath,
+            problemFingerprint: fingerprint,
+            workflow,
           },
           originContactId: originChatId,
           originAnchorId: anchor.m ?? null,
@@ -366,14 +461,17 @@ export function buildDelegateTools(
         if (created.merged) {
           return {
             ok: true,
-            text: `${jobBrief(created.job)}\n已并入在途 job；同一 taskPath 不再新建第二张。`,
+            text:
+              `${jobBrief(created.job)}\n已并入在途 job；同一 taskPath 不再新建第二张。` +
+              (created.queueWarning ? `\n⚠ ${created.queueWarning}` : ''),
           };
         }
         return {
           ok: true,
           text:
             `${jobBrief(created.job)}\n已进入队列。PC 在线会自动认领；离线则等它上线。` +
-            `结果回来网关会通知你，本回合不用等——先把已派单的事告诉 User。`,
+            `结果回来网关会通知你，本回合不用等——先把已派单的事告诉 User。` +
+            (created.queueWarning ? `\n⚠ ${created.queueWarning}` : ''),
         };
       },
     },

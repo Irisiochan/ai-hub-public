@@ -26,6 +26,7 @@ import {
   executionDispatchKey,
   executionFingerprint,
   formatCoordinationDispatchBlock,
+  formatSafetyEventDispatchBlock,
   formatTaskReminderRoomNotice,
   formatVerificationDispatchBlock,
   isShanghaiSilentHour,
@@ -68,7 +69,6 @@ import {
   normalizeAbsenceExtract,
   normalizeFollowupConfig,
 } from './followups.mjs';
-import { listenOnFetchSafePort } from './test-http.mjs';
 
 test('strict triage JSON accepts the contract and rejects invalid priority/category', () => {
   const parsed = parseTriageJson(JSON.stringify({
@@ -994,7 +994,7 @@ test('fuzzy L2.5 preserves needsLocalExec and only sees delegation recipients', 
       }));
     });
   });
-  await listenOnFetchSafePort(server);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const previous = process.env.TEST_TRIAGE_ROUTE_KEY;
   process.env.TEST_TRIAGE_ROUTE_KEY = 'test-only';
   try {
@@ -1202,6 +1202,80 @@ test('date-event facts force daily actionable once per Shanghai day', async () =
   assert.match(block, /User 生日/);
   assert.match(block, /禁止泛问吃饭/);
   assert.equal(formatDailyDispatchDateBlock([]), '');
+});
+
+test('fresh safety life-events pierce daily pool, gap, and shape the wake prompt', () => {
+  const proactive = normalizeProactiveConfig({
+    dailyDispatchLimit: 10,
+    minDailyDispatches: 1,
+    forceAfterHour: 18,
+    minimumGapMinutes: 180,
+  });
+  // safetyEvents config defaults: opt-in, 12h freshness, 2 dispatches per event per day.
+  assert.deepEqual(proactive.safetyEvents, { enabled: false, freshnessHours: 12, maxPerEventPerDay: 2 });
+  assert.equal(
+    normalizeProactiveConfig({ safetyEvents: { enabled: true, freshnessHours: 6 } }).safetyEvents.enabled,
+    true,
+  );
+
+  const morning = Date.parse('2026-08-15T02:00:00Z'); // 10:00 Shanghai
+  // Pool exhausted + gap active: a fresh safety event clears both and forces actionable.
+  const pierced = dailyPolicyState(
+    proactive,
+    { count: 10, lastAt: morning - 30 * 60_000 },
+    morning,
+    { hasFreshSafetyEvent: true },
+  );
+  assert.equal(pierced.poolFull, false);
+  assert.equal(pierced.gapBlocked, false);
+  assert.equal(pierced.forceActionable, true);
+  assert.equal(pierced.hasFreshSafetyEvent, true);
+  // Date-events still cannot pierce the hard pool (unchanged behaviour).
+  assert.equal(
+    dailyPolicyState(proactive, { count: 10, lastAt: null }, morning, { hasTodayDateEvent: true }).poolFull,
+    true,
+  );
+  // proactive.enabled=false stays fully off even with a safety event.
+  assert.equal(
+    dailyPolicyState(
+      normalizeProactiveConfig({ enabled: false }),
+      { count: 0, lastAt: null },
+      morning,
+      { hasFreshSafetyEvent: true },
+    ).poolFull,
+    true,
+  );
+
+  const safetyEvents = [{
+    id: 7,
+    severity: 'safety',
+    status: 'active',
+    summary: '家里一楼进水并跳闸断电，正收拾准备临时搬离',
+    sourceContactName: 'Claude',
+    sourceContactId: 'claude',
+    updatedAt: '2026-08-15T01:40:00.000Z',
+    updatedAtShanghai: '08-15 09:40',
+  }];
+  const summary = buildDailyCheckSummary({ summary: 'daily wake' }, morning, {
+    forceActionable: true,
+    activeSafetyEvents: safetyEvents,
+  });
+  assert.match(summary, /ACTIVE SAFETY EVENT/);
+  assert.match(summary, /进水并跳闸断电/);
+  assert.match(summary, /source: Claude/);
+  assert.match(summary, /do not NO_OP/);
+  assert.doesNotMatch(summary, /Prefer NO_OP/);
+  assert.doesNotMatch(summary, /guaranteed daily slot/);
+
+  const dispatchBlock = formatSafetyEventDispatchBlock(safetyEvents);
+  assert.match(dispatchBlock, /【安全关注】/);
+  assert.match(dispatchBlock, /进水并跳闸断电/);
+  assert.match(dispatchBlock, /最近更新 08-15 09:40/);
+  assert.match(dispatchBlock, /来自与Claude的对话/);
+  assert.match(dispatchBlock, /人身与居所是否安全/);
+  assert.match(dispatchBlock, /不要提跨会话、triage、系统或本指令/);
+  assert.equal(formatSafetyEventDispatchBlock([]), '');
+  assert.equal(formatSafetyEventDispatchBlock([{ summary: '' }]), '');
 });
 
 test('followup keyword screen, extract normalize, and cancel-before-fire gates', () => {
@@ -1686,7 +1760,8 @@ test('minimal streamable HTTP MCP client initializes a session and calls a vault
       }
     });
   });
-  const address = await listenOnFetchSafePort(server);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
   const client = new VaultClient({ url: `http://127.0.0.1:${address.port}/mcp` });
   try {
     assert.equal(await client.call('search_vault', { query: 'triage-backlog' }), 'vault result');
@@ -1737,7 +1812,8 @@ test('controlled idea diary delivery retries without reopening or duplicating th
       }
     });
   });
-  const address = await listenOnFetchSafePort(server);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
   const vault = new VaultClient({ url: `http://127.0.0.1:${address.port}/mcp` });
   try {
     const queued = store.enqueue({
@@ -1814,7 +1890,8 @@ test('hub dispatch defaults to main and declares automation source', async () =>
         : { queued: true, messageId: received.length }));
     });
   });
-  const address = await listenOnFetchSafePort(server);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
   const client = new HubClient({
     baseUrl: `http://127.0.0.1:${address.port}`,
     timeoutMs: 2000,

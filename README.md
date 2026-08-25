@@ -7,6 +7,9 @@ Grok CLI 和任意 API 模型接进同一套持久会话、长期记忆、任务
 PC Worker 在个人设备执行任务，triage worker 处理主动事件，会议室负责可信派单、handoff 和回执。
 Web、Electron 桌面端和 Android 客户端只是这套 harness 的交互入口。
 
+> 当前公开版本：**v0.2.0**（2026-08-25）。AI Hub 与 Memory Vault 独立版本化；
+> 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
 > 但不承诺支持、不保证响应 issue，PR 随缘。拿去用、拿去改都欢迎（MIT）。
 
@@ -16,17 +19,21 @@ Web、Electron 桌面端和 Android 客户端只是这套 harness 的交互入�
   `codex app-server`（JSON-RPC）、Grok CLI 和 API 直连模型（Anthropic / OpenAI-compatible /
   Gemini 原生协议）组织成长期在线的独立联系人；每个联系人保留自己的会话、人格、权限与工作目录
 - **协作与 handoff**：拉现有联系人建群，用 `@名字` / `@all` 调度；Plan 就绪的任务可进入会议室工作总线，
-  由网关签发可信派单，成员接单、委派、交付，协调指纹和完成回执防止正文伪造状态
+  由网关签发可信派单，成员接单、委派、交付；任务控制器、协调指纹、durable outbox 和完成回执
+  共同防止正文伪造状态、重复派单或崩溃后丢回执
+- **Workflow Profiles**：把 Plan / Review / Execute / Fix / Maintenance / Patrol 的 runner、模型与
+  reasoning 映射收进版本化配置；每个任务冻结路由快照，支持预览、切换、回滚与三次质量不收敛后的兜底
 - **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
   任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
 - **长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，
   支持 full / compact / off 三档，并通过独立、版本化的 MCP 契约接入
 - **自主 triage worker**：VPS 常驻事件分诊——daily 主动陪伴、纪念日/生日提醒、任务到期催办、
-  临时离开跟进，全部走廉价 flash 模型把关后才打扰人
+  临时离开跟进；每日 Agenda 只展示真实增量，未展示项轮转、长期静默项定期重新浮出；数据库异常时进入
+  可观测 maintenance mode，不在坏状态下继续派单
 - **IM 式交互入口**：每个 AI 是一个联系人，一条持续演进的对话；历史跨设备同步，支持群聊、
   改名、头像与主题色，Web、Electron 和 Android 共用同一套网关
 - **图片与模型能力**：选图或粘贴截图直接发送，API 联系人可按需配置独立视觉模型；
-  Claude / Codex 标题栏可显示 5h / 周窗口剩余
+  可选图片描述与跨联系人生活事件抽取；Claude / Codex 标题栏可显示 5h / 周窗口剩余
 - **运维内建**：token 门控的一键部署端点（拉取/构建/重启/健康检查/失败自动回滚）、
   SQLite 在线定时备份（integrity 校验 + 保留窗口）、发布状态面板
 
@@ -94,17 +101,7 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 - 系统提示词分几层、想改口吻该动哪一层：[docs/prompt-layers.md](docs/prompt-layers.md)
 - 自动消息 `origin` 兼容与 side 审计层约定（任务执行进会议室，daily 陪伴进 `main`）：
   [docs/split-private-and-side-channel-windows.md](docs/split-private-and-side-channel-windows.md) 文末「side 退役为审计层」
-- **多会话并发写这个仓库时先开自己的分支**（暂存区是仓库级共享状态，直接在 master 上
-  add/commit 会互相收走对方的文件）：
-
-  ```bash
-  git config core.hooksPath deploy/githooks   # 每个 checkout 装一次，挡住 master 直提
-  bash deploy/session-worktree.sh add <本次任务短名>
-  # 干完在自己的 worktree 里 commit，再回主检出 merge --ff-only session/<短名> 并 push
-  ```
-
-  集成、修部署脚本这类确实要就地提交的，用 `AI_HUB_ALLOW_MASTER=1 git commit ...` 单次放行；
-  PC Worker 的 job 已经带着这个变量跑，委派链路不受影响。
+- 多会话并发开发时，为每个任务使用独立 branch/worktree，提交时只暂存本任务文件，避免共享暂存区串单
 - 秘密只走 `.env`（gitignore）：`CLAUDE_CODE_OAUTH_TOKEN`、`VAULT_TOKEN`、`DEPLOY_TOKEN`、`DEEPSEEK_API_KEY`
 
 ## Memory Vault

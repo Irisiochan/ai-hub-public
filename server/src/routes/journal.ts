@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { captionsFromMeta } from '../captionService.js';
 import type { Db } from '../db.js';
 import { parsePositiveIntegerQuery } from '../queryParams.js';
 
@@ -42,6 +43,7 @@ interface JournalRow {
   role: 'user' | 'assistant';
   at: string;
   content: string;
+  meta: string | null;
 }
 
 export function journalDay(db: Db, date: string, limit = DEFAULT_LIMIT): JournalMessage[] {
@@ -52,7 +54,8 @@ export function journalDay(db: Db, date: string, limit = DEFAULT_LIMIT): Journal
               c.name          AS contact_name,
               m.role          AS role,
               strftime('%H:%M', m.created_at, '+8 hours') AS at,
-              m.content       AS content
+              m.content       AS content,
+              m.meta          AS meta
          FROM messages m
          JOIN contacts c ON c.id = m.contact_id
         WHERE date(m.created_at, '+8 hours') = ?
@@ -72,17 +75,22 @@ export function journalDay(db: Db, date: string, limit = DEFAULT_LIMIT): Journal
     )
     .all(date, ...MACHINE_PREFIXES, limit) as JournalRow[];
 
-  return rows.map((row) => ({
-    id: row.id,
-    contactId: row.contact_id,
-    contactName: row.contact_name,
-    role: row.role,
-    at: row.at ?? '',
-    content: row.content.length > MAX_CONTENT_CHARS
-      ? row.content.slice(0, MAX_CONTENT_CHARS)
-      : row.content,
-    clipped: row.content.length > MAX_CONTENT_CHARS,
-  }));
+  return rows.map((row) => {
+    // caption 旁路（P3 S1）：图片转写并入正文，日记蒸馏才看得到图里的事。
+    const captions = row.role === 'user' ? captionsFromMeta(row.meta) : [];
+    const content = captions.length > 0
+      ? [row.content, ...captions.map((c) => `[图片内容：${c}]`)].join('\n')
+      : row.content;
+    return {
+      id: row.id,
+      contactId: row.contact_id,
+      contactName: row.contact_name,
+      role: row.role,
+      at: row.at ?? '',
+      content: content.length > MAX_CONTENT_CHARS ? content.slice(0, MAX_CONTENT_CHARS) : content,
+      clipped: content.length > MAX_CONTENT_CHARS,
+    };
+  });
 }
 
 export function journalRouter(db: Db): Router {

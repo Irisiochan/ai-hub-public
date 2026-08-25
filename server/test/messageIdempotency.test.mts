@@ -168,7 +168,7 @@ legacy.close();
 
 const upgraded = openDb(upgradePath);
 try {
-  assert.equal(upgraded.pragma('user_version', { simple: true }), 22);
+  assert.equal(upgraded.pragma('user_version', { simple: true }), 27);
   const messageColumns = upgraded.pragma('table_info(messages)') as Array<{ name: string }>;
   assert.ok(messageColumns.some((column) => column.name === 'idempotency_key'));
   const outbox = upgraded.prepare('SELECT * FROM memory_outbox').get() as {
@@ -182,6 +182,8 @@ try {
   );
   const writebackColumns = upgraded.pragma('table_info(task_writebacks)') as Array<{ name: string }>;
   assert.ok(writebackColumns.some((column) => column.name === 'idempotency_key'));
+  assert.ok(writebackColumns.some((column) => column.name === 'command_id'));
+  assert.ok(writebackColumns.some((column) => column.name === 'event_id'));
   upgraded.prepare(
     `INSERT INTO messages (
        contact_id, sender, role, kind, content, status, meta, origin, idempotency_key

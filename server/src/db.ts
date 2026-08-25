@@ -71,6 +71,8 @@ export interface TaskWritebackRow {
   source_ref: string;
   status: 'processing' | 'applied' | 'proposed' | 'rejected' | 'ambiguous' | 'conflict' | 'queued' | 'failed';
   detail: string | null;
+  command_id: string | null;
+  event_id: string | null;
   created_at: string;
   updated_at: string;
 }

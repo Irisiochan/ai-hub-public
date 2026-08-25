@@ -163,6 +163,13 @@ test('codex reasoning effort uses the supported config override for fresh and re
   }, {}, { platform: 'win32' });
   assert.equal(resumed.args.includes('--reasoning-effort'), false);
   assert.equal(resumed.args.includes('model_reasoning_effort="max"'), true);
+
+  const ultra = buildRunnerSpec({
+    ...baseJob,
+    runner: 'codex',
+    options: { reasoning: 'ultra' },
+  }, {}, { platform: 'win32' });
+  assert.equal(ultra.args.includes('model_reasoning_effort="ultra"'), true);
 });
 
 test('codex resume re-applies the exact job sandbox in all three modes', () => {

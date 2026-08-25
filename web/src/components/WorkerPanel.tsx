@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, type JobMessage, type Worker, type WorkerJob } from '../api';
+import {
+  api,
+  type JobMessage,
+  type Worker,
+  type WorkerJob,
+  type WorkflowProfile,
+  type WorkflowStage,
+} from '../api';
 import {
   DeliverySummaryCard,
   hideJobWindow,
@@ -27,11 +34,15 @@ export default function WorkerPanel({ onClose }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<JobMessage[]>([]);
   const [error, setError] = useState('');
-  const [drawer, setDrawer] = useState<'none' | 'compose' | 'pair'>('none');
+  const [drawer, setDrawer] = useState<'none' | 'compose' | 'pair' | 'profile'>('none');
+  const [profiles, setProfiles] = useState<WorkflowProfile[]>([]);
+  const [activeProfile, setActiveProfile] = useState<WorkflowProfile | null>(null);
+  const [previousProfile, setPreviousProfile] = useState<WorkflowProfile | null>(null);
   const [pairToken, setPairToken] = useState('');
   const [pairName, setPairName] = useState('my-pc');
   const [form, setForm] = useState({
-    runner: 'codex' as 'codex' | 'claude' | 'grok',
+    runner: '' as '' | 'codex' | 'claude' | 'grok',
+    stage: 'execute' as WorkflowStage,
     workspace: '',
     prompt: '',
     workerId: '',
@@ -41,9 +52,12 @@ export default function WorkerPanel({ onClose }: Props) {
   });
 
   const refresh = async () => {
-    const [w, j] = await Promise.all([api.workers(), api.jobs()]);
+    const [w, j, p] = await Promise.all([api.workers(), api.jobs(), api.workflowProfiles()]);
     setWorkers(w.workers);
     setJobs(j.jobs);
+    setProfiles(p.profiles);
+    setActiveProfile(p.active);
+    setPreviousProfile(p.previous);
     if (!form.workspace) {
       const first = w.workers.flatMap((x) => x.capabilities.workspaces ?? [])[0];
       if (first) setForm((f) => ({ ...f, workspace: f.workspace || first }));
@@ -102,7 +116,8 @@ export default function WorkerPanel({ onClose }: Props) {
     setError('');
     try {
       const job = await api.createJob({
-        runner: form.runner,
+        runner: form.runner || undefined,
+        stage: form.stage,
         workspace: form.workspace,
         prompt: form.prompt,
         workerId: form.workerId || undefined,
@@ -173,7 +188,54 @@ export default function WorkerPanel({ onClose }: Props) {
     }
   };
 
-  const permWarn = form.runner === 'codex' && !form.shell;
+  const switchProfile = async (profile: WorkflowProfile) => {
+    setError('');
+    try {
+      const preview = await api.previewWorkflowProfile(profile.id, profile.version);
+      const changedStages = preview.changes.length;
+      const ok = await confirm({
+        title: `切换到 ${profile.label}`,
+        message: `将改变 ${changedStages} 个角色路由。只影响切换后新建的任务；在途任务继续使用原快照。`,
+        confirmLabel: '切换协议',
+      });
+      if (!ok) return;
+      await api.switchWorkflowProfile(profile.id, profile.version);
+      await refresh();
+      setDrawer('none');
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const rollbackProfile = async () => {
+    if (!previousProfile) return;
+    const ok = await confirm({
+      title: '回滚工作流协议',
+      message: `回滚到 ${previousProfile.label}。只影响之后新建的任务。`,
+      confirmLabel: '回滚',
+    });
+    if (!ok) return;
+    await api.rollbackWorkflowProfile();
+    await refresh();
+    setDrawer('none');
+  };
+
+  const recordQuality = async (quality: 'success' | 'inadequate' | 'infrastructure') => {
+    if (!selected) return;
+    setError('');
+    try {
+      await api.recordJobQuality(selected.id, quality);
+      const detail = await api.job(selected.id);
+      setJobs((list) => list.map((job) => job.id === selected.id ? detail.job : job));
+      setMessages(detail.messages);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const profileRunner = activeProfile?.routes[form.stage]?.primary.runner;
+  const effectiveRunner = form.runner || profileRunner;
+  const permWarn = effectiveRunner === 'codex' && !form.shell;
 
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -182,6 +244,14 @@ export default function WorkerPanel({ onClose }: Props) {
           <b>PC Worker</b>
           <small>VPS 持久队列 · PC 主动认领</small>
           <span className="spacer" />
+          <button
+            type="button"
+            className={'chip-pill' + (drawer === 'profile' ? ' selected' : '')}
+            onClick={() => setDrawer(drawer === 'profile' ? 'none' : 'profile')}
+            title="切换只影响新任务；在途任务固定原协议快照"
+          >
+            {activeProfile?.label ?? '工作流协议'}
+          </button>
           <div className="worker-chips">
             {workers.map((w) => (
               <span key={w.id} className={`worker-chip ${w.status}`}>
@@ -265,10 +335,54 @@ export default function WorkerPanel({ onClose }: Props) {
           </section>
         )}
 
+        {drawer === 'profile' && (
+          <section className="worker-drawer workflow-profile-drawer">
+            <div className="workflow-profile-list">
+              {profiles.map((profile) => (
+                <button
+                  key={`${profile.id}@${profile.version}`}
+                  type="button"
+                  className={'workflow-profile-option' + (activeProfile?.id === profile.id && activeProfile.version === profile.version ? ' active' : '')}
+                  onClick={() => void switchProfile(profile)}
+                  disabled={activeProfile?.id === profile.id && activeProfile.version === profile.version}
+                >
+                  <b>{profile.label}</b>
+                  <span>{profile.description}</span>
+                  <small>
+                    Plan {profile.routes.plan.primary.model}/{profile.routes.plan.primary.reasoning}
+                    {' · '}Execute {profile.routes.execute.primary.model}/{profile.routes.execute.primary.reasoning}
+                  </small>
+                </button>
+              ))}
+            </div>
+            <small>切换只影响新任务；在途任务固定原 Profile 版本。</small>
+            {previousProfile && (
+              <button type="button" onClick={() => void rollbackProfile()}>
+                ↶ 回滚到 {previousProfile.label}
+              </button>
+            )}
+          </section>
+        )}
+
         {drawer === 'compose' && (
           <section className="worker-drawer compose">
             <div className="compose-row">
+              <select value={form.stage} onChange={(e) => setForm({ ...form, stage: e.target.value as WorkflowStage })}>
+                <option value="execute">执行</option>
+                <option value="fix">修复</option>
+                <option value="review">Review</option>
+                <option value="maintenance">维护</option>
+                <option value="patrol">巡逻</option>
+                <option value="plan">Plan</option>
+              </select>
               <div className="seg">
+                <button
+                  type="button"
+                  className={'seg-btn' + (!form.runner ? ' selected' : '')}
+                  onClick={() => setForm({ ...form, runner: '' })}
+                >
+                  按协议
+                </button>
                 {RUNNERS.map(([id, label]) => (
                   <button
                     key={id}
@@ -412,6 +526,28 @@ export default function WorkerPanel({ onClose }: Props) {
                     <span>worker {selected.worker_id || '尚未认领'}</span>
                   </div>
                   <DeliverySummaryCard job={selected} />
+                  {selected.options?.workflow && (
+                    <section className="workflow-job-card">
+                      <div>
+                        <b>{selected.options.workflow.profileLabel}</b>
+                        <span>
+                          {selected.options.workflow.stage} · {selected.options.workflow.selected.runner}/
+                          {selected.options.workflow.selected.model}/{selected.options.workflow.selected.reasoning}
+                        </span>
+                        {selected.options.workflow.fallbackActive && <em>已触发兜底</em>}
+                      </div>
+                      <code title={selected.options.workflow.workflowFingerprint}>
+                        v3 {selected.options.workflow.workflowFingerprint.slice(0, 12)}
+                      </code>
+                      {['done', 'blocked', 'failed', 'interrupted'].includes(selected.status) && (
+                        <div className="workflow-quality-actions">
+                          <button type="button" onClick={() => void recordQuality('success')}>质量收敛</button>
+                          <button type="button" onClick={() => void recordQuality('inadequate')}>效果不佳 +1</button>
+                          <button type="button" onClick={() => void recordQuality('infrastructure')}>平台故障（不计数）</button>
+                        </div>
+                      )}
+                    </section>
+                  )}
                   <article className="job-msg prompt">
                     <small>任务</small>
                     <pre>{selected.prompt}</pre>

@@ -3,9 +3,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { openDb } from '../src/db.js';
+import { openDb, type ContactRow } from '../src/db.js';
+import {
+  auditRoomOrchestratorConfigs,
+  dispatchCoordinationRoomHost,
+} from '../src/agents/coordinationRoom.js';
 import { buildDelegateTools } from '../src/agents/gatewayTools.js';
+import {
+  coordinationAuthorityHolderIds,
+  resolveRoomOrchestratorId,
+} from '../src/agents/roomPrompt.js';
 import { codexAppServerArgs } from '../src/agents/codexAppServer.js';
+import { redactSecrets } from '../src/agents/redactSecrets.js';
 import { hubMcpAuthMode, hubMcpBearerMatches, hubMcpBearerToken } from '../src/middleware/hubMcpAuth.js';
 import { hubMcpRouter } from '../src/routes/hubMcp.js';
 import { executionFingerprint } from '../src/workers/coordinationKeys.js';
@@ -111,10 +120,25 @@ const codexArgs = codexAppServerArgs([{
   required: true,
   httpHeaders: { Authorization: `Bearer ${coveToken}` },
 }]);
+// codex -c 的 value 按 TOML 解析：必须是 inline table 而不是 JSON 对象字符串，
+// 否则 codex 启动即报 "expected a map" 且报错原文回显 bearer（2026-08-19 生产事故）。
 assert.ok(
-  codexArgs.includes(`mcp_servers.hub.http_headers=${JSON.stringify({ Authorization: `Bearer ${coveToken}` })}`),
-  'codex 配置必须带 per-contact Authorization header'
+  codexArgs.includes(`mcp_servers.hub.http_headers={ "Authorization" = "Bearer ${coveToken}" }`),
+  'codex http_headers 必须是 TOML inline table 且带 per-contact Authorization header'
 );
+assert.ok(
+  codexArgs.every((arg) => !arg.includes('http_headers={"')),
+  'http_headers 不得再以 JSON 对象字符串下发'
+);
+
+// ── 用户可见错误文本的凭据脱敏 ──
+const leakyCodexError = 'codex app-server exited code=1 signal=null — Error: error loading default config '
+  + `after config error: invalid type: string "{\\"Authorization\\":\\"Bearer ${coveToken}\\"}", expected a map`;
+const scrubbed = redactSecrets(leakyCodexError);
+assert.ok(!scrubbed.includes(coveToken), '错误文本里的 bearer 必须被脱敏');
+assert.ok(scrubbed.includes('[REDACTED_SECRET]'), '脱敏后必须留下占位标记');
+assert.ok(scrubbed.includes('expected a map'), '脱敏不得吞掉诊断信息本身');
+assert.equal(redactSecrets('后端启动失败：连接超时'), '后端启动失败：连接超时', '无凭据文本必须原样保留');
 
 // ── coordination delegate gate：工具层硬闸，不再只靠 prompt ──
 const taskPath = 'tasks/gate-demo.md';
@@ -204,6 +228,110 @@ assert.ok(
   auditRecords.some((entry) => entry.component === 'coordination-delegate-gate'),
   '工具层拒绝必须留审计记录'
 );
+
+// ── 派单 authority TTL：旧派单未被新版取代也会过期 ──
+const ttlTaskPath = 'tasks/gate-ttl-demo.md';
+const ttlFingerprint = executionFingerprint({
+  taskPath: ttlTaskPath,
+  planHash,
+  executor: 'codex',
+  workspace: 'C:/ai-hub-codex',
+  branch: 'gate-ttl',
+});
+const ttlDispatchKey = `coordination:v2:${ttlTaskPath}:${ttlFingerprint}`;
+insertDispatch.run('@codex TTL 演示派单', JSON.stringify({
+  roomHost: {
+    coordination: {
+      kind: 'execution',
+      taskPath: ttlTaskPath,
+      branch: 'gate-ttl',
+      workspace: 'C:/ai-hub-codex',
+      planHash,
+      executor: 'codex',
+    },
+  },
+}), ttlDispatchKey);
+db.prepare(`UPDATE messages SET created_at = datetime('now', '-25 hours') WHERE idempotency_key = ?`)
+  .run(ttlDispatchKey);
+const ttlMarkerPrompt = [
+  '[AI_HUB_COORDINATION_V2]',
+  `taskPath=${ttlTaskPath}`,
+  `planHash=${planHash}`,
+  `fingerprint=${ttlFingerprint}`,
+  '只执行任务文件 Plan。',
+].join('\n');
+
+const expired = await delegateAs('codex').exec({ ...baseInput, prompt: ttlMarkerPrompt });
+assert.equal(expired.ok, false, '超过默认 24h TTL 的派单必须拒绝');
+assert.match(expired.text, /过期/);
+assert.ok(
+  auditRecords.some((entry) =>
+    entry.component === 'coordination-delegate-gate' && /TTL/.test(String(entry.reason))),
+  'TTL 拒绝必须留审计记录'
+);
+
+db.prepare(`UPDATE contacts SET config = ? WHERE id = 'room'`)
+  .run(JSON.stringify({ coordination: { dispatchTtlHours: 100 } }));
+const withinCustomTtl = await delegateAs('codex').exec({ ...baseInput, prompt: ttlMarkerPrompt });
+assert.equal(withinCustomTtl.ok, true, '房间配置放宽 dispatchTtlHours 后，25h 前的派单应放行');
+
+// ── orchestrator 配置化：room config coordination.orchestrator ──
+assert.equal(resolveRoomOrchestratorId(undefined), 'claude', '无配置回落默认 orchestrator');
+assert.equal(resolveRoomOrchestratorId({ coordination: { orchestrator: 'codex' } }), 'codex');
+assert.equal(
+  resolveRoomOrchestratorId({ coordination: { orchestrator: 'Bad Id!' } }),
+  'claude',
+  '非法 contact id 不得进入 authority 链'
+);
+assert.deepEqual(
+  coordinationAuthorityHolderIds(null, 'codex'),
+  ['codex'],
+  'authority holder 必须跟随配置的 orchestrator'
+);
+
+db.prepare(
+  `INSERT INTO contacts (id, name, backend, kind, config) VALUES
+     ('room-orch-ok', '配置房', 'room', 'room', ?),
+     ('room-orch-ghost', '幽灵房', 'room', 'room', ?),
+     ('room-orch-bad', '坏配置房', 'room', 'room', ?)`
+).run(
+  JSON.stringify({ members: ['codex'], coordination: { enabled: true, orchestrator: 'codex' } }),
+  JSON.stringify({ members: ['ghost'], coordination: { orchestrator: 'ghost' } }),
+  JSON.stringify({ members: ['codex'], coordination: { orchestrator: 'Bad Id!' } }),
+);
+const issues = auditRoomOrchestratorConfigs(db);
+assert.ok(!issues.some((issue) => issue.roomId === 'room-orch-ok'), '合法配置不得报问题');
+assert.ok(
+  issues.some((issue) => issue.roomId === 'room-orch-ghost' && /not an enabled dm contact/.test(issue.reason)),
+  'orchestrator 指向不存在联系人必须在启动校验暴露'
+);
+assert.ok(
+  issues.some((issue) => issue.roomId === 'room-orch-bad' && /invalid contact id/.test(issue.reason)),
+  '非法 orchestrator id 必须在启动校验暴露'
+);
+
+// 回执默认目标：不再硬编码 claude，落到房间配置的 orchestrator
+const coveRow = db.prepare(`SELECT * FROM contacts WHERE id = 'codex'`).get() as ContactRow;
+const fakeManager = {
+  imageRoomMembers: () => [coveRow],
+  dispatchRoomMessageTracked: () => ({ completion: Promise.resolve({ ok: true }) }),
+};
+const receiptPost = dispatchCoordinationRoomHost(
+  { db, sse, manager: fakeManager as never, logger },
+  { content: '回执：TTL 演示任务完成', kind: 'receipt', idempotencyKey: 'receipt:test:orch', meta: {} },
+);
+assert.equal(receiptPost.status, 'posted', '省略 targetId 的回执必须按房间配置派发');
+assert.equal(receiptPost.roomId, 'room-orch-ok', '优先选择 coordination.enabled=true 的房间');
+const receiptRow = db.prepare(
+  `SELECT meta FROM messages WHERE idempotency_key = 'receipt:test:orch'`
+).get() as { meta: string };
+assert.deepEqual(
+  JSON.parse(receiptRow.meta).roomHost.targets,
+  ['codex'],
+  '回执目标必须是房间配置的 orchestrator，而不是硬编码 claude'
+);
+// 等 dispatch 的 completion 回调落库完成，再关 db
+await new Promise((resolve) => setImmediate(resolve));
 
 console.log('hub mcp security tests: ok');
 db.close();

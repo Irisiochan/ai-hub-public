@@ -54,6 +54,8 @@ export interface ContactConfig {
   projectAccess: ProjectAccessConfig;
   affect: 'on' | 'off';
   affectBaseline: { valence: number; arousal: number };
+  /** Cross-contact life events: extract from this contact's DM + inject other contacts' events per turn. */
+  lifeEvents: 'on' | 'off';
   /** NSFW craft injection: always=preamble, intimate=per-turn fail-open, off=never. */
   nsfwCraft: 'always' | 'intimate' | 'off';
   maxSessionInputTokens: number;
@@ -81,6 +83,14 @@ export interface ContactConfig {
   promptCache?: 'auto' | 'off';
   maxTokens?: number;
   contextWindowTokens?: number;
+  harness?: {
+    enabled: boolean;
+    command: string;
+    home: string;
+    workspace: string;
+    port: number;
+    [key: string]: unknown;
+  };
   members?: string[];
   reactionRounds?: number;
   respondAllByDefault?: boolean;

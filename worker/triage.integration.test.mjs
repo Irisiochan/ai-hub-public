@@ -17,14 +17,14 @@ import {
   shanghaiDateAt,
   TriageStore,
 } from './triage-core.mjs';
-import { listenOnFetchSafePort } from './test-http.mjs';
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 
-async function listen(handler) {
+function listen(handler) {
   const server = http.createServer(handler);
-  await listenOnFetchSafePort(server);
-  return server;
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  });
 }
 
 function portOf(server) {
@@ -1695,6 +1695,149 @@ test('daily path uses real context, a guaranteed slot, and a companion-specific 
     }
   } finally {
     await Promise.all([close(deepseek), close(hub), close(vault)]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fresh safety life-event pierces silent hours, lands in the companion prompt, and claims once', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-triage-safety-e2e-'));
+  const dispatched = [];
+  let deepseekCalls = 0;
+  const eventUpdatedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+  const safetyEvent = {
+    id: 7,
+    severity: 'safety',
+    status: 'active',
+    summary: '家里一楼进水并跳闸断电，正收拾准备临时搬离',
+    sourceContactId: 'claude',
+    sourceContactName: 'Claude',
+    updatedAt: eventUpdatedAt,
+    updatedAtShanghai: '08-15 23:10',
+  };
+  const deepseek = await listen((req, res) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      deepseekCalls++;
+      const body = JSON.parse(raw);
+      const user = JSON.parse(body.messages[1].content);
+      assert.equal(user.mode, 'daily');
+      assert.match(user.event.summary, /ACTIVE SAFETY EVENT/);
+      assert.match(user.event.summary, /进水并跳闸断电/);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              actionable: true,
+              needsLocalExec: false,
+              category: 'daily',
+              priority: 1,
+              suggestedRecipient: 'codex',
+              rationale: 'active safety event needs a check-in',
+            }),
+          },
+        }],
+        usage: { prompt_tokens: 100, completion_tokens: 20 },
+      }));
+    });
+  });
+  const hub = await listen((req, res) => {
+    if (req.method === 'GET' && req.url === '/api/system/life-events') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ events: [safetyEvent] }));
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/api/contacts') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        contacts: [{
+          id: 'codex',
+          name: 'Codex',
+          kind: 'dm',
+          state: 'idle',
+          last_at: '2026-07-26 13:00:00',
+          config: { routing: { enabled: true, recipientKey: 'codex', categories: ['system'] } },
+        }],
+      }));
+      return;
+    }
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk; });
+    req.on('end', () => {
+      dispatched.push({ url: req.url, body: JSON.parse(raw) });
+      res.writeHead(202, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ queued: true }));
+    });
+  });
+
+  const configPath = path.join(dir, 'triage.json');
+  const stateFile = path.join(dir, 'triage.db');
+  fs.writeFileSync(configPath, JSON.stringify({
+    stateFile,
+    categories: ['daily', 'system', 'other'],
+    deepseek: {
+      baseUrl: `http://127.0.0.1:${portOf(deepseek)}`,
+      apiKeyEnv: 'TEST_DEEPSEEK_KEY',
+      flashModel: 'deepseek-v4-flash',
+      proModel: 'deepseek-v4-pro',
+    },
+    hub: { baseUrl: `http://127.0.0.1:${portOf(hub)}` },
+    routing: { rules: {}, fuzzyFallback: true },
+    proactive: {
+      enabled: true,
+      dailyDispatchLimit: 10,
+      minDailyDispatches: 0,
+      forceAfterHour: 23,
+      minimumGapMinutes: 180,
+      // Always-silent window: only the safety piercing path can dispatch at all.
+      silentStartHour: 0,
+      silentEndHour: 24,
+      safetyEvents: { enabled: true, freshnessHours: 12, maxPerEventPerDay: 2 },
+      recipients: ['codex'],
+    },
+    sources: [{
+      id: 'daily-check-in',
+      type: 'timer',
+      mode: 'daily',
+      intervalMinutes: 45,
+      jitterSeconds: 0,
+      category: 'daily',
+      summary: 'Check in naturally.',
+    }],
+  }));
+
+  try {
+    const first = await runWorker(configPath, { TEST_DEEPSEEK_KEY: 'test-only' });
+    assert.match(first.stdout, /piercing silent hours/);
+    assert.equal(deepseekCalls, 1);
+    assert.equal(dispatched.length, 1);
+    assert.equal(dispatched[0].url, '/api/contacts/codex/messages');
+    // Companion prompt must carry the safety hard block — L1 context alone is not enough.
+    assert.match(dispatched[0].body.content, /【安全关注】/);
+    assert.match(dispatched[0].body.content, /进水并跳闸断电/);
+    assert.match(dispatched[0].body.content, /最近更新 08-15 23:10/);
+    assert.match(dispatched[0].body.content, /来自与Claude的对话/);
+    assert.match(dispatched[0].body.content, /人身与居所是否安全/);
+    assert.equal(dispatched[0].body.hidden, true);
+    assert.equal(dispatched[0].body.automation.messageType, 'proactive-trigger');
+    {
+      const store = new TriageStore(stateFile);
+      try {
+        const claims = JSON.parse(store.getSourceState('safety-event-claims:v1') ?? '{}');
+        assert.ok(claims[`7:${eventUpdatedAt}`], 'dispatched safety state must be claimed');
+      } finally {
+        store.close();
+      }
+    }
+
+    // Second run with the same event state: claim holds, silent hours suppress the wake.
+    const second = await runWorker(configPath, { TEST_DEEPSEEK_KEY: 'test-only' });
+    assert.match(second.stdout, /silent hours/);
+    assert.equal(deepseekCalls, 1, 'claimed safety state must not re-trigger L1');
+    assert.equal(dispatched.length, 1, 'claimed safety state must not re-dispatch');
+  } finally {
+    await Promise.all([close(deepseek), close(hub)]);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

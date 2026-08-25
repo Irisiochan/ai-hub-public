@@ -2,7 +2,7 @@
   "name": "ai-hub-desktop",
   "productName": "ai-hub",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "ai-hub desktop shell (Electron)",
   "main": "main.cjs",
   "scripts": {

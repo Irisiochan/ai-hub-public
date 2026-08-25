@@ -9,6 +9,7 @@ export type SseEvent =
   | 'prune' // { contactId, ids?: number[], afterId?: number } messages removed
   | 'user' // user profile changed
   | 'worker'
+  | 'workflow-profile'
   | 'job'
   | 'job-message';
 

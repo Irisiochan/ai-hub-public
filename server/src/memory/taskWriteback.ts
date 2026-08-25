@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { Db, TaskWritebackRow } from '../db.js';
+import { TaskStateService } from '../tasks/taskStateService.js';
 
 const REVIEW_TIMEOUT_MS = 10_000;
 const AUTO_APPLY_THRESHOLD = 0.9;
@@ -31,7 +32,6 @@ export interface TaskWritebackOutcome {
 
 export interface TaskWritebackVault {
   call(name: string, args?: Record<string, unknown>, retries?: number): Promise<string>;
-  write(name: string, args: Record<string, unknown>): Promise<'ok' | 'queued'>;
 }
 
 export type TaskWritebackReviewer = (text: string) => Promise<TaskWritebackReview>;
@@ -43,10 +43,12 @@ interface ContactRef {
 
 interface TaskSnapshot {
   path: string;
-  fingerprint: string;
+  contentFingerprint: string;
 }
 
 const activeTaskWrites = new Set<string>();
+
+class TaskWritebackConflictError extends Error {}
 
 function vaultText(raw: string): string {
   try {
@@ -62,8 +64,8 @@ function taskStatus(raw: string): string | null {
   return frontmatter?.[1].match(/^status:\s*['"]?([^'"\s]+)['"]?\s*$/im)?.[1]?.toLowerCase() ?? null;
 }
 
-function fingerprint(raw: string): string {
-  return crypto.createHash('sha256').update(vaultText(raw)).digest('hex');
+function taskContentFingerprint(raw: string): string {
+  return crypto.createHash('sha256').update(vaultText(raw).replaceAll('\r\n', '\n')).digest('hex');
 }
 
 function shanghaiDate(): string {
@@ -195,7 +197,7 @@ async function findUniqueOpenTask(vault: TaskWritebackVault, query: string): Pro
     try {
       const raw = await vault.call('read_file', { path }, 0);
       if (taskStatus(raw) !== 'open') continue;
-      open.push({ path, fingerprint: fingerprint(raw) });
+      open.push({ path, contentFingerprint: taskContentFingerprint(raw) });
     } catch {
       // A stale search hit is not a writable target.
     }
@@ -209,7 +211,8 @@ async function findUniqueOpenTask(vault: TaskWritebackVault, query: string): Pro
 function updateRow(
   db: Db,
   idempotencyKey: string,
-  fields: Partial<Pick<TaskWritebackRow, 'task_path' | 'action' | 'confidence' | 'due' | 'status' | 'detail'>>
+  fields: Partial<Pick<TaskWritebackRow,
+    'task_path' | 'action' | 'confidence' | 'due' | 'status' | 'detail' | 'command_id' | 'event_id'>>
 ): void {
   const entries = Object.entries(fields);
   if (entries.length === 0) return;
@@ -245,6 +248,7 @@ function traceNote(
 export async function maybeWriteBackTask(
   db: Db,
   vault: TaskWritebackVault,
+  tasksDir: string | null,
   contact: ContactRef,
   messageId: number,
   userText: string,
@@ -306,11 +310,24 @@ export async function maybeWriteBackTask(
   const task = found.snapshot;
   updateRow(db, idempotencyKey, { task_path: task.path });
 
+  if (!tasksDir) {
+    const detail = '任务目录未配置，未执行 Controller 写入';
+    updateRow(db, idempotencyKey, { status: 'ambiguous', detail });
+    log(`task writeback ambiguous: ${detail}`);
+    return { status: 'ambiguous', idempotencyKey, taskPath: task.path, action: review.action, detail };
+  }
+
   if (review.action === 'done' || review.action === 'dropped') {
     const detail = `${review.action} 只生成待确认候选，未修改任务`;
     updateRow(db, idempotencyKey, { status: 'proposed', detail });
     log(`task writeback proposed: ${task.path} → ${review.action}`);
     return { status: 'proposed', idempotencyKey, taskPath: task.path, action: review.action, detail };
+  }
+
+  if (review.action === 'reschedule' && !review.due) {
+    const detail = '改期候选缺少明确日期，未执行 Controller 写入';
+    updateRow(db, idempotencyKey, { status: 'ambiguous', detail });
+    return { status: 'ambiguous', idempotencyKey, taskPath: task.path, action: review.action, detail };
   }
 
   if (activeTaskWrites.has(task.path)) {
@@ -322,57 +339,60 @@ export async function maybeWriteBackTask(
 
   activeTaskWrites.add(task.path);
   try {
-    let latestRaw: string;
-    try {
-      latestRaw = await vault.call('read_file', { path: task.path }, 0);
-    } catch (error) {
-      const detail = `写入前复读失败：${error instanceof Error ? error.message : String(error)}`;
-      updateRow(db, idempotencyKey, { status: 'failed', detail });
-      return { status: 'failed', idempotencyKey, taskPath: task.path, action: review.action, detail };
-    }
-    if (taskStatus(latestRaw) !== 'open' || fingerprint(latestRaw) !== task.fingerprint) {
-      const detail = '任务在候选生成后已变化，已拒绝覆盖并保留冲突记录';
-      updateRow(db, idempotencyKey, { status: 'conflict', detail });
-      log(`task writeback conflict after reread: ${task.path}`);
-      return { status: 'conflict', idempotencyKey, taskPath: task.path, action: review.action, detail };
-    }
-
     const note = traceNote(contact, messageId, idempotencyKey, sourceText, review);
-    let writeResult: 'ok' | 'queued';
+    const taskState = new TaskStateService(db);
+    const commandId = idempotencyKey;
     try {
-      writeResult = await vault.write('update_task', {
-        path: task.path,
-        status: 'open',
-        note,
-        source: contact.id,
+      const apply = db.transaction(() => {
+        const current = taskState.refreshTask(tasksDir, task.path);
+        if (current.contentFingerprint !== task.contentFingerprint) {
+          throw new TaskWritebackConflictError('task_content_changed_after_review');
+        }
+        const command = {
+          commandId,
+          idempotencyKey,
+          taskId: current.taskId,
+          expectedVersion: current.version,
+          actor: contact.id,
+          source: 'chat-task-writeback',
+          reason: note,
+          evidence: {
+            action: review.action,
+            due: review.due,
+            messageId,
+            sourceRef,
+          },
+          projection: { path: task.path, note, source: contact.id },
+        };
+        const applied = review.action === 'reschedule'
+          ? taskState.reschedule(command, review.due!)
+          : taskState.annotate(command);
+        if (applied.result !== 'applied' || !applied.eventId) {
+          throw new TaskWritebackConflictError(applied.error ?? 'unknown conflict');
+        }
+        updateRow(db, idempotencyKey, {
+          status: 'applied',
+          command_id: commandId,
+          event_id: applied.eventId,
+          detail: '权威命令已写入 SQLite，等待 Vault 异步投影',
+        });
+        return applied;
       });
+      apply();
     } catch (error) {
-      const detail = `任务状态写入失败：${error instanceof Error ? error.message : String(error)}`;
+      if (error instanceof TaskWritebackConflictError) {
+        const detail = `Controller 拒绝写入：${error.message}`;
+        updateRow(db, idempotencyKey, { status: 'conflict', detail });
+        log(`task writeback conflict: ${task.path} (${error.message})`);
+        return { status: 'conflict', idempotencyKey, taskPath: task.path, action: review.action, detail };
+      }
+      const detail = `Controller 写入失败：${error instanceof Error ? error.message : String(error)}`;
       updateRow(db, idempotencyKey, { status: 'failed', detail });
       log(`task writeback failed: ${detail}`);
       return { status: 'failed', idempotencyKey, taskPath: task.path, action: review.action, detail };
     }
-    if (writeResult === 'queued') {
-      const detail = 'Vault 写入失败，已进入 outbox 排队；尚未同步';
-      updateRow(db, idempotencyKey, { status: 'queued', detail });
-      log(`task writeback queued (not synced): ${task.path}`);
-      return { status: 'queued', idempotencyKey, taskPath: task.path, action: review.action, detail };
-    }
 
-    try {
-      const verified = await vault.call('read_file', { path: task.path }, 0);
-      if (taskStatus(verified) !== 'open' || !vaultText(verified).includes(idempotencyKey)) {
-        throw new Error('回读未找到幂等键或任务已不是 open');
-      }
-    } catch (error) {
-      const detail = `Vault 返回成功但回读验证失败：${error instanceof Error ? error.message : String(error)}`;
-      updateRow(db, idempotencyKey, { status: 'failed', detail });
-      log(`task writeback unverified: ${task.path}`);
-      return { status: 'failed', idempotencyKey, taskPath: task.path, action: review.action, detail };
-    }
-
-    updateRow(db, idempotencyKey, { status: 'applied', detail: '已写入并回读验证' });
-    log(`task writeback applied and verified: ${task.path} stays open`);
+    log(`task writeback applied to Controller: ${task.path} stays open`);
     return { status: 'applied', idempotencyKey, taskPath: task.path, action: review.action };
   } finally {
     activeTaskWrites.delete(task.path);

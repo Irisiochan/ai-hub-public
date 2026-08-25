@@ -62,7 +62,7 @@ export interface Attachment {
   url: string;
 }
 
-class ApiRequestError extends Error {
+export class ApiRequestError extends Error {
   constructor(
     message: string,
     readonly status: number,
@@ -196,6 +196,8 @@ export interface WorkerJob {
   workspace: string;
   prompt: string;
   status: string;
+  /** Present on create when no currently eligible worker advertises this runner. */
+  queue_warning?: string;
   priority: number;
   ttl_at: string | null;
   session_id: string | null;
@@ -228,10 +230,64 @@ export interface WorkerJob {
   };
   origin_contact_id: string | null;
   origin_anchor_id: number | null;
+  options?: {
+    model?: string;
+    reasoning?: string;
+    runnerSource?: 'policy' | 'override';
+    runnerOverrideReason?: string;
+    workflow?: WorkflowSnapshot;
+  };
   /** 1 when task window is soft-hidden; list APIs omit these */
   deleted?: number;
   created_at: string;
   updated_at: string;
+}
+
+export type WorkflowStage = 'plan' | 'review' | 'execute' | 'fix' | 'maintenance' | 'patrol';
+
+export interface WorkflowBinding {
+  runner: 'codex' | 'claude' | 'grok';
+  model: string;
+  reasoning: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+}
+
+export interface WorkflowRoute {
+  primary: WorkflowBinding;
+  fallback?: WorkflowBinding;
+  fallbackAfter?: number;
+}
+
+export interface WorkflowProfile {
+  id: string;
+  version: number;
+  label: string;
+  description: string;
+  routes: Record<WorkflowStage, WorkflowRoute>;
+  capabilities: { deepseekBulkHarness: 'unavailable' | 'planned' | 'available' };
+}
+
+export interface WorkflowSnapshot {
+  profileId: string;
+  profileVersion: number;
+  profileLabel: string;
+  stage: WorkflowStage;
+  taskPath: string;
+  problemFingerprint: string;
+  primary: WorkflowBinding;
+  fallback?: WorkflowBinding;
+  fallbackAfter?: number;
+  fallbackActive: boolean;
+  selected: WorkflowBinding;
+  workflowFingerprint: string;
+}
+
+export interface WorkflowProfilesResponse {
+  active: WorkflowProfile;
+  previous: WorkflowProfile | null;
+  updatedBy: string;
+  updatedAt: string;
+  profiles: WorkflowProfile[];
+  audit: Array<Record<string, unknown>>;
 }
 
 export interface JobMessage {
@@ -393,13 +449,36 @@ export const api = {
   job: (id: string) => req<{ job: WorkerJob; messages: JobMessage[] }>(`/api/jobs/${id}`),
 
   createJob: (data: {
-    runner: 'codex' | 'claude' | 'grok'; workspace: string; prompt: string; workerId?: string;
+    runner?: 'codex' | 'claude' | 'grok'; stage?: WorkflowStage;
+    workspace: string; prompt: string; workerId?: string;
     permissions?: { write?: boolean; shell?: boolean; ssh?: boolean };
     requestedBy?: string; originContactId?: string; originAnchorId?: number; idempotencyKey?: string;
   }) => req<WorkerJob>('/api/jobs', { method: 'POST', body: JSON.stringify(data) }),
 
+  workflowProfiles: () => req<WorkflowProfilesResponse>('/api/workflow-profiles'),
+
+  previewWorkflowProfile: (id: string, version: number) =>
+    req<{ current: WorkflowProfile; target: WorkflowProfile; changes: unknown[] }>('/api/workflow-profiles/preview', {
+      method: 'POST', body: JSON.stringify({ id, version }),
+    }),
+
+  switchWorkflowProfile: (id: string, version: number) =>
+    req<{ active: WorkflowProfile; changed: boolean }>('/api/workflow-profiles/switch', {
+      method: 'POST', body: JSON.stringify({ id, version }),
+    }),
+
+  rollbackWorkflowProfile: () =>
+    req<{ active: WorkflowProfile; changed: boolean }>('/api/workflow-profiles/rollback', {
+      method: 'POST', body: '{}',
+    }),
+
+  recordJobQuality: (id: string, quality: 'success' | 'inadequate' | 'infrastructure', detail?: string) =>
+    req<{ ok: boolean; streak?: number; fallbackActive?: boolean }>(`/api/jobs/${id}/quality`, {
+      method: 'POST', body: JSON.stringify({ quality, detail }),
+    }),
+
   setVaultTaskStatus: (data: { path: string; status: 'done'; note: string }) =>
-    req<{ ok: true; path: string; status: 'done' }>('/api/vault/task-status', {
+    req<{ ok: true; path: string; status: 'done'; alreadyDone?: boolean }>('/api/vault/task-status', {
       method: 'POST',
       body: JSON.stringify(data),
     }),

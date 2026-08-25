@@ -138,6 +138,17 @@ const orchestratorNotice = roomTurnNotice('normal', [{ id: 'codex', name: 'Codex
 }, null, 'claude');
 assert.match(orchestratorNotice, /"recipient":"claude","role":"orchestrator","task_path":null/);
 
+// 房间配置 coordination.orchestrator 后，authority 与提示词都必须跟随配置值
+const customOrchestratorNotice = roomTurnNotice('normal', [{ id: 'codex', name: 'Codex' }], {
+  messageIds: [48],
+}, null, 'codex', 'codex');
+assert.match(customOrchestratorNotice, /"orchestrator":"codex","recipient":"codex","role":"orchestrator"/);
+assert.match(customOrchestratorNotice, /orchestrator\(codex\) 可接入、派工与发起部署/);
+const demotedDefaultNotice = roomTurnNotice('normal', [{ id: 'claude', name: 'Claude' }], {
+  messageIds: [49],
+}, null, 'claude', 'codex');
+assert.match(demotedDefaultNotice, /"orchestrator":"codex","recipient":"claude","role":"member"/, '配置切换 orchestrator 后旧默认联系人必须降为 member');
+
 const escaped = quotedRoomMessage({
   senderId: 'codex',
   senderName: 'Codex',

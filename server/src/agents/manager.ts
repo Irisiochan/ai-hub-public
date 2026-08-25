@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type { MemoryConfig } from '../config.js';
 import type { ContactRow, MessageOrigin } from '../db.js';
 import { maybeCapture } from '../memory/capture.js';
@@ -6,6 +7,7 @@ import { contactConfig, openContact } from './configSchemas.js';
 import { Debouncer } from './debouncer.js';
 import {
   coordinationAuthorityHolderIds,
+  resolveRoomOrchestratorId,
   type RoomCoordinationDispatch,
 } from './roomPrompt.js';
 import { AgentRuntime, type AgentDeps, type RoomTurnOutcome } from './runtime.js';
@@ -146,6 +148,9 @@ export class AgentManager {
         ? maybeWriteBackTask(
             this.deps.db,
             this.deps.vault,
+            this.deps.config.memory.repoPath
+              ? path.join(this.deps.config.memory.repoPath, 'tasks')
+              : null,
             contact,
             options.userMessageId,
             content,
@@ -243,7 +248,7 @@ export class AgentManager {
     // role=member → [PASS], so do not spend a model wake computing that. Idea /
     // social rooms leave coordinationDomain unset and keep full reactions.
     const authorityIds = coordinationDomain
-      ? new Set(coordinationAuthorityHolderIds(coordination))
+      ? new Set(coordinationAuthorityHolderIds(coordination, resolveRoomOrchestratorId(roomCfg)))
       : null;
 
     for (let round = 0; round < maxReactionRounds; round++) {

@@ -1,4 +1,5 @@
 import express, { type Express } from 'express';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { type AgentManager } from './agents/manager.js';
@@ -8,10 +9,12 @@ import {
   updateCoordinationRoomReceipt,
 } from './agents/coordinationRoom.js';
 import { AffectRepo } from './agents/affect.js';
+import { LifeEventRepo } from './agents/lifeEvents.js';
 import { type DbBackup } from './backup.js';
+import { CaptionService } from './captionService.js';
 import { type HubConfig } from './config.js';
 import { type Db, type ContactRow, type JobRow, type MessageRow } from './db.js';
-import { type HubLogger } from './logger.js';
+import { logMessage, type HubLogger } from './logger.js';
 import { sessionAuth } from './middleware/auth.js';
 import { localCors } from './middleware/cors.js';
 import { type VaultClient } from './memory/vaultClient.js';
@@ -30,6 +33,8 @@ import { userRouter } from './routes/user.js';
 import { vaultTasksRouter } from './routes/vaultTasks.js';
 import { workersRouter } from './routes/workers.js';
 import { type SseHub } from './sse.js';
+import { taskPathFromOptions } from './tasks/invariants.js';
+import { TaskStateService } from './tasks/taskStateService.js';
 import { type JobStore } from './workers/jobStore.js';
 import { deriveDeliverySummary } from './workers/deliveryStatus.js';
 import { coordinationMarkerDispatchKey, formatCoordinationReceipt, parseCoordinationMarker } from './workers/coordinationReceipt.js';
@@ -63,10 +68,11 @@ function parseDeliveryMeta(raw: string | null): { dirtyFiles?: string[]; head?: 
 }
 
 export function attachWorkerCompletion(deps: ServerDependencies): void {
-  const { db, jobStore, logger, manager, sse, vault } = deps;
-  const ensureWorkerTail = async (job: JobRow): Promise<void> => {
-    if (!vault || !['blocked_local_changes', 'blocked_unpushed'].includes(job.delivery_state ?? '')) return;
-    const taskPath = `tasks/worker-tail-${job.id}.md`;
+  const { config, db, jobStore, logger, manager, sse, vault } = deps;
+  const tasksDir = config.memory.repoPath ? path.join(config.memory.repoPath, 'tasks') : null;
+  const taskState = new TaskStateService(db);
+
+  const workerTailNote = (job: JobRow): string => {
     const meta = parseDeliveryMeta(job.delivery_meta);
     const files = Array.isArray(meta.dirtyFiles) && meta.dirtyFiles.length
       ? meta.dirtyFiles.map((file) => `- \`${file}\``).join('\n')
@@ -80,6 +86,18 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
       (job.result || job.error || '（无输出）').slice(0, 8000), '', '### 下一步',
       '从现有工作区续接，核对改动后完成剩余验证；验证通过再只提交本任务文件并 push。禁止从头派单覆盖本地改动。',
     ].filter((line) => line !== '').join('\n');
+    return note;
+  };
+
+  const taskFileExists = (taskPath: string): boolean => {
+    if (!tasksDir || !/^tasks\/[a-z0-9][a-z0-9-]*\.md$/.test(taskPath)) return false;
+    return fs.existsSync(path.join(tasksDir, taskPath.slice('tasks/'.length)));
+  };
+
+  const ensureLegacyWorkerTail = async (job: JobRow): Promise<void> => {
+    if (!vault) return;
+    const taskPath = `tasks/worker-tail-${job.id}.md`;
+    const note = workerTailNote(job);
     const source = job.requested_by || 'codex';
     try {
       await vault.call('read_file', { path: taskPath }, 0);
@@ -96,13 +114,111 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
     }
   };
 
+  const annotateParentTask = (job: JobRow, taskPath: string): void => {
+    if (!tasksDir) return;
+    const note = workerTailNote(job);
+    const source = job.requested_by || 'codex';
+    const meta = parseDeliveryMeta(job.delivery_meta);
+    const result = db.transaction(() => {
+      const current = taskState.refreshTask(tasksDir, taskPath);
+      const transition = taskState.annotate({
+        commandId: crypto.randomUUID(),
+        idempotencyKey: `worker-tail-parent:${job.id}:${job.delivery_state}`,
+        taskId: current.taskId,
+        expectedVersion: current.version,
+        actor: source,
+        source: 'worker-tail-projection',
+        reason: `Worker job ${job.id} stopped at ${job.delivery_state}`,
+        evidence: {
+          ahead: meta.ahead ?? null,
+          deliveryState: job.delivery_state,
+          dirtyFiles: meta.dirtyFiles ?? [],
+          head: meta.head ?? null,
+          jobId: job.id,
+          nextAction: 'continue existing workspace and finish validation before push',
+          workspace: job.workspace,
+        },
+        projection: { path: taskPath, note, source },
+      });
+      if (transition.result !== 'applied') {
+        throw new Error(`parent task annotation rejected: ${transition.error ?? 'unknown'}`);
+      }
+      return transition;
+    })();
+    logger.info({
+      component: 'jobs',
+      eventId: result.eventId,
+      jobId: job.id,
+      replayed: result.replayed,
+      taskPath,
+    }, 'worker delivery blocker projected to parent task');
+  };
+
+  const closeLegacyWorkerTail = (job: JobRow): void => {
+    if (!tasksDir) return;
+    const taskPath = `tasks/worker-tail-${job.id}.md`;
+    if (!taskFileExists(taskPath)) return;
+    const source = job.requested_by || 'codex';
+    const note = [
+      `Worker job \`${job.id}\` 已恢复完成。`,
+      `终态：\`${job.status}\` / \`${job.delivery_state}\`。`,
+      (job.result || '交付已由现有 job 回执确认。').slice(0, 4000),
+    ].join('\n');
+    const result = db.transaction(() => {
+      const current = taskState.refreshTask(tasksDir, taskPath);
+      if (current.status !== 'open') return null;
+      const transition = taskState.transition({
+        commandId: crypto.randomUUID(),
+        idempotencyKey: `worker-tail-close:${job.id}`,
+        taskId: current.taskId,
+        expectedVersion: current.version,
+        toStatus: 'done',
+        actor: source,
+        source: 'worker-tail-projection',
+        reason: `Worker job ${job.id} reached ${job.status}/${job.delivery_state}`,
+        evidence: {
+          deliveryState: job.delivery_state,
+          jobId: job.id,
+          status: job.status,
+        },
+        projection: { path: taskPath, note, source },
+      });
+      if (transition.result !== 'applied') {
+        throw new Error(`worker tail close rejected: ${transition.error ?? 'unknown'}`);
+      }
+      return transition;
+    })();
+    if (!result) return;
+    logger.info({
+      component: 'jobs',
+      eventId: result.eventId,
+      jobId: job.id,
+      replayed: result.replayed,
+      taskPath,
+    }, 'worker tail close projected');
+  };
+
+  const syncWorkerTail = async (job: JobRow): Promise<void> => {
+    if (!vault) return;
+    if (job.status === 'done' && ['delivered', 'delivered_out_of_band'].includes(job.delivery_state ?? '')) {
+      closeLegacyWorkerTail(job);
+      return;
+    }
+    if (!['blocked_local_changes', 'blocked_unpushed'].includes(job.delivery_state ?? '')) return;
+    const parentTaskPath = taskPathFromOptions(job.options);
+    if (tasksDir && parentTaskPath && taskFileExists(parentTaskPath)) {
+      annotateParentTask(job, parentTaskPath);
+      return;
+    }
+    await ensureLegacyWorkerTail(job);
+  };
+
   const dispatchCoordinationReceipt = (job: JobRow): 'sent' | 'unavailable' | 'not-coordination' => {
     const marker = parseCoordinationMarker(job.prompt);
     if (!marker) return 'not-coordination';
     const dispatchKey = coordinationMarkerDispatchKey(marker);
     const text = formatCoordinationReceipt(job, marker);
     const outcome = dispatchCoordinationRoomHost({ db, sse, manager, logger }, {
-      targetId: 'claude',
       content: text,
       kind: 'receipt',
       exactDispatchKey: dispatchKey,
@@ -164,11 +280,11 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
   jobStore.onFinished = async (job, ctx) => {
     if (!ctx.meta.tailDone) {
       try {
-        await ensureWorkerTail(job);
+        await syncWorkerTail(job);
         ctx.setMeta({ tailDone: true });
       } catch (error) {
-        logger.error({ component: 'jobs', jobId: job.id, err: error }, 'worker tail registration failed');
-        // vault 恢复后重试补 tail；末次尝试放行，让回执仍然送达。
+        logger.error({ component: 'jobs', jobId: job.id, err: error }, 'worker tail projection failed');
+        // vault / Controller 恢复后重试；末次尝试放行，让回执仍然送达。
         if (!ctx.finalAttempt) throw error;
       }
     }
@@ -219,6 +335,7 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
 
 export function createServer(deps: ServerDependencies): Express {
   const { config, db, dbBackup, grokQuotaPoller, jobStore, manager, quotaPoller, codexQuotaPoller, softPurge, sse } = deps;
+  const captions = new CaptionService(db, config.uploadsDir, logMessage(deps.logger, 'caption'));
   attachWorkerCompletion(deps);
   const app = express();
   app.use(localCors(deps.corsOrigins));
@@ -244,6 +361,12 @@ export function createServer(deps: ServerDependencies): Express {
   app.get('/api/system/affect', (_req, res) => {
     res.json({ states: new AffectRepo(db).health() });
   });
+  app.get('/api/system/captions', (_req, res) => {
+    res.json(captions.health());
+  });
+  app.get('/api/system/life-events', (_req, res) => {
+    res.json({ events: new LifeEventRepo(db).healthWithNames() });
+  });
   app.get('/api/events', (req, res) => {
     const subscriptions = typeof req.query.subscribe === 'string'
       ? new Set(req.query.subscribe.split(',').map((id) => id.trim()).filter(Boolean).slice(0, 100))
@@ -254,7 +377,7 @@ export function createServer(deps: ServerDependencies): Express {
 
   app.use('/api/app', appReleaseRouter(config.releasesDir));
   app.use('/api/contacts', contactsRouter(db, sse, manager, config, deps.logger));
-  app.use('/api/contacts', messagesRouter(db, sse, manager, config.uploadsDir));
+  app.use('/api/contacts', messagesRouter(db, sse, manager, config.uploadsDir, captions, jobStore));
   app.use('/api/attachments', attachmentsRouter(db, config.uploadsDir));
   app.use('/api/user', userRouter(db, sse));
   app.use('/api', journalRouter(db));
@@ -264,7 +387,10 @@ export function createServer(deps: ServerDependencies): Express {
     envMode: process.env.HUB_MCP_AUTH_MODE,
     logger: deps.logger,
   }));
-  app.use('/api/vault', vaultTasksRouter(deps.vault));
+  app.use('/api/vault', vaultTasksRouter({
+    db,
+    tasksDir: config.memory.repoPath ? path.join(config.memory.repoPath, 'tasks') : null,
+  }));
   app.use('/api', systemRouter(config));
   app.get('/api/system/backup', (_req, res) => res.json(dbBackup.status()));
   app.post('/api/system/backup', async (_req, res) => {

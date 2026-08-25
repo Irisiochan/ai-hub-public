@@ -7,14 +7,14 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { shanghaiDateAt, TriageStore } from './triage-core.mjs';
-import { listenOnFetchSafePort } from './test-http.mjs';
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 
-async function listen(handler) {
+function listen(handler) {
   const server = http.createServer(handler);
-  await listenOnFetchSafePort(server);
-  return server;
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  });
 }
 
 const portOf = (server) => server.address().port;

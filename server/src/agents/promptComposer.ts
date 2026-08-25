@@ -33,6 +33,7 @@ import { ROOM_RHYTHM_TEMPLATE } from './roomPrompt.js';
 import { historicalMessageText } from './sideChannel.js';
 import { estimateTokens } from './tokenEstimate.js';
 import type { AffectService } from './affectService.js';
+import type { LifeEventService } from './lifeEvents.js';
 
 export interface PromptContext {
   agent: ContactRow;
@@ -74,7 +75,8 @@ export class PromptComposer {
     /** 联系人工作目录根，用来找 `<cwd>/overlay.md`；缺省表示不启用叠层。 */
     private readonly agentsDir: string | null = null,
     private readonly summaries: ConversationSummaryRepo | null = null,
-    private readonly affect: AffectService | null = null
+    private readonly affect: AffectService | null = null,
+    private readonly lifeEvents: LifeEventService | null = null
   ) {}
 
   async composeStart(ctx: PromptContext, resumeToken: string | null): Promise<StartPrompt> {
@@ -196,6 +198,13 @@ export class PromptComposer {
     if (affectBlock) {
       turnText = [turnText, '', affectBlock].join('\n');
       ctx.log(`affect context injected (${affectBlock.length} chars)`);
+    }
+    // P3 S3：其他会话里的高时效生活状态，per-turn 注入（不碰 composeStart 的 cache 前缀）。
+    // 群聊有独立转录语义，只进 DM。
+    const lifeBlock = !ctx.isRoom ? this.lifeEvents?.turnBlock(ctx.agent) ?? '' : '';
+    if (lifeBlock) {
+      turnText = [turnText, '', lifeBlock].join('\n');
+      ctx.log(`cross-contact state injected (${lifeBlock.length} chars)`);
     }
     return injectTurnTime(turnText);
   }

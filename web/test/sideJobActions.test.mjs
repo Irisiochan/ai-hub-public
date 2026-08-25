@@ -11,6 +11,7 @@ import {
   reworkIdempotencyKey,
   saveHandledReceiptIds,
   taskPathCandidates,
+  vaultTaskAlreadySettled,
   visibleJobsForContact,
   workerReceiptJobId,
 } from '../src/sideJobActions.ts';
@@ -176,5 +177,16 @@ assert.equal(defaultClosableTaskPath(taskJob, receipt), 'tasks/main-work.md');
 assert.equal(isTailTaskPath('tasks/worker-tail-demo.md'), true);
 assert.equal(isTailTaskPath('tasks/deploy-demo.md'), true);
 assert.equal(isTailTaskPath('tasks/main-work.md'), false);
+
+class FakeApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+}
+assert.equal(vaultTaskAlreadySettled(new FakeApiError('任务不是 open 状态，未执行置 done', 409)), true);
+assert.equal(vaultTaskAlreadySettled(new FakeApiError('任务读取失败：文件不存在', 404)), true);
+assert.equal(vaultTaskAlreadySettled(new FakeApiError('尾巴任务不能从回执快捷按钮关闭，请在任务账本单独处理', 409)), false);
+assert.equal(vaultTaskAlreadySettled(new Error('任务不是 open 状态，未执行置 done')), false);
 
 console.log('side worker receipt action checks passed');

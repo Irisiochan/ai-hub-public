@@ -188,3 +188,12 @@ export function defaultClosableTaskPath(
   const candidates = taskPathCandidates(job, receipt).filter((candidate) => !isTailTaskPath(candidate));
   return candidates.length === 1 ? candidates[0] : '';
 }
+
+/** 验收卡置 done：vault 任务已关闭/归档时仍应收口卡片，不要把 409 当成操作失败。 */
+export function vaultTaskAlreadySettled(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const status = 'status' in error ? Number((error as { status?: unknown }).status) : NaN;
+  const message = error instanceof Error ? error.message : '';
+  if (status === 404) return true;
+  return status === 409 && /任务不是 open 状态/.test(message);
+}

@@ -7,8 +7,9 @@ import {
   persistImageBuffer,
   withAttachments,
 } from '../attachments.js';
+import { CaptionService } from '../captionService.js';
 import type { ContactRow, Db, MessageRow } from '../db.js';
-import type { HubLogger } from '../logger.js';
+import { logMessage, type HubLogger } from '../logger.js';
 import type { SseHub } from '../sse.js';
 import type { WechatChannelConfig } from './config.js';
 import { downloadWechatImage, type DownloadedWechatImage } from './media.js';
@@ -127,6 +128,7 @@ function splitText(text: string, limit: number): string[] {
 export class WechatChannel {
   private readonly api: WechatApiClient;
   private readonly fetchImpl: typeof fetch;
+  private readonly captions: CaptionService;
   private state: WechatChannelState;
   private abort: AbortController | null = null;
   private loop: Promise<void> | null = null;
@@ -137,6 +139,7 @@ export class WechatChannel {
       baseUrl: deps.config.baseUrl,
       token: deps.config.token,
     });
+    this.captions = new CaptionService(deps.db, deps.uploadsDir, logMessage(deps.logger, 'caption'));
     this.fetchImpl = deps.fetchImpl ?? fetch;
     this.state = deps.config.enabled
       ? loadWechatChannelState(deps.config.stateFile)
@@ -416,6 +419,7 @@ export class WechatChannel {
         this.deps.db.prepare('DELETE FROM messages WHERE id = ?').run(userRow.id);
         throw error;
       }
+      if (input.images.length > 0) void this.captions.captureMessage(userRow.id);
       this.deps.sse.broadcast('message', withAttachments(this.deps.db, userRow));
     }
 

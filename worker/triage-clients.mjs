@@ -387,6 +387,20 @@ export class HubClient {
     return body.contacts ?? [];
   }
 
+  /** Read-only jobs inventory for Agenda shadow reconciliation. */
+  async jobs(params = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params ?? {})) {
+      if (value === null || value === undefined || value === '') continue;
+      query.set(key, String(value));
+    }
+    const suffix = query.size ? `?${query}` : '';
+    const body = await jsonRequest(`${this.baseUrl}/api/jobs${suffix}`, {
+      headers: this.headers(),
+    }, this.timeoutMs);
+    return Array.isArray(body.jobs) ? body.jobs : [];
+  }
+
   async dispatch(contactId, content, {
     origin = 'main',
     hidden = false,
@@ -454,6 +468,23 @@ export class HubClient {
       truncated: body.truncated === true,
       messages: body.messages ?? [],
     };
+  }
+
+  /**
+   * P3 S4：网关聚合的跨联系人生活事件（active，含来源联系人名与上海时间戳）。
+   * fail-open：任何错误返回空数组，daily 链路照常。
+   */
+  async lifeEvents() {
+    try {
+      const body = await jsonRequest(
+        `${this.baseUrl}/api/system/life-events`,
+        { headers: this.headers() },
+        this.timeoutMs,
+      );
+      return Array.isArray(body.events) ? body.events : [];
+    } catch {
+      return [];
+    }
   }
 
   async messages(contactId, after, limit = 200, origin = 'main') {

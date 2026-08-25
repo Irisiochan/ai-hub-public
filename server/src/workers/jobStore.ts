@@ -6,6 +6,13 @@ import type { Db, JobRow } from '../db.js';
 import type { SseHub } from '../sse.js';
 import { publicJob } from './deliveryStatus.js';
 import { parseCoordinationMarker } from './coordinationReceipt.js';
+import {
+  problemFingerprint,
+  stageForRouteClass,
+  type WorkflowSnapshot,
+  type WorkflowStage,
+  WorkflowProfileStore,
+} from './workflowProfiles.js';
 
 const execFileAsync = promisify(execFile);
 const GIT_SHA_RE = /^[0-9a-f]{7,64}$/i;
@@ -105,12 +112,23 @@ export interface CreateJobInput {
     routeClass?: 'implement' | 'fix' | 'review' | 'recon' | 'mechanical';
     runnerSource?: 'policy' | 'override';
     runnerOverrideReason?: string;
+    workflowStage?: WorkflowStage;
+    problemFingerprint?: string;
+    taskPath?: string;
+    workflow?: WorkflowSnapshot;
   };
   /** 委派发生的聊天（DM/群）与当时的最后一条消息 id——前端把任务 thread 挂回这条消息下。 */
   originContactId?: string | null;
   originAnchorId?: number | null;
   /** Optional per-requester queue guard; coordination dedupe runs before this limit. */
   maxOpenJobs?: number;
+}
+
+export interface CreateJobResult {
+  job: JobRow;
+  merged?: boolean;
+  /** Human-visible queue diagnostic; the job remains pending and claimable. */
+  queueWarning?: string;
 }
 
 // pause/cancel 只是「已请求」，旧 worker 可能仍在执行；在真正转成 paused/cancelled
@@ -174,8 +192,10 @@ export class JobStore {
   private outboxTimer: NodeJS.Timeout | null = null;
   private outboxDraining = false;
   private outboxDrainScheduled = false;
+  readonly workflowProfiles: WorkflowProfileStore;
 
   constructor(private db: Db, private sse: SseHub) {
+    this.workflowProfiles = new WorkflowProfileStore(db);
     this.statements = {
       get: db.prepare('SELECT * FROM jobs WHERE id = ?'),
       softDelete: db.prepare(
@@ -190,6 +210,22 @@ export class JobStore {
         'INSERT INTO job_messages (job_id, sender, kind, content, meta) VALUES (?, ?, ?, ?, ?)'
       ),
       messageById: db.prepare('SELECT * FROM job_messages WHERE id = ?'),
+      pendingJobs: db.prepare(
+        `SELECT * FROM jobs WHERE deleted = 0 AND status = 'pending' ORDER BY created_at ASC`
+      ),
+      liveAcceptingWorkers: db.prepare(
+        `SELECT id, capabilities FROM workers
+         WHERE accepting_jobs = 1 AND last_seen_at IS NOT NULL
+           AND last_seen_at >= datetime('now', '-70 seconds')
+           AND (? IS NULL OR id = ?)`
+      ),
+      runnerUnavailableMessage: db.prepare(
+        `SELECT id FROM job_messages
+         WHERE job_id = ? AND kind = 'state'
+           AND json_extract(meta, '$.event') = 'runner-unavailable'
+           AND json_extract(meta, '$.runner') = ?
+         LIMIT 1`
+      ),
       expirePending: db.prepare(
         `UPDATE jobs SET status = 'expired', updated_at = datetime('now')
          WHERE status = 'pending' AND ttl_at IS NOT NULL AND ttl_at <= datetime('now')`
@@ -368,6 +404,46 @@ export class JobStore {
     return row;
   }
 
+  /**
+   * Make an unclaimable pending job observable without turning a temporary
+   * capability removal into a terminal failure. The warning is durable and
+   * deduplicated; once a worker advertises the runner again normal claim logic
+   * continues unchanged.
+   */
+  ensureRunnerAvailabilitySignal(job: JobRow): string | undefined {
+    if (job.status !== 'pending') return undefined;
+    const targetWorkerId = job.worker_id || null;
+    const workers = this.statements.liveAcceptingWorkers.all(
+      targetWorkerId,
+      targetWorkerId
+    ) as { id: string; capabilities: string }[];
+    const declared = workers.some((worker) => {
+      const capabilities = jsonRecord(worker.capabilities);
+      return Array.isArray(capabilities.runners) && capabilities.runners.includes(job.runner);
+    });
+    if (declared) return undefined;
+
+    const target = targetWorkerId ? `（指定 ${targetWorkerId}）` : '';
+    const warning =
+      `当前没有在线且接单中的 Worker${target} 声明 runner=${job.runner}；` +
+      '任务仍保持 pending，Worker 恢复该 runner 后可正常认领。';
+    const existing = this.statements.runnerUnavailableMessage.get(job.id, job.runner);
+    if (!existing) {
+      this.addMessage(job.id, 'system', 'state', warning, {
+        event: 'runner-unavailable',
+        runner: job.runner,
+        workerId: targetWorkerId,
+      });
+    }
+    return warning;
+  }
+
+  /** Reconcile jobs created before a worker dynamically changed its runners. */
+  signalUnservablePendingJobs(): void {
+    const pending = this.statements.pendingJobs.all() as JobRow[];
+    for (const job of pending) this.ensureRunnerAvailabilitySignal(job);
+  }
+
   emitJob(id: string): void {
     const row = this.get(id);
     if (row) this.sse.broadcast('job', publicJob(row));
@@ -495,7 +571,7 @@ export class JobStore {
     }
   }
 
-  create(input: CreateJobInput): { job: JobRow; merged?: boolean } | { error: string } {
+  create(input: CreateJobInput): CreateJobResult | { error: string } {
     if (!input.runner || !input.prompt.trim() || !input.workspace.trim())
       return { error: 'runner/workspace/prompt required' };
     if (input.prompt.length > 100_000 || input.workspace.length > 1000)
@@ -507,7 +583,13 @@ export class JobStore {
     if (taskPath) {
       const existing = (this.statements.activeCoordinationJobs.all() as JobRow[])
         .find((job) => coordinationTaskPath(job.prompt)?.toLowerCase() === taskPath.toLowerCase());
-      if (existing) return { job: existing, merged: true };
+      if (existing) {
+        return {
+          job: existing,
+          merged: true,
+          queueWarning: this.ensureRunnerAvailabilitySignal(existing),
+        };
+      }
     }
     if (Number.isSafeInteger(input.maxOpenJobs) && Number(input.maxOpenJobs) > 0) {
       const open = this.statements.openJobsByRequester.get(input.requestedBy) as { c: number };
@@ -519,7 +601,22 @@ export class JobStore {
     const id = crypto.randomUUID();
     const workspace = normalizeWorkspace(input.workspace);
     const ttlMinutes = Math.min(Math.max(Number(input.ttlMinutes) || 1440, 5), 10080);
-    const options = input.options ? JSON.stringify(input.options) : '{}';
+    const rawOptions = input.options ?? {};
+    const workflowTaskPath = rawOptions.taskPath ?? coordinationTaskPath(input.prompt) ?? '';
+    const stage = rawOptions.workflowStage ?? stageForRouteClass(rawOptions.routeClass);
+    const fingerprint = rawOptions.problemFingerprint ?? problemFingerprint(input.prompt, workflowTaskPath);
+    const workflow = rawOptions.workflow ?? this.workflowProfiles.snapshot({
+      stage,
+      taskPath: workflowTaskPath,
+      problemFingerprint: fingerprint,
+    });
+    const options = JSON.stringify({
+      ...rawOptions,
+      workflowStage: stage,
+      problemFingerprint: fingerprint,
+      taskPath: workflowTaskPath,
+      workflow,
+    });
     try {
       this.statements.create.run(
           id,
@@ -545,8 +642,10 @@ export class JobStore {
       workspace,
       permissions: input.permissions,
     });
+    const job = this.get(id)!;
+    const queueWarning = this.ensureRunnerAvailabilitySignal(job);
     this.emitJob(id);
-    return { job: this.get(id)! };
+    return { job, queueWarning };
   }
 
   action(id: string, action: 'cancel' | 'pause' | 'resume', actor: string): { status: string } | { error: string } {
