@@ -14,9 +14,11 @@
   structured failure behavior in the public contract workflow.
 - Refresh supported dependency locks; local audits for server, web, mobile, and desktop report
   zero known vulnerabilities.
+- Wait for Git child-process output to close before classifying Worker delivery state, removing a
+  Linux race that could drop branch or ahead/behind evidence.
 
 This public release is a curated, sanitized snapshot based on private source revision
-`c9efbcc201febe103fb3506313fc519f4465971c`; private contacts, personas, real evaluation data,
+`be56f9af8379d8c920e2c3029645b94fcae3046a`; private contacts, personas, real evaluation data,
 databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
 
 ## 0.2.0 - 2026-08-25

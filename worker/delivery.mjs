@@ -14,9 +14,14 @@ function runGit(cwd, args) {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     const chunks = [];
+    let settled = false;
     child.stdout.on('data', (chunk) => chunks.push(chunk));
-    child.once('error', () => resolve(null));
-    child.once('exit', (code) => {
+    child.once('error', () => {
+      settled = true;
+      resolve(null);
+    });
+    child.once('close', (code) => {
+      if (settled) return;
       resolve(code === 0 ? Buffer.concat(chunks).toString('utf8') : null);
     });
   });
