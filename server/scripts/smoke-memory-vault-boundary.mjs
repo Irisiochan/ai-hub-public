@@ -14,7 +14,7 @@ assert.equal(
 );
 assert.match(
   compose,
-  /github\.com\/Irisiochan\/memory-vault\.git#\$\{MEMORY_VAULT_VERSION:-v0\.6\.0\}/,
+  /github\.com\/Irisiochan\/memory-vault\.git#\$\{MEMORY_VAULT_VERSION:-v0\.7\.1\}/,
   'Compose must pin the released external Memory Vault version',
 );
 assert.doesNotMatch(

@@ -333,6 +333,12 @@ export class WorkflowProfileStore {
         input.quality,
         String(input.detail ?? '').slice(0, 2000),
       );
+      if (options.runnerSource === 'override') {
+        return {
+          counted: false,
+          reason: 'manual runner overrides do not affect profile fallback streaks',
+        } as const;
+      }
       if (input.quality === 'infrastructure') {
         return { counted: false, reason: 'infrastructure failures do not affect quality streaks' } as const;
       }

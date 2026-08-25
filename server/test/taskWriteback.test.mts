@@ -86,11 +86,23 @@ class FakeVault implements TaskWritebackVault {
     if (name === 'update_task') {
       this.calls.push({ name, args });
       if (this.projectedTaskFile) {
-        const current = fs.readFileSync(this.projectedTaskFile, 'utf8').trimEnd();
+        let current = fs.readFileSync(this.projectedTaskFile, 'utf8').trimEnd();
+        if (typeof args?.due === 'string') {
+          current = current.replace(/^due:\s*.*$/m, `due: '${args.due}'`);
+        }
         this.raw = `${current}\n\n## 更新\n${String(args?.note ?? '')}\n`;
         fs.writeFileSync(this.projectedTaskFile, this.raw, 'utf8');
       }
-      return 'updated';
+      return JSON.stringify({
+        ok: true,
+        code: 'task_updated',
+        message: 'updated',
+        data: {
+          path: args?.path,
+          status: args?.status,
+          ...(typeof args?.due === 'string' ? { due: args.due } : {}),
+        },
+      });
     }
     throw new Error(`unexpected call ${name}`);
   }
@@ -154,9 +166,10 @@ const progressReview: TaskWritebackReview = {
   assert.equal(vault.calls.length, 1);
   assert.equal(vault.calls[0].name, 'update_task');
   assert.equal(vault.calls[0].args?.status, 'open');
+  assert.equal(vault.calls[0].args?.due, '2026-08-10');
   assert.match(String(vault.calls[0].args?.note), /幂等键：chat-task:claude:/);
   assert.match(String(vault.calls[0].args?.note), /新时间承诺：2026-08-10/);
-  assert.match(fs.readFileSync(taskFile, 'utf8'), /due: '2026-07-30'/);
+  assert.match(fs.readFileSync(taskFile, 'utf8'), /due: '2026-08-10'/);
 
   const duplicate = await maybeWriteBackTask(
     db, vault, tasksDir, { id: 'claude', name: 'Claude' }, messageId, text, () => {},

@@ -1,7 +1,7 @@
 {
   "name": "ai-hub",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "scripts": {
     "dev:server": "npm run dev --prefix server",
     "dev:web": "npm run dev --prefix web",

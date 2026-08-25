@@ -502,6 +502,7 @@ export class TaskStateService {
         eventId,
         expectedSourceVersion: command.expectedVersion,
         nextStatus: 'open',
+        ...(kind === 'reschedule' ? { due } : {}),
         ...command.projection,
         taskId: command.taskId,
         taskVersion: nextVersion,

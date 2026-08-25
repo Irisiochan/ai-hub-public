@@ -19,8 +19,26 @@ interface TaskOutboxRow {
 interface VaultTaskPayload {
   path: string;
   nextStatus: 'open' | 'done';
+  due?: string;
   note: string;
   source: string;
+}
+
+interface VaultTaskUpdateResult {
+  ok: boolean;
+  code: string;
+  message: string;
+  data: Record<string, unknown>;
+}
+
+class VaultTaskUpdateError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'VaultTaskUpdateError';
+  }
 }
 
 function projectionPayload(raw: string): VaultTaskPayload {
@@ -29,6 +47,7 @@ function projectionPayload(raw: string): VaultTaskPayload {
     typeof value.path !== 'string'
     || !/^tasks\/[a-z0-9][a-z0-9-]*\.md$/.test(value.path)
     || (value.nextStatus !== 'open' && value.nextStatus !== 'done')
+    || (value.due !== undefined && (typeof value.due !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value.due)))
     || typeof value.note !== 'string'
     || !value.note.trim()
     || typeof value.source !== 'string'
@@ -39,12 +58,47 @@ function projectionPayload(raw: string): VaultTaskPayload {
   return {
     path: value.path,
     nextStatus: value.nextStatus,
+    ...(value.due ? { due: value.due } : {}),
     note: value.note,
     source: value.source,
   };
 }
 
-export function isIdempotentVaultProjectionError(error: unknown): boolean {
+function requireVaultTaskUpdateSuccess(raw: string): VaultTaskUpdateResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new VaultTaskUpdateError(
+      'unstructured_result',
+      `update_task returned an unstructured result: ${raw.slice(0, 160) || '(empty)'}`,
+    );
+  }
+  const value = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? parsed as Partial<VaultTaskUpdateResult>
+    : null;
+  if (
+    !value
+    || typeof value.ok !== 'boolean'
+    || typeof value.code !== 'string'
+    || !value.code
+    || typeof value.message !== 'string'
+    || !value.data
+    || typeof value.data !== 'object'
+    || Array.isArray(value.data)
+  ) {
+    throw new VaultTaskUpdateError('invalid_result', 'update_task returned an invalid structured result');
+  }
+  if (!value.ok) throw new VaultTaskUpdateError(value.code, value.message || value.code);
+  return value as VaultTaskUpdateResult;
+}
+
+export function isIdempotentVaultProjectionError(
+  error: unknown,
+  nextStatus: VaultTaskPayload['nextStatus'],
+): boolean {
+  if (nextStatus !== 'done') return false;
+  if (error instanceof VaultTaskUpdateError && error.code === 'not_found') return true;
   const detail = error instanceof Error ? error.message : String(error);
   return /文件不存在|not found|ENOENT|already[ _-]?done|already archived|已(?:完成|归档)/i.test(detail);
 }
@@ -90,19 +144,23 @@ export class VaultTaskProjection {
          ORDER BY id LIMIT 20`
       ).all(now) as TaskOutboxRow[];
       for (const row of rows) {
+        let nextStatus: VaultTaskPayload['nextStatus'] | null = null;
         try {
           const payload = projectionPayload(row.payload);
-          await this.vault.call('update_task', {
+          nextStatus = payload.nextStatus;
+          const result = await this.vault.call('update_task', {
             path: payload.path,
             status: payload.nextStatus,
+            ...(payload.due ? { due: payload.due } : {}),
             note: payload.note,
             source: payload.source,
           }, 0);
+          requireVaultTaskUpdateSuccess(result);
           this.markDone(row.id);
           completed += 1;
           this.log(`task outbox projected: update_task #${row.id}`);
         } catch (error) {
-          if (isIdempotentVaultProjectionError(error)) {
+          if (nextStatus && isIdempotentVaultProjectionError(error, nextStatus)) {
             this.markDone(row.id);
             completed += 1;
             this.log(`task outbox idempotently settled: update_task #${row.id}`);

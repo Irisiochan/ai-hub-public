@@ -6,8 +6,27 @@ import { openDb } from '../src/db.js';
 import {
   MEMORY_OUTBOX_MAX_ATTEMPTS,
   VaultClient,
+  assertVaultToolSucceeded,
   memoryOutboxRetryDelayMs,
 } from '../src/memory/vaultClient.js';
+
+assert.throws(
+  () => assertVaultToolSucceeded(
+    { ok: false, code: 'not_found', message: '文件不存在', data: {} },
+    '',
+  ),
+  /not_found: 文件不存在/,
+);
+assert.throws(
+  () => assertVaultToolSucceeded(undefined, JSON.stringify({
+    ok: false,
+    code: 'not_task',
+    message: '目标文件不是 task。',
+    data: {},
+  })),
+  /not_task: 目标文件不是 task。/,
+);
+assert.doesNotThrow(() => assertVaultToolSucceeded({ result: 'read content' }, 'read content'));
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-vault-outbox-'));
 const db = openDb(path.join(tempDir, 'hub.db'));

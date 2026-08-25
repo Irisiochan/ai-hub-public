@@ -531,9 +531,13 @@ export default function WorkerPanel({ onClose }: Props) {
                       <div>
                         <b>{selected.options.workflow.profileLabel}</b>
                         <span>
-                          {selected.options.workflow.stage} · {selected.options.workflow.selected.runner}/
+                          {selected.options.workflow.stage} · 实际 {selected.runner}
+                          {' · '}Profile 计划 {selected.options.workflow.selected.runner}/
                           {selected.options.workflow.selected.model}/{selected.options.workflow.selected.reasoning}
                         </span>
+                        {selected.options.runnerSource === 'override' && (
+                          <em>手动 override，不计入 Profile fallback 统计</em>
+                        )}
                         {selected.options.workflow.fallbackActive && <em>已触发兜底</em>}
                       </div>
                       <code title={selected.options.workflow.workflowFingerprint}>

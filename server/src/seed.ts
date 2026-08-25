@@ -82,13 +82,13 @@ export function ensureCodexContact(db: Db, config: HubConfig, logger?: HubLogger
   logger?.info({ component: 'seed', contactId: 'codex' }, 'contact seeded');
 }
 
-/** Add a generic Grok CLI contact without modifying existing contacts or sessions. */
+/** Add a generic Grok contact without modifying existing contacts or sessions. */
 export function ensureGrokContact(db: Db, config: HubConfig, logger?: HubLogger): void {
-  const grokDir = path.join(config.agentsDir, 'grok');
-  fs.mkdirSync(grokDir, { recursive: true });
-
   const existing = db.prepare('SELECT id FROM contacts WHERE id = ?').get('grok');
   if (existing) return;
+
+  const grokDir = path.join(config.agentsDir, 'grok');
+  fs.mkdirSync(grokDir, { recursive: true });
 
   db.prepare(
     `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
@@ -96,13 +96,13 @@ export function ensureGrokContact(db: Db, config: HubConfig, logger?: HubLogger)
   ).run(
     'grok',
     'Grok Build',
-    '⚡',
+    '🛠️',
     '#6e7681',
     'grok-cli',
     JSON.stringify({
       cwd: 'grok',
       appendSystemPrompt:
-        'You are chatting through ai-hub. Keep replies natural and direct. Do not use shell or file-writing tools unless project access is explicitly enabled.',
+        'You are chatting through ai-hub. Keep replies natural and direct, and do not claim tools or permissions that are unavailable.',
     })
   );
 

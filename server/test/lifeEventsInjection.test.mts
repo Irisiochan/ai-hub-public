@@ -99,14 +99,14 @@ try {
 
   // B（codex）的每轮注入：最新事实 + 风险等级 + 时间 + 来源
   const composer = new PromptComposer(null, new MessageRepo(db), null, null, null, service);
-  const codexTurn = await composer.composeTurn(ctxFor(codex), '用户现在什么状态？', '用户现在什么状态？', new Set());
-  assert.match(codexTurn, /<CROSS_CONTACT_STATE trust="gateway">/);
-  assert.match(codexTurn, /【安全·进行中】/, 'risk level must be visible');
-  assert.match(codexTurn, /进水并跳闸断电，正收拾准备临时搬离/, 'latest fact, not the initial state');
-  assert.doesNotMatch(codexTurn, /上海暴雨，家里一楼倒灌进水（/, 'stale initial summary must be replaced');
-  assert.match(codexTurn, /\d{2}-\d{2} \d{2}:\d{2}/, 'timestamp must be visible');
-  assert.match(codexTurn, /来自与Claude的对话/, 'source contact must be visible');
-  assert.match(codexTurn, /不是台词/, 'anti-recitation rule must ship with the block');
+  const coveTurn = await composer.composeTurn(ctxFor(codex), '老婆现在什么状态？', '老婆现在什么状态？', new Set());
+  assert.match(coveTurn, /<CROSS_CONTACT_STATE trust="gateway">/);
+  assert.match(coveTurn, /【安全·进行中】/, 'risk level must be visible');
+  assert.match(coveTurn, /进水并跳闸断电，正收拾准备临时搬离/, 'latest fact, not the initial state');
+  assert.doesNotMatch(coveTurn, /上海暴雨，家里一楼倒灌进水（/, 'stale initial summary must be replaced');
+  assert.match(coveTurn, /\d{2}-\d{2} \d{2}:\d{2}/, 'timestamp must be visible');
+  assert.match(coveTurn, /来自与Claude的对话/, 'source contact must be visible');
+  assert.match(coveTurn, /不是台词/, 'anti-recitation rule must ship with the block');
 
   // A（claude）自己：来源剔除，不重复注入
   const chengTurn = await composer.composeTurn(ctxFor(claude), '在吗', '在吗', new Set());

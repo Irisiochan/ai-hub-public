@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const envExample = fs.readFileSync(path.join(root, '.env.example'), 'utf8');
 const compose = fs.readFileSync(path.join(root, 'docker-compose.example.yml'), 'utf8');
-const expected = 'v0.7.0';
+const expected = 'v0.7.1';
 
 const envVersion = envExample.match(/^MEMORY_VAULT_VERSION=(\S+)$/m)?.[1];
 const composeVersion = compose.match(/\$\{MEMORY_VAULT_VERSION:-([^}]+)\}/)?.[1];

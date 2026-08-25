@@ -11,6 +11,19 @@ export function memoryOutboxRetryDelayMs(attempts: number): number {
   return Math.min(MEMORY_OUTBOX_BASE_RETRY_MS * (2 ** exponent), MEMORY_OUTBOX_MAX_RETRY_MS);
 }
 
+export function assertVaultToolSucceeded(structuredContent: unknown, text: string): void {
+  let candidate = structuredContent;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    try { candidate = JSON.parse(text); } catch { return; }
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return;
+  const result = candidate as { ok?: unknown; code?: unknown; message?: unknown };
+  if (result.ok !== false) return;
+  const code = typeof result.code === 'string' && result.code ? result.code : 'vault_tool_failed';
+  const message = typeof result.message === 'string' && result.message ? result.message : code;
+  throw new Error(`${code}: ${message}`);
+}
+
 /**
  * MCP client for the memory vault's streamable-http server, hardened for
  * gateway use: reconnect-on-failure with retries, and a SQLite outbox so
@@ -71,6 +84,7 @@ export class VaultClient {
           .map((b: any) => b.text)
           .join('\n');
         if (res?.isError) throw new Error(text.slice(0, 200) || `${name} returned error`);
+        assertVaultToolSucceeded(res?.structuredContent, text);
         return text;
       } catch (e) {
         lastErr = e;

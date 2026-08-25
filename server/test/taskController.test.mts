@@ -56,7 +56,12 @@ async function workerTailProjectionChecks(): Promise<void> {
     async call(name: string, args: Record<string, unknown> = {}) {
       vaultCalls.push({ name, args });
       if (name === 'read_file') throw new Error('not found');
-      return 'ok';
+      return JSON.stringify({
+        ok: true,
+        code: 'task_updated',
+        message: 'updated',
+        data: { path: args.path, status: args.status },
+      });
     },
     async write(name: string, args: Record<string, unknown>) {
       vaultWrites.push({ name, args });
@@ -367,7 +372,12 @@ try {
         fs.readFileSync(target, 'utf8').replace('status: open', 'status: done'),
         'utf8',
       );
-      return 'updated';
+      return JSON.stringify({
+        ok: true,
+        code: 'task_archived',
+        message: 'updated',
+        data: { path: args?.path, status: args?.status },
+      });
     },
   }, () => {});
   assert.equal(await projection.flushOutbox(), 1);
@@ -410,7 +420,12 @@ try {
   assert.equal(afterRestart.prepare('SELECT status FROM task_outbox').get().status, 'pending');
   const restartProjection = new VaultTaskProjection(afterRestart, {
     async call() {
-      throw new Error('文件不存在：task already archived');
+      return JSON.stringify({
+        ok: false,
+        code: 'not_found',
+        message: '文件不存在：task already archived',
+        data: { path: 'tasks/crash-safe.md', status: 'done' },
+      });
     },
   }, () => {});
   assert.equal(await restartProjection.flushOutbox(), 1);
@@ -448,6 +463,88 @@ try {
   assert.deepEqual(
     afterRestart.prepare('SELECT status, attempts FROM task_outbox WHERE task_id = ?').get('retry-dead'),
     { status: 'dead', attempts: 8 },
+  );
+
+  fs.writeFileSync(
+    path.join(crashTasksDir, 'open-not-found.md'),
+    '---\ntype: task\nstatus: open\n---\n\n# open-not-found\n',
+    'utf8',
+  );
+  const openMissingTask = retryService.refreshTask(crashTasksDir, 'tasks/open-not-found.md');
+  retryService.annotate({
+    commandId: 'command-open-not-found',
+    idempotencyKey: 'idem-open-not-found',
+    taskId: openMissingTask.taskId,
+    expectedVersion: openMissingTask.version,
+    actor: 'User',
+    source: 'test-suite',
+    reason: 'open projection must not settle missing files',
+    projection: {
+      path: 'tasks/open-not-found.md',
+      note: 'must retry',
+      source: 'User',
+    },
+  });
+  const openMissingProjection = new VaultTaskProjection(afterRestart, {
+    async call() {
+      return JSON.stringify({
+        ok: false,
+        code: 'not_found',
+        message: '文件不存在：tasks/open-not-found.md',
+        data: { path: 'tasks/open-not-found.md', status: 'open' },
+      });
+    },
+  }, () => {});
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    afterRestart.prepare(
+      "UPDATE task_outbox SET next_attempt_at = 0 WHERE task_id = 'open-not-found'"
+    ).run();
+    await openMissingProjection.flushOutbox();
+  }
+  assert.deepEqual(
+    afterRestart.prepare('SELECT status, attempts, last_error FROM task_outbox WHERE task_id = ?')
+      .get('open-not-found'),
+    {
+      status: 'dead',
+      attempts: 8,
+      last_error: '文件不存在：tasks/open-not-found.md',
+    },
+  );
+
+  fs.writeFileSync(
+    path.join(crashTasksDir, 'open-unstructured.md'),
+    '---\ntype: task\nstatus: open\n---\n\n# open-unstructured\n',
+    'utf8',
+  );
+  const unstructuredTask = retryService.refreshTask(crashTasksDir, 'tasks/open-unstructured.md');
+  retryService.annotate({
+    commandId: 'command-open-unstructured',
+    idempotencyKey: 'idem-open-unstructured',
+    taskId: unstructuredTask.taskId,
+    expectedVersion: unstructuredTask.version,
+    actor: 'User',
+    source: 'test-suite',
+    reason: 'ordinary response text must not be accepted as success',
+    projection: {
+      path: 'tasks/open-unstructured.md',
+      note: 'must remain pending',
+      source: 'User',
+    },
+  });
+  const unstructuredProjection = new VaultTaskProjection(afterRestart, {
+    async call() {
+      return '目标文件不是 task。';
+    },
+  }, () => {});
+  assert.equal(await unstructuredProjection.flushOutbox(), 0);
+  assert.deepEqual(
+    afterRestart.prepare('SELECT status, attempts, last_error FROM task_outbox WHERE task_id = ?')
+      .get('open-unstructured'),
+    {
+      status: 'pending',
+      attempts: 1,
+      last_error: 'update_task returned an unstructured result: 目标文件不是 task。',
+    },
   );
   afterRestart.close();
 

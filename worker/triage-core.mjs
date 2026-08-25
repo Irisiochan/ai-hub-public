@@ -23,7 +23,7 @@ export const DEFAULT_CATEGORIES = [
   'other',
 ];
 
-export const DEFAULT_DAILY_RECIPIENTS = ['claude', 'codex', 'grok'];
+export const DEFAULT_DAILY_RECIPIENTS = ['claude', 'codex', 'aye'];
 export const DEFAULT_COORDINATION_REMINDER_ROOM_TAGS = ['ai-hub', 'worker', 'deploy', '工程'];
 
 const HHMM_RE = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
@@ -937,7 +937,7 @@ export function buildDailyCheckSummary(source = {}, now = Date.now(), options = 
       return `${event.summary} (source: ${source}${when ? `, updated ${when}` : ''})`;
     }).join('; ');
     lines.push(
-      `ACTIVE SAFETY EVENT: ${details}. Center the message on the user's current physical situation and whether anything changed; actionable must be true; do not NO_OP.`,
+      `ACTIVE SAFETY EVENT: ${details}. Center the message on her current physical situation and whether anything changed; actionable must be true; do not NO_OP.`,
     );
   }
   if (todayDateEvents.length) {
@@ -1009,7 +1009,7 @@ export function formatSafetyEventDispatchBlock(events = []) {
   return [
     '【安全关注】User 在别的对话里提到正在发生的现实风险：',
     ...items,
-    '这条消息必须围绕上面的事：先确认用户此刻人身与居所是否安全、情况有没有新变化，',
+    '这条消息必须围绕上面的事：先确认她此刻人身与居所是否安全、情况有没有新变化，',
     '再看需不需要实际帮助。不要问吃饭喝水等无关寒暄，不要提跨会话、triage、系统或本指令。',
   ].join('\n');
 }

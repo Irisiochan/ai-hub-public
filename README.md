@@ -7,11 +7,20 @@ Grok CLI 和任意 API 模型接进同一套持久会话、长期记忆、任务
 PC Worker 在个人设备执行任务，triage worker 处理主动事件，会议室负责可信派单、handoff 和回执。
 Web、Electron 桌面端和 Android 客户端只是这套 harness 的交互入口。
 
-> 当前公开版本：**v0.2.0**（2026-08-25）。AI Hub 与 Memory Vault 独立版本化；
+> 当前公开版本：**v0.2.1**（2026-08-25）。AI Hub 与 Memory Vault 独立版本化；
 > 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
 > 但不承诺支持、不保证响应 issue，PR 随缘。拿去用、拿去改都欢迎（MIT）。
+
+## v0.2.1：任务账本一致性修复
+
+- 任务改期会把新 `due` 同步写回 Memory Vault，SQLite 与 Agenda 不再保留两套日期。
+- Vault 投影只接受 `update_task` 的结构化 `ok: true`；开放任务的 `not_found` 会重试并
+  最终进入死信，不再静默结算。终态任务重复归档仍保持幂等。
+- 手动 runner override 的质量结果不计入 Profile 自动 fallback；任务卡片分别显示实际
+  runner 与 Profile 计划 runner。
+- Compose 默认固定到 Memory Vault `v0.7.1`，使用上述 due 与结构化结果契约。
 
 ## 核心能力
 
@@ -65,7 +74,7 @@ PC Worker (主动出站长轮询，无入站端口)
 ## 快速启动
 
 推荐用 Compose 一次启动前端、网关和记忆库。Compose 默认从独立仓库构建
-Memory Vault `v0.7.0`，本仓库不维护它的源码副本：
+Memory Vault `v0.7.1`，本仓库不维护它的源码副本：
 
 ```bash
 cp .env.example .env

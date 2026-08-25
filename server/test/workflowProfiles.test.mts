@@ -48,6 +48,24 @@ try {
     reason: 'job quality already recorded',
     quality: 'infrastructure',
   });
+  const overrideJob = (id: string) => ({
+    id,
+    runner: 'claude',
+    options: JSON.stringify({ workflow: primary, runnerSource: 'override' }),
+  } as JobRow);
+  for (const id of ['override-poor-1', 'override-poor-2', 'override-poor-3']) {
+    assert.deepEqual(store.record(overrideJob(id), { quality: 'inadequate' }), {
+      counted: false,
+      reason: 'manual runner overrides do not affect profile fallback streaks',
+    });
+  }
+  const afterOverrides = store.snapshot({
+    stage: 'execute',
+    taskPath: 'tasks/demo.md',
+    problemFingerprint: fingerprint,
+  });
+  assert.equal(afterOverrides.fallbackActive, false);
+  assert.equal(afterOverrides.selected.runner, 'grok');
   assert.equal(store.record(qualityJob('job-poor-1'), { quality: 'inadequate' }).streak, 1);
   assert.equal(store.record(qualityJob('job-poor-2'), { quality: 'inadequate' }).streak, 2);
   const third = store.record(qualityJob('job-poor-3'), { quality: 'inadequate' });

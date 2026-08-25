@@ -148,7 +148,7 @@ function tokenCostCny(usage: Record<string, unknown> | undefined): number {
 
 const EXTRACT_SYSTEM_PROMPT = [
   '你是跨会话生活状态提取器。输入是 User（用户本人）最近的消息片段（含 [图片内容：…] 转写）',
-  '和当前已记录的进行中事件列表。任务：提取/更新 User 自述的现实生活状态事件。',
+  '和当前已记录的进行中事件列表。任务：提取/更新她自述的现实生活状态事件。',
   '输出严格 JSON：{"events":[{"action":"new"|"update"|"resolve","id":number|null,',
   '"severity":"safety"|"health"|"schedule"|"mood","summary":"最新事实一句话（≤80字）",',
   '"note":"本次新增进展（≤60字）","confidence":0..1}]}。没有可提取内容时输出 {"events":[]}。',
@@ -157,8 +157,8 @@ const EXTRACT_SYSTEM_PROMPT = [
   '2. summary 写"现在是什么状态"的最新事实，不写演变过程。',
   '3. severity：safety=现实人身/居所风险（进水、断电、火灾、受伤等）；health=身体不适；',
   '   schedule=作息与行程（睡眠、出门、到家、搬家进度）；mood 仅在明显影响互动判断时才记。',
-  '4. 只提取 User 本人陈述的现实生活状态。绝不输出：亲密或性相关内容；User 与 AI 之间的关系互动、',
-  '   称呼、情话；对第三者隐私的转述；未经 User 确认的猜测。拿不准就不输出。',
+  '4. 只提取 User 本人陈述的现实生活状态。绝不输出：亲密或性相关内容；她与 AI 之间的关系互动、',
+  '   称呼、情话；对第三者隐私的转述；未经她确认的猜测。拿不准就不输出。',
   '5. 不编造原文没有的信息；低把握时降低 confidence。',
 ].join('\n');
 
@@ -410,7 +410,7 @@ export class LifeEventService {
       'User 最近在其他对话里提到的生活状态（跨会话共享给你衔接语境，不是台词）：',
       ...lines,
       '使用规则：相关时自然接上，别装作不知道；不要逐条复述本块，不要提"跨会话/系统/注入"。',
-      '若 User 本轮亲口更新了状态，以本轮陈述为准。有安全类事项时，优先关切 User 此刻的现实处境。',
+      '若 User 本轮亲口更新了状态，以她本轮说的为准。有安全类事项时，优先关切她此刻的现实处境。',
       '</CROSS_CONTACT_STATE>',
     ].join('\n');
   }
