@@ -29,7 +29,7 @@
   zero known vulnerabilities.
 
 This public release is a curated, sanitized snapshot based on private source revision
-`875f112af36bb0af14753e57c2f79a22f080086c`; private contacts, personas, real evaluation data,
+`d58aa21a688283d37f876fd3185cb956e8ab579b`; private contacts, personas, real evaluation data,
 databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
 
 ## 0.2.1 - 2026-08-25

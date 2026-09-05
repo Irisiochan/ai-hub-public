@@ -108,3 +108,30 @@ export function ensureGrokContact(db: Db, config: HubConfig, logger?: HubLogger)
 
   logger?.info({ component: 'seed', contactId: 'grok' }, 'contact seeded');
 }
+
+/** Add a generic OpenCode contact without modifying existing contacts or sessions. */
+export function ensureMuseContact(db: Db, config: HubConfig, logger?: HubLogger): void {
+  const existing = db.prepare('SELECT id FROM contacts WHERE id = ?').get('opencode');
+  if (existing) return;
+
+  const opencodeDir = path.join(config.agentsDir, 'opencode');
+  fs.mkdirSync(opencodeDir, { recursive: true });
+
+  db.prepare(
+    `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
+     VALUES (?, ?, ?, ?, ?, 'dm', ?, 3)`
+  ).run(
+    'opencode',
+    'OpenCode',
+    '🎼',
+    '#c4a574',
+    'opencode-cli',
+    JSON.stringify({
+      cwd: 'opencode',
+      appendSystemPrompt:
+        'You are chatting through ai-hub via the OpenCode CLI. Keep replies natural and direct, and do not claim tools or permissions that are unavailable.',
+    })
+  );
+
+  logger?.info({ component: 'seed', contactId: 'opencode' }, 'contact seeded');
+}
