@@ -11,7 +11,8 @@ export type SseEvent =
   | 'worker'
   | 'workflow-profile'
   | 'job'
-  | 'job-message';
+  | 'job-message'
+  | 'heartbeat';
 
 export class SseHub {
   /** null subscriptions = legacy client receiving every contact delta. */

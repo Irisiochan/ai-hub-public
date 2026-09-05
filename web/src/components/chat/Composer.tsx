@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { ImageAttachButton, ImagePreviewStrip, type PendingImage } from '../ImageComposer';
+import { Icon } from '../icons';
 
 interface Props {
   contactName: string;
@@ -47,7 +48,7 @@ export default function Composer(props: Props) {
   }, [focusSignal]);
 
   return (
-    <>
+    <div className={`composer-shell${pendingImages.length > 0 ? ' has-attachments' : ''}`}>
       <ImagePreviewStrip images={pendingImages} onRemove={onRemoveImage} />
       <footer className="composer">
         {canSendImages && (
@@ -79,20 +80,17 @@ export default function Composer(props: Props) {
             }
           }}
         />
-        {busy ? (
-          <button className="send-btn stop" title="打断这一轮" onClick={onInterrupt}>
-            ■
-          </button>
-        ) : (
-          <button
-            className="send-btn"
-            onClick={onSend}
-            disabled={sending || (!draft.trim() && pendingImages.length === 0)}
-          >
-            {sending ? '…' : '➤'}
-          </button>
-        )}
+        <button
+          className={`send-btn${busy ? ' stop' : ''}`}
+          data-control-state={busy ? 'stop' : 'send'}
+          title={busy ? '打断这一轮' : undefined}
+          aria-label={busy ? '打断这一轮' : sending ? '发送中' : '发送消息'}
+          onClick={busy ? onInterrupt : onSend}
+          disabled={!busy && (sending || (!draft.trim() && pendingImages.length === 0))}
+        >
+          <Icon name={busy ? 'stop' : 'send'} size={24} />
+        </button>
       </footer>
-    </>
+    </div>
   );
 }

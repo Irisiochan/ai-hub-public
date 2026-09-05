@@ -12,6 +12,7 @@ import {
   type TurnHandle,
   type TurnInput,
 } from './types.js';
+import { TurnTimeoutController, resolveTurnTimeouts, timeoutTurnEvent } from './turnTimeouts.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -69,7 +70,9 @@ export interface GrokCliBackendOpts {
   alwaysApprove?: boolean;
   /** 人设 + 记忆前缀，经 `--rules` 追加进 system prompt（每轮进程都带，resume 也不丢人设）。 */
   preamble?: string;
-  turnTimeoutMs: number;
+  turnTimeoutMs?: number;
+  turnIdleTimeoutMs?: number;
+  turnHardTimeoutMs?: number;
   log: (msg: string) => void;
 }
 
@@ -161,7 +164,7 @@ export class GrokCliBackend implements AgentBackend {
   private started = false;
   private proc: JsonlProcess | null = null;
   private turn: AsyncQueue<TurnEvent> | null = null;
-  private turnTimer: NodeJS.Timeout | null = null;
+  private turnTimeouts: TurnTimeoutController | null = null;
   private interrupted = false;
   private retried = false;
   private turnText = '';
@@ -255,13 +258,16 @@ export class GrokCliBackend implements AgentBackend {
       return { events: queue, interrupt: () => this.interrupt() };
     }
 
-    this.turnTimer = setTimeout(() => {
-      this.opts.log('turn timeout, killing grok process');
+    const timeouts = resolveTurnTimeouts(this.opts);
+    this.turnTimeouts = new TurnTimeoutController(timeouts, (kind) => {
+      if (this.turn !== queue) return;
+      this.opts.log(`${kind} turn timeout, killing grok process`);
       this.interrupted = true;
       void this.proc?.stop(0);
-      this.turn?.push({ type: 'error', message: '这轮超时了，已打断', fatal: false });
+      queue.push(timeoutTurnEvent(kind));
       this.finishTurn();
-    }, this.opts.turnTimeoutMs);
+    });
+    this.turnTimeouts.start();
 
     return {
       events: queue,
@@ -324,14 +330,17 @@ export class GrokCliBackend implements AgentBackend {
   }
 
   private finishTurn(): void {
-    if (this.turnTimer) {
-      clearTimeout(this.turnTimer);
-      this.turnTimer = null;
-    }
+    this.turnTimeouts?.finish();
+    this.turnTimeouts = null;
     this.turn?.end();
     this.turn = null;
     this.turnText = '';
     this.turnImagePaths = [];
+  }
+
+  private emit(event: TurnEvent): void {
+    this.turnTimeouts?.activity(event);
+    this.turn?.push(event);
   }
 
   // ── line routing ───────────────────────────────────────
@@ -341,13 +350,13 @@ export class GrokCliBackend implements AgentBackend {
     switch (line?.type) {
       case 'thought':
         if (typeof line.data === 'string' && line.data) {
-          this.turn.push({ type: 'thinking', text: line.data });
+          this.emit({ type: 'thinking', text: line.data });
         }
         return;
       case 'text':
         if (typeof line.data === 'string' && line.data) {
           this.accText += line.data;
-          this.turn.push({ type: 'delta', text: line.data });
+          this.emit({ type: 'delta', text: line.data });
         }
         return;
       // tool_call / tool_call_update 是 0.2.10x 之后才有的行；旧版本没有，
@@ -358,7 +367,7 @@ export class GrokCliBackend implements AgentBackend {
           : typeof line.title === 'string' && line.title ? line.title : 'tool';
         if (typeof line.toolCallId === 'string') this.toolNames.set(line.toolCallId, name);
         this.pendingTool = name;
-        this.turn.push({ type: 'tool_use', name, inputSummary: summarize(line.rawInput) });
+        this.emit({ type: 'tool_use', name, inputSummary: summarize(line.rawInput) });
         return;
       }
       case 'tool_call_update': {
@@ -366,7 +375,7 @@ export class GrokCliBackend implements AgentBackend {
         if (status === 'in_progress' || status === 'pending') return;
         const name = this.toolNames.get(line.toolCallId) ?? this.pendingTool ?? 'tool';
         this.pendingTool = null;
-        this.turn.push({
+        this.emit({
           type: 'tool_result',
           name,
           ok: status === 'completed',
@@ -382,7 +391,7 @@ export class GrokCliBackend implements AgentBackend {
         // CLI 报的 sessionId 是权威值——万一和我们传的不一致，跟着它走
         if (typeof line.sessionId === 'string' && UUID_RE.test(line.sessionId) && line.sessionId !== this.sessionId) {
           this.sessionId = line.sessionId;
-          this.turn.push({ type: 'session', sessionId: line.sessionId });
+          this.emit({ type: 'session', sessionId: line.sessionId });
         }
         return;
       }
@@ -408,14 +417,14 @@ export class GrokCliBackend implements AgentBackend {
         this.sessionFlag = '-s';
         this.sessionId = crypto.randomUUID();
         this.opts.log(`resume failed — retrying with fresh session ${this.sessionId}`);
-        this.turn.push({ type: 'session', sessionId: this.sessionId });
+        this.emit({ type: 'session', sessionId: this.sessionId });
       }
       this.spawnAttempt();
       return;
     }
 
     if (this.interrupted) {
-      this.turn.push({ type: 'error', message: '这轮被打断了', fatal: false });
+      this.emit({ type: 'error', message: '这轮被打断了', fatal: false });
     } else if (code === 0) {
       // 进程正常退出说明 session 已落盘；即使工具审批取消，下一轮也必须 resume。
       this.sessionFlag = '-r';
@@ -427,7 +436,7 @@ export class GrokCliBackend implements AgentBackend {
         // 卡住的那个工具名是排查起点：MCP 调用被 --allow 覆盖，而 search_tool /
         // use_tool 这类内置元工具只能靠 --always-approve 放行。
         const stuck = this.pendingTool ? `卡在工具 ${this.pendingTool}。` : '';
-        this.turn.push({
+        this.emit({
           type: 'error',
           message:
             `Grok 回合未完成（stop_reason=${this.stopReason}）。${stuck}` +
@@ -435,10 +444,10 @@ export class GrokCliBackend implements AgentBackend {
           fatal: false,
         });
       } else {
-        this.turn.push({ type: 'done', finalText: this.accText, usage: this.usage });
+        this.emit({ type: 'done', finalText: this.accText, usage: this.usage });
       }
     } else {
-      this.turn.push({
+      this.emit({
         type: 'error',
         message: `grok 退出异常 (code=${code})${this.stderrSnippet(' — ')}`,
         // 进程本来就每轮一个，退出不代表后端坏了

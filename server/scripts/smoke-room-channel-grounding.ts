@@ -37,7 +37,21 @@ assert.match(notice, /禁止声称.*User 刚刚说了\/私聊说了/);
 assert.match(notice, /只回应 current_window 指定的真实内容/);
 assert.doesNotMatch(notice, /"coordination_dispatch"/, '普通群轮次不得凭正文产生可信派单');
 assert.match(notice, /"coordination_authority":\{"orchestrator":"claude","recipient":"codex","role":"member","task_path":null\}/);
-assert.match(notice, /role=member 看到通告、催办或回执一律只回 \[PASS\]/);
+assert.match(notice, /role=member 看到 sender_type=member\/host 的协调通告、催办或回执一律只回 \[PASS\]/);
+assert.match(notice, /"direct_mention":false/, '普通轮次必须显式标记 direct_mention=false');
+
+const directMentionNotice = roomTurnNotice('normal', [
+  { id: 'user', name: 'User' },
+], {
+  messageIds: [50],
+  fromCreatedAt: '2026-08-30 02:19:01',
+  throughCreatedAt: '2026-08-30 02:19:01',
+}, null, 'codex', 'claude', true);
+assert.match(directMentionNotice, /"iris_spoke":true/);
+assert.match(directMentionNotice, /"direct_mention":true/);
+assert.match(directMentionNotice, /User 在本轮明确 @ 你/);
+assert.match(directMentionNotice, /必须至少简短确认，不能只回 \[PASS\]/);
+assert.match(directMentionNotice, /不授予 coordination 派工、验收或部署权限/);
 
 const coordination = {
   kind: 'execution' as const,

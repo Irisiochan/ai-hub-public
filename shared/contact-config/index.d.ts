@@ -1,8 +1,11 @@
 import type { z } from 'zod';
 
-export type ContactBackend = 'claude-cli' | 'codex' | 'grok-cli' | 'api' | 'room';
+export type ContactBackend = 'claude-cli' | 'codex' | 'grok-cli' | 'opencode-cli' | 'api' | 'room';
 export type ContactKind = 'dm' | 'room';
 export type ApiProvider = 'anthropic' | 'openai-compat' | 'gemini';
+
+export const CLI_CONTACT_BACKENDS: ContactBackend[];
+export function isCliContactBackend(backend: ContactBackend | string): boolean;
 
 export interface ContactMemoryConfig {
   injectOnSpawn?: boolean;
@@ -31,6 +34,18 @@ export interface DelegationConfig {
   [key: string]: unknown;
 }
 
+export interface HeartbeatTaobaoConfig {
+  enabled: boolean;
+  mode: 'browse' | 'cart' | 'full';
+  [key: string]: unknown;
+}
+
+export interface HeartbeatConfig {
+  enabled: boolean;
+  taobao: HeartbeatTaobaoConfig;
+  [key: string]: unknown;
+}
+
 export interface RoutingConfig {
   enabled: boolean;
   recipientKey?: string;
@@ -48,8 +63,13 @@ export interface ContactConfig {
   model: string;
   modelOptions: Array<string | { id: string; label?: string; [key: string]: unknown }>;
   effort: string;
+  /** Legacy absolute timeout override; used as hard cap when turnHardTimeoutMs is absent. */
+  turnTimeoutMs?: number;
+  turnIdleTimeoutMs?: number;
+  turnHardTimeoutMs?: number;
   memory: ContactMemoryConfig;
   delegation: DelegationConfig;
+  heartbeat: HeartbeatConfig;
   routing: RoutingConfig;
   projectAccess: ProjectAccessConfig;
   affect: 'on' | 'off';
@@ -100,6 +120,8 @@ export interface ContactConfig {
 export const MemoryConfigSchema: z.ZodType<ContactMemoryConfig>;
 export const ProjectAccessSchema: z.ZodType<ProjectAccessConfig>;
 export const DelegationConfigSchema: z.ZodType<DelegationConfig>;
+export const HeartbeatTaobaoConfigSchema: z.ZodType<HeartbeatTaobaoConfig>;
+export const HeartbeatConfigSchema: z.ZodType<HeartbeatConfig>;
 export const RoutingConfigSchema: z.ZodType<RoutingConfig>;
 export const ClaudeContactConfigSchema: z.ZodType<ContactConfig>;
 export const CodexContactConfigSchema: z.ZodType<ContactConfig>;

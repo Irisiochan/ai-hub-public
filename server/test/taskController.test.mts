@@ -220,6 +220,42 @@ async function workerTailProjectionChecks(): Promise<void> {
 
 try {
   await workerTailProjectionChecks();
+  // A projection failure must roll back the entire command, for every mutation kind.
+  for (const kind of ['transition', 'annotate', 'reschedule'] as const) {
+    const taskId = `atomic-${kind}`;
+    writeTask(taskId, 'open', 'atomic command fixture', 'due: 2026-09-01\n');
+    const atomicService = new TaskStateService(db);
+    const current = atomicService.refreshTask(tasksDir, `tasks/${taskId}.md`);
+    const before = db.prepare('SELECT * FROM work_items WHERE task_id = ?').get(taskId);
+    const command = {
+      commandId: `atomic-command-${kind}`,
+      idempotencyKey: `atomic-idempotency-${kind}`,
+      taskId, expectedVersion: current.version, actor: 'test', source: 'test-suite',
+      reason: 'verify transaction rollback',
+      projection: { path: `tasks/${taskId}.md`, note: 'atomic projection', source: 'test' },
+    };
+    const invoke = () => kind === 'transition'
+      ? atomicService.transition({ ...command, toStatus: 'done' })
+      : kind === 'annotate' ? atomicService.annotate(command)
+      : atomicService.reschedule(command, '2026-09-20');
+    db.exec(`CREATE TEMP TRIGGER fail_projection BEFORE INSERT ON task_outbox
+      BEGIN SELECT RAISE(ABORT, 'projection unavailable'); END`);
+    assert.throws(invoke, /projection unavailable/);
+    assert.deepEqual(db.prepare('SELECT * FROM work_items WHERE task_id = ?').get(taskId), before);
+    for (const table of ['task_commands', 'task_events', 'task_outbox']) {
+      assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE task_id = ?`).get(taskId).count, 0);
+    }
+    db.exec('DROP TRIGGER fail_projection');
+    const applied = invoke();
+    assert.equal(applied.result, 'applied');
+    assert.equal(applied.version, current.version + 1);
+    assert.equal(invoke().replayed, true, `${kind} retry must reuse the committed result`);
+    for (const table of ['task_commands', 'task_events', 'task_outbox']) {
+      assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE task_id = ?`).get(taskId).count, 1);
+    }
+    db.prepare('DELETE FROM task_outbox WHERE task_id = ?').run(taskId);
+    fs.unlinkSync(path.join(tasksDir, `${taskId}.md`));
+  }
   const expectedTables = ['work_items', 'task_events', 'task_commands', 'task_outbox'];
   for (const table of expectedTables) {
     assert.ok(

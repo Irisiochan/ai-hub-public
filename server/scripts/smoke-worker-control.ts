@@ -18,7 +18,10 @@ function check(label: string, condition: boolean, detail = '') {
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-worker-control-'));
 const db = openDb(path.join(dir, 'test.db'));
-const sse = { broadcast: () => {} } as any;
+const workerEvents: Array<{ id: string; status: string }> = [];
+const sse = { broadcast: (event: string, data: any) => {
+  if (event === 'worker') workerEvents.push(data);
+} } as any;
 const jobs = new JobStore(db, sse);
 const app = express();
 app.use(express.json());
@@ -44,6 +47,7 @@ try {
     method: 'POST', body: JSON.stringify({ id: 'my-pc', name: 'User PC' }),
   });
   const auth = { Authorization: `Bearer ${paired.token}` };
+  check('配对立即广播 Worker 状态', workerEvents.at(-1)?.id === 'my-pc' && workerEvents.at(-1)?.status === 'offline');
   const capabilities = {
     runners: ['codex'],
     workspaces: [dir],
@@ -95,6 +99,7 @@ try {
 
   const resumedClaim = await call('/worker/claim?wait=0', { headers: auth });
   check('恢复后可以认领原任务', resumedClaim.job?.id === created.job.id && resumedClaim.acceptingJobs === true);
+  check('领单立即广播 busy，无需 UI 轮询', workerEvents.at(-1)?.status === 'busy');
   check(
     'claim 下发 protocol v2 与服务端交付契约',
     resumedClaim.protocolVersion === 2
@@ -106,6 +111,11 @@ try {
   await call(`/worker/jobs/${created.job.id}/start`, {
     method: 'POST', headers: auth, body: '{}',
   });
+  const eventsBeforeHeartbeat = workerEvents.length;
+  await call(`/worker/jobs/${created.job.id}/heartbeat`, {
+    method: 'POST', headers: auth, body: '{}',
+  });
+  check('无状态变化的心跳不重复广播', workerEvents.length === eventsBeforeHeartbeat);
   await call(`/worker/jobs/${created.job.id}/complete`, {
     method: 'POST', headers: auth,
     body: JSON.stringify({
@@ -115,6 +125,7 @@ try {
     }),
   });
   const candidates = await call('/worker/reconcile', { headers: auth });
+  check('最后一单结束立即广播 online', workerEvents.at(-1)?.status === 'online');
   check(
     '交付阻塞任务进入自动回写候选',
     candidates.jobs.length === 1 && candidates.jobs[0].id === created.job.id

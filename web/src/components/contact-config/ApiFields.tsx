@@ -1,3 +1,6 @@
+import type { ModelOption } from '../../api';
+import ModelPicker from '../ModelPicker';
+
 interface Props {
   /** connection = 基本·接入页；context = 历史与记忆页 */
   section: 'connection' | 'context';
@@ -5,6 +8,8 @@ interface Props {
   readOnlyConnection?: boolean;
   provider: string;
   model: string;
+  modelOptions?: ModelOption[];
+  modelsWarning?: string;
   visionModel: string;
   imageSupport: 'auto' | 'on' | 'off';
   baseUrl: string;
@@ -117,10 +122,19 @@ export default function ApiFields(props: Props) {
             />
           </label>
           <div className="cfg-row">
-            <label className="cfg-field">
+            <div className="cfg-field">
               <span>模型</span>
-              <input className="cfg-mono" value={props.model} onChange={(e) => props.onModel(e.target.value)} placeholder="glm-4-plus" />
-            </label>
+              <ModelPicker
+                variant="field"
+                value={props.model}
+                options={props.modelOptions ?? []}
+                allowCustom
+                placeholder="glm-4-plus"
+                ariaLabel="模型"
+                onChange={props.onModel}
+              />
+              {props.modelsWarning && <p className="cfg-note">{props.modelsWarning}</p>}
+            </div>
             <label className="cfg-field">
               <span>图片模型（可空）</span>
               <input

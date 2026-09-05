@@ -5,6 +5,8 @@
  * Not shipped to production — run with: npx tsx scripts/smoke-directapi-tools.ts
  */
 import assert from 'node:assert/strict';
+import { z } from 'zod';
+import { defineGatewayTool } from '../src/agents/gatewayTool.js';
 import http from 'node:http';
 import { DirectApiBackend } from '../src/agents/directApi.js';
 import { AnthropicProvider } from '../src/agents/directApi/anthropic.js';
@@ -202,6 +204,10 @@ const geminiSrv = http.createServer((req, res) => {
       if (!parsed.tools?.[0]?.functionDeclarations?.length) {
         throw new Error('Gemini function declarations missing');
       }
+      const leaked = JSON.stringify(parsed.tools).includes('"additionalProperties"');
+      if (leaked) {
+        throw new Error('Gemini function declaration parameters still contain additionalProperties');
+      }
       if (parsed.contents?.[0]?.role !== 'user') throw new Error('Gemini contents role mapping is wrong');
       sse(res, [
         {
@@ -306,6 +312,12 @@ const geminiBackend = new DirectApiBackend({
   ...common,
   provider: 'gemini',
   baseUrl: `http://127.0.0.1:${gPort}/v1beta/models/{model}:streamGenerateContent?alt=sse`,
+  extraTools: [defineGatewayTool({
+    name: 'camera_snap',
+    description: 'heartbeat camera',
+    inputSchema: { reason: z.string().optional() },
+    exec: async () => ({ ok: true, text: 'ok' }),
+  })],
 });
 await geminiBackend.start(null);
 // Gemini：本轮 input 取最终轮 180，而非 90+180=270；output/cache 口径见 smoke-token-efficiency

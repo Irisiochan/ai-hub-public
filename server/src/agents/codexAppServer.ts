@@ -7,6 +7,7 @@ import {
   type TurnInput,
 } from './types.js';
 import type { TokenUsage } from './types.js';
+import { TurnTimeoutController, resolveTurnTimeouts, timeoutTurnEvent } from './turnTimeouts.js';
 
 export interface CodexAppServerBackendOpts {
   cliPath: string;
@@ -20,7 +21,9 @@ export interface CodexAppServerBackendOpts {
     enabled?: boolean;
     inputTokens?: number;
   };
-  turnTimeoutMs: number;
+  turnTimeoutMs?: number;
+  turnIdleTimeoutMs?: number;
+  turnHardTimeoutMs?: number;
   log: (msg: string) => void;
 }
 
@@ -191,7 +194,7 @@ export class CodexAppServerBackend implements AgentBackend {
   private turnId: string | null = null;
   private turn: AsyncQueue<TurnEvent> | null = null;
   private userTurnStartRequested = false;
-  private turnTimer: NodeJS.Timeout | null = null;
+  private turnTimeouts: TurnTimeoutController | null = null;
   private accText = '';
   private stderrTail: string[] = [];
   private toolNames = new Map<string, string>();
@@ -360,7 +363,7 @@ export class CodexAppServerBackend implements AgentBackend {
       }
       this.pending.clear();
       if (this.turn) {
-        this.turn.push({ type: 'error', message: err.message, fatal: true });
+        this.emit({ type: 'error', message: err.message, fatal: true });
         this.finishTurn();
       }
     });
@@ -392,7 +395,18 @@ export class CodexAppServerBackend implements AgentBackend {
       queue.push({ type: 'session', sessionId: this.threadId });
     }
 
-    void this.beginTurnAfterCompaction(input.text, input.imagePaths).catch((e: any) => {
+    const timeouts = resolveTurnTimeouts(this.opts);
+    this.turnTimeouts = new TurnTimeoutController(timeouts, (kind) => {
+      if (this.turn !== queue) return;
+      this.opts.log(`${kind} turn timeout, interrupting`);
+      void this.interrupt();
+      queue.push(timeoutTurnEvent(kind));
+      this.finishTurn();
+    });
+    this.turnTimeouts.start();
+
+    void this.beginTurnAfterCompaction(input.text, input.imagePaths, queue).catch((e: any) => {
+      if (this.turn !== queue) return;
       queue.push({ type: 'error', message: `Codex 发送失败：${e.message}`, fatal: false });
       this.finishTurn();
     });
@@ -400,11 +414,16 @@ export class CodexAppServerBackend implements AgentBackend {
     return { events: queue, interrupt: () => this.interrupt() };
   }
 
-  private async beginTurnAfterCompaction(text: string, imagePaths: string[] = []): Promise<void> {
+  private async beginTurnAfterCompaction(
+    text: string,
+    imagePaths: string[] = [],
+    expectedTurn?: AsyncQueue<TurnEvent>,
+  ): Promise<void> {
     if (this.compactBarrier) await this.compactBarrier;
+    if (expectedTurn && this.turn !== expectedTurn) return;
     if (this.stopping) throw new Error('Codex app-server is stopping');
     try {
-      await this.beginTurn(text, imagePaths);
+      await this.beginTurn(text, imagePaths, expectedTurn);
     } catch (error) {
       if (this.isActiveTurnNotSteerable(error)) {
         this.userTurnStartRequested = false;
@@ -414,7 +433,11 @@ export class CodexAppServerBackend implements AgentBackend {
     }
   }
 
-  private async beginTurn(text: string, imagePaths: string[] = []): Promise<void> {
+  private async beginTurn(
+    text: string,
+    imagePaths: string[] = [],
+    expectedTurn?: AsyncQueue<TurnEvent>,
+  ): Promise<void> {
     if (!this.threadId) throw new Error('Codex thread is not ready');
     this.userTurnStartRequested = true;
     const result = await this.request('turn/start', {
@@ -422,13 +445,18 @@ export class CodexAppServerBackend implements AgentBackend {
       input: codexTurnInput(text, imagePaths),
       ...(this.opts.effort ? { effort: this.opts.effort } : {}),
     });
-    this.turnId = result?.turn?.id ?? this.turnId;
-    this.turnTimer = setTimeout(() => {
-      this.opts.log('turn timeout, interrupting');
-      void this.interrupt();
-      this.turn?.push({ type: 'error', message: '这轮超时了，已打断', fatal: false });
-      this.finishTurn();
-    }, this.opts.turnTimeoutMs);
+    const startedTurnId = result?.turn?.id ?? this.turnId;
+    if (expectedTurn && this.turn !== expectedTurn) {
+      if (startedTurnId) {
+        try {
+          await this.request('turn/interrupt', { threadId: this.threadId, turnId: startedTurnId });
+        } catch (error) {
+          this.opts.log(`late timed-out turn interrupt failed: ${(error as Error).message}`);
+        }
+      }
+      return;
+    }
+    this.turnId = startedTurnId;
   }
 
   async interrupt(): Promise<void> {
@@ -557,11 +585,11 @@ export class CodexAppServerBackend implements AgentBackend {
       case 'item/agentMessage/delta':
         if (params?.delta) {
           this.accText += params.delta;
-          this.turn.push({ type: 'delta', text: params.delta });
+          this.emit({ type: 'delta', text: params.delta });
         }
         return;
       case 'item/reasoning/summaryTextDelta':
-        if (params?.delta) this.turn.push({ type: 'thinking', text: params.delta });
+        if (params?.delta) this.emit({ type: 'thinking', text: params.delta });
         return;
       case 'item/started':
         this.handleItemStarted(params?.item);
@@ -580,7 +608,7 @@ export class CodexAppServerBackend implements AgentBackend {
     if (item.type === 'mcpToolCall') {
       const name = `${item.server ?? 'mcp'}:${item.tool ?? 'tool'}`;
       this.toolNames.set(item.id, name);
-      this.turn?.push({
+      this.emit({
         type: 'tool_use',
         name,
         inputSummary: this.summarize(item.arguments),
@@ -588,7 +616,7 @@ export class CodexAppServerBackend implements AgentBackend {
     } else if (item.type === 'commandExecution' || item.type === 'fileChange') {
       const name = item.type === 'commandExecution' ? 'shell (read-only)' : 'file change';
       this.toolNames.set(item.id, name);
-      this.turn?.push({ type: 'tool_use', name, inputSummary: this.summarize(item.command ?? item.changes) });
+      this.emit({ type: 'tool_use', name, inputSummary: this.summarize(item.command ?? item.changes) });
     }
   }
 
@@ -596,13 +624,13 @@ export class CodexAppServerBackend implements AgentBackend {
     if (!item?.id) return;
     if (item.type === 'agentMessage' && item.text && !this.accText) {
       this.accText = item.text;
-      this.turn?.push({ type: 'delta', text: item.text });
+      this.emit({ type: 'delta', text: item.text });
       return;
     }
     const name = this.toolNames.get(item.id);
     if (!name) return;
     const failed = ['failed', 'declined'].includes(String(item.status));
-    this.turn?.push({
+    this.emit({
       type: 'tool_result',
       name,
       ok: !failed && !item.error,
@@ -614,9 +642,9 @@ export class CodexAppServerBackend implements AgentBackend {
     if (!this.turn || (this.turnId && turn?.id && turn.id !== this.turnId)) return;
     const status = typeof turn?.status === 'string' ? turn.status : turn?.status?.type;
     if (status === 'completed') {
-      this.turn.push({ type: 'done', finalText: this.accText, usage: this.lastTokenUsage });
+      this.emit({ type: 'done', finalText: this.accText, usage: this.lastTokenUsage });
     } else {
-      this.turn.push({
+      this.emit({
         type: 'error',
         message: turn?.error?.message ?? `Codex turn ended with status ${status ?? 'unknown'}`,
         fatal: false,
@@ -633,20 +661,25 @@ export class CodexAppServerBackend implements AgentBackend {
     this.threadId = id;
     if (this.turn) {
       this.threadAnnounced = true;
-      this.turn.push({ type: 'session', sessionId: id });
+      this.emit({ type: 'session', sessionId: id });
     } else {
       this.threadAnnounced = false;
     }
   }
 
   private finishTurn(): void {
-    if (this.turnTimer) clearTimeout(this.turnTimer);
-    this.turnTimer = null;
+    this.turnTimeouts?.finish();
+    this.turnTimeouts = null;
     this.turnId = null;
     this.userTurnStartRequested = false;
     this.turn?.end();
     this.turn = null;
     if (!this.stopping && this.compactQueued) void this.startQueuedNativeCompact();
+  }
+
+  private emit(event: TurnEvent): void {
+    this.turnTimeouts?.activity(event);
+    this.turn?.push(event);
   }
 
   private nativeCompactEnabled(): boolean {
@@ -661,7 +694,7 @@ export class CodexAppServerBackend implements AgentBackend {
   }
 
   private nativeCompactCompletionTimeoutMs(): number {
-    return Math.max(this.opts.turnTimeoutMs, NATIVE_COMPACT_MIN_COMPLETION_TIMEOUT_MS);
+    return Math.max(resolveTurnTimeouts(this.opts).hardTimeoutMs, NATIVE_COMPACT_MIN_COMPLETION_TIMEOUT_MS);
   }
 
   private considerNativeCompact(inputTokens: number, notificationThreadId?: string): void {

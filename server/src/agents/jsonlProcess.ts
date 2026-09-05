@@ -76,6 +76,15 @@ export class JsonlProcess extends EventEmitter {
     return this.child?.pid;
   }
 
+  /** Close stdin without killing the child. `opencode run` treats a piped stdin as the prompt and waits for EOF. */
+  endStdin(): void {
+    const child = this.child;
+    if (!child || this.exited || !child.stdin.writable) return;
+    try {
+      child.stdin.end();
+    } catch {}
+  }
+
   /** Graceful: close stdin → wait → SIGTERM → wait → SIGKILL. */
   async stop(graceMs = 8000): Promise<void> {
     const child = this.child;

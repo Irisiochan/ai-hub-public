@@ -26,6 +26,7 @@ const BUILTIN: Record<string, BackendCatalog> = {
       { id: 'opus', label: 'Opus（最新）' },
       { id: 'haiku', label: 'Haiku（最新）' },
       { id: 'fable', label: 'Fable（最新）' },
+      { id: 'claude-fable-5-1', label: 'Fable 5.1' },
       { id: 'claude-opus-5', label: 'Opus 5' },
       { id: 'claude-sonnet-5', label: 'Sonnet 5' },
       { id: 'claude-fable-5', label: 'Fable 5' },
@@ -53,6 +54,25 @@ const BUILTIN: Record<string, BackendCatalog> = {
       { id: '', label: '默认（Grok CLI 自动选择）', isDefault: true },
       { id: 'grok-4.6', label: 'Grok 4.6' },
       { id: 'grok-4.5', label: 'Grok 4.5' },
+    ],
+  },
+  // API 主目录来自上游 /models；这里只做查询失败时的空兜底，具体模型写 api 或 api:<provider>。
+  api: { models: [] },
+  'api:openai-compat': { models: [] },
+  'api:anthropic': { models: [] },
+  'api:gemini': { models: [] },
+  // `opencode models` 是主目录；这里用于 CLI 查询失败时兜底，也可被热更新 JSON 覆盖。
+  'opencode-cli': {
+    models: [
+      { id: '', label: '默认（OpenCode 自动选择）', isDefault: true },
+      { id: 'opencode-go/muse-spark-1.2-contributor', label: 'Muse Spark 1.2 Contributor (Go)' },
+    ],
+    efforts: [
+      { id: '', label: '默认强度', isDefault: true },
+      { id: 'low', label: 'low' },
+      { id: 'medium', label: 'medium' },
+      { id: 'high', label: 'high' },
+      { id: 'xhigh', label: 'xhigh' },
     ],
   },
 };

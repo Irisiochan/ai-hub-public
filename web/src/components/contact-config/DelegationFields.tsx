@@ -1,4 +1,5 @@
 import { type Contact } from '../../api';
+import { Icon } from '../icons';
 
 interface Props {
   contact: Contact | null;
@@ -76,7 +77,7 @@ export default function DelegationFields(props: Props) {
 
           <div className="cfg-group">
             <h3>Workspace 白名单</h3>
-            {props.workspaces.length === 0 && <p className="cfg-warn">⚠ 白名单为空时无法派单</p>}
+            {props.workspaces.length === 0 && <p className="cfg-warn"><Icon name="warning" /> 白名单为空时无法派单</p>}
             <div className="path-chips">
               {props.workspaces.map((workspace) => (
                 <span className="path-chip" key={workspace}>
@@ -86,7 +87,7 @@ export default function DelegationFields(props: Props) {
                     aria-label={`移除 ${workspace}`}
                     onClick={() => props.onWorkspaces(props.workspaces.filter((item) => item !== workspace))}
                   >
-                    ✕
+                    <Icon name="close" />
                   </button>
                 </span>
               ))}
@@ -146,7 +147,7 @@ export default function DelegationFields(props: Props) {
               </div>
             </div>
             <p className="cfg-note">
-              SSH 等高影响能力永远不给模型，只能在 🖥 面板手动派。委派任务会以子会话形式挂在原聊天消息下。
+              SSH 等高影响能力永远不给模型，只能在 Worker 面板手动派。委派任务会以子会话形式挂在原聊天消息下。
               {props.contact?.backend === 'codex' && ' Codex 会按联系人自动接入 hub MCP，无需修改全局 config.toml。'}
               {props.contact?.backend === 'grok-cli' &&
                 ' Grok 使用部署机受信任的用户级 hub MCP；这里只控制是否授权委派，并仅自动批准这个接口。'}

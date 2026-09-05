@@ -7,14 +7,18 @@
  *  2b) empty backlog + categoryHint:'system' WITHOUT scheduler origin → L1 still runs
  *      (gate must not swallow real webhook/http-diff events)
  *  2c) system timer + vault empty string / garbage text → fail-open to L1 (no short-circuit)
- *  3) User present within threshold → daily skips L1; idle beyond threshold → daily evaluates
- *  4) webhook kind:"probe" → acknowledged, never enqueued; real non-probe system event reaches L1
+ *  3) naive UTC Hub timestamps are timezone-independent; explicit ISO keeps its instant
+ *  4) User present within threshold → normal and guaranteed daily slots are journaled/suppressed;
+ *     idle or a failed presence scan → guaranteed slot dispatches
+ *  5) webhook kind:"probe" → acknowledged, never enqueued; real non-probe system event reaches L1
  *
  * Removing the system-timer gate makes (1) fail (model is called).
  * Broadening isSystemTimerEvent to categoryHint==='system' alone makes (2b)/(4) fail.
  * Treating empty/garbage vault as zero-tasks makes (2c) fail.
- * Removing the presence gate makes (3a) fail (model is called while present).
- * Removing the probe bypass makes (4) fail (event is enqueued/dispatched).
+ * Removing the UTC normalization makes (3)/(4b) fail under America/New_York.
+ * Removing the presence gate or restoring the guaranteed-slot bypass makes (4a)/(4c) fail.
+ * Turning presence errors fail-closed makes (4e) fail.
+ * Removing the probe bypass makes (5) fail (event is enqueued/dispatched).
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -28,6 +32,8 @@ import {
   fileWatchContentDigest,
   isSystemTimerEvent,
   isWebhookProbeInput,
+  messageTimestampMs,
+  parseHubTimestampMs,
   shouldSuppressUnchangedFileWatch,
 } from '../../worker/triage-core.mjs';
 import { irisPresenceFromMessages } from '../../worker/followups.mjs';
@@ -207,6 +213,16 @@ const ELIGIBLE_SNAPSHOT = [
   assert.equal(shouldSuppressUnchangedFileWatch(null, digA), false);
 
   const now = Date.now();
+  const naiveUtc = '2026-08-31 18:00:00';
+  const expectedUtc = Date.parse('2026-08-31T18:00:00Z');
+  assert.equal(parseHubTimestampMs(naiveUtc), expectedUtc);
+  assert.equal(messageTimestampMs({ created_at: naiveUtc }), expectedUtc);
+  assert.equal(parseHubTimestampMs('2026-08-31T18:00:00Z'), expectedUtc);
+  assert.equal(
+    parseHubTimestampMs('2026-08-31T14:00:00-04:00'),
+    expectedUtc,
+    'explicit offsets must retain their instant',
+  );
   const present = irisPresenceFromMessages(
     [{ sender: 'user', role: 'user', content: 'hi', status: 'done', created_at: now - 5 * 60_000 }],
     { now, idleMinutes: 30 },
@@ -509,8 +525,11 @@ async function nonTimerSystemEventScenario(taskText: string): Promise<{ deepseek
 async function dailyPresenceScenario(opts: {
   userMessageAgeMs: number | null;
   aiOnly?: boolean;
-}): Promise<{ deepseekCalls: number; stdout: string }> {
+  guaranteedSlot?: boolean;
+  messageScanError?: boolean;
+}): Promise<{ deepseekCalls: number; dispatchCount: number; stdout: string }> {
   let deepseekCalls = 0;
+  let dispatchCount = 0;
   const now = Date.now();
   const deepseek = await listen((_req, res) => {
     deepseekCalls += 1;
@@ -520,12 +539,12 @@ async function dailyPresenceScenario(opts: {
         choices: [{
           message: {
             content: JSON.stringify({
-              actionable: false,
+              actionable: opts.guaranteedSlot === true,
               needsLocalExec: false,
               category: 'daily',
               priority: 1,
-              suggestedRecipient: null,
-              rationale: 'nothing pressing',
+              suggestedRecipient: opts.guaranteedSlot ? 'codex' : null,
+              rationale: opts.guaranteedSlot ? 'guaranteed daily slot' : 'nothing pressing',
             }),
           },
         }],
@@ -543,7 +562,7 @@ async function dailyPresenceScenario(opts: {
             name: 'Codex',
             kind: 'dm',
             state: 'idle',
-            last_at: new Date(now - 60_000).toISOString(),
+            last_at: new Date(now - 60_000).toISOString().replace('T', ' ').replace('Z', ''),
             config: {
               routing: {
                 enabled: true,
@@ -559,6 +578,11 @@ async function dailyPresenceScenario(opts: {
       return;
     }
     if (req.method === 'GET' && req.url?.startsWith('/api/contacts/codex/messages')) {
+      if (opts.messageScanError) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'presence scan unavailable' }));
+        return;
+      }
       const messages =
         opts.userMessageAgeMs == null
           ? []
@@ -569,7 +593,8 @@ async function dailyPresenceScenario(opts: {
               role: 'assistant',
               content: 'AI only',
               status: 'done',
-              created_at: now - opts.userMessageAgeMs,
+              created_at: new Date(now - opts.userMessageAgeMs)
+                .toISOString().replace('T', ' ').replace('Z', ''),
             }]
             : [{
               id: 1,
@@ -577,12 +602,14 @@ async function dailyPresenceScenario(opts: {
               role: 'user',
               content: '我在',
               status: 'done',
-              created_at: now - opts.userMessageAgeMs,
+              created_at: new Date(now - opts.userMessageAgeMs)
+                .toISOString().replace('T', ' ').replace('Z', ''),
             }];
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ messages }));
       return;
     }
+    if (req.method === 'POST') dispatchCount += 1;
     res.writeHead(202, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ queued: true }));
   });
@@ -605,10 +632,9 @@ async function dailyPresenceScenario(opts: {
       routing: { rules: {}, fuzzyFallback: false },
       proactive: {
         enabled: true,
-        // Disable guaranteed-slot force so presence damping can be observed in isolation.
-        minDailyDispatches: 0,
+        minDailyDispatches: opts.guaranteedSlot ? 1 : 0,
         dailyDispatchLimit: 10,
-        forceAfterHour: 23,
+        forceAfterHour: opts.guaranteedSlot ? 0 : 23,
         minimumGapMinutes: 0,
         silentStartHour: 0,
         silentEndHour: 0,
@@ -629,30 +655,68 @@ async function dailyPresenceScenario(opts: {
     }),
   );
   try {
-    const result = await runWorker(configPath, { TEST_DEEPSEEK_KEY: 'test-only' });
+    const result = await runWorker(configPath, {
+      TEST_DEEPSEEK_KEY: 'test-only',
+      TZ: 'America/New_York',
+    });
     assert.equal(result.code, 0, result.stderr || result.stdout);
-    return { deepseekCalls, stdout: result.stdout };
+    return { deepseekCalls, dispatchCount, stdout: result.stdout };
   } finally {
     await Promise.all([close(deepseek), close(hub), close(vault)]);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
-// ③a User present → daily skips
+// ④a User present → normal daily skips and journals the suppression.
 {
   const present = await dailyPresenceScenario({ userMessageAgeMs: 5 * 60_000 });
   assert.equal(present.deepseekCalls, 0, 'daily must not call model while User is present');
   assert.match(present.stdout, /daily suppressed by User presence/);
 }
 
-// ③b idle beyond threshold → still evaluates
+// ④b Naive UTC older than the threshold stays idle under America/New_York.
 {
   const idle = await dailyPresenceScenario({ userMessageAgeMs: 90 * 60_000 });
   assert.ok(idle.deepseekCalls >= 1, 'daily must still evaluate when User is idle past threshold');
   assert.doesNotMatch(idle.stdout, /daily suppressed by User presence/);
 }
 
-// ④ webhook probe: never enqueue / never dispatch
+// ④c Guaranteed slot also yields to recent User presence and writes the journal marker.
+{
+  const present = await dailyPresenceScenario({
+    userMessageAgeMs: 5 * 60_000,
+    guaranteedSlot: true,
+  });
+  assert.equal(present.deepseekCalls, 0);
+  assert.equal(present.dispatchCount, 0);
+  assert.match(present.stdout, /daily suppressed by User presence/);
+}
+
+// ④d Guaranteed slot dispatches when User is idle.
+{
+  const idle = await dailyPresenceScenario({
+    userMessageAgeMs: 90 * 60_000,
+    guaranteedSlot: true,
+  });
+  assert.ok(idle.deepseekCalls >= 1);
+  assert.equal(idle.dispatchCount, 1);
+  assert.doesNotMatch(idle.stdout, /daily suppressed by User presence/);
+}
+
+// ④e Presence scan errors fail open: the guaranteed slot still dispatches.
+{
+  const failedProbe = await dailyPresenceScenario({
+    userMessageAgeMs: 5 * 60_000,
+    guaranteedSlot: true,
+    messageScanError: true,
+  });
+  assert.ok(failedProbe.deepseekCalls >= 1);
+  assert.equal(failedProbe.dispatchCount, 1);
+  assert.match(failedProbe.stdout, /User presence message scan failed/);
+  assert.doesNotMatch(failedProbe.stdout, /daily suppressed by User presence/);
+}
+
+// ⑤ webhook probe: never enqueue / never dispatch
 {
   let deepseekCalls = 0;
   let dispatchCount = 0;

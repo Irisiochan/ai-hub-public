@@ -172,6 +172,11 @@ export const pipelineMethods = {
         return true;
       }
 
+      if (this.isRouteTriageEvent(event)) {
+        await this.processRouteTriage(event);
+        return true;
+      }
+
       if (this.isIdeaEvent(event)) {
         await this.processIdea(event);
         return true;
@@ -310,14 +315,15 @@ export const pipelineMethods = {
       }
 
       // Presence damping (on top of silent hours / minimumGap): if User herself
-      // spoke recently, skip pure proactive assessment. Date-events, guaranteed
-      // forceActionable slots, and followups still go through (no false negatives).
+      // spoke recently, skip pure proactive assessment, including the guaranteed
+      // forceAfterHour slot. Date-events, safety events, and followups still go
+      // through. Presence probe errors remain fail-open to dispatch.
       if (
         isDaily
         && !isFollowup
         && !triageResult
         && !hasTodayDateEvent
-        && !initialDailyPolicy.forceActionable
+        && !initialDailyPolicy.hasFreshSafetyEvent
       ) {
         const presence = await this.detectIrisPresence(Date.now());
         if (presence.active) {

@@ -56,46 +56,32 @@ export const coordinationMethods = {
     this.store.setSourceState(COORDINATION_STATE_KEY, JSON.stringify(state));
   },
 
-  coordinationPlans() {
+  coordinationTaskSnapshot() {
     const config = this.coordinationConfig();
-    if (!fs.existsSync(config.tasksDir)) return [];
-    return fs.readdirSync(config.tasksDir, { withFileTypes: true })
+    const snapshot = { plans: [], verifications: [] };
+    if (!fs.existsSync(config.tasksDir)) return snapshot;
+    const entries = fs.readdirSync(config.tasksDir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .map((entry) => {
-        const taskPath = `tasks/${entry.name}`;
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const taskPath = `tasks/${entry.name}`;
+      let raw;
+      try {
+        raw = fs.readFileSync(path.join(config.tasksDir, entry.name), 'utf8');
+      } catch (error) {
+        log('warn', 'coordination task read failed', { taskPath, error: error.message });
+        continue;
+      }
+      for (const [kind, parser] of [['plans', parseCoordinationTask], ['verifications', parseVerificationTask]]) {
         try {
-          return parseCoordinationTask(
-            fs.readFileSync(path.join(config.tasksDir, entry.name), 'utf8'),
-            { taskPath },
-          );
+          const task = parser(raw, { taskPath });
+          if (task) snapshot[kind].push(task);
         } catch (error) {
-          log('warn', 'coordination task read failed', { taskPath, error: error.message });
-          return null;
+          log('warn', 'coordination task parse failed', { taskPath, kind, error: error.message });
         }
-      })
-      .filter(Boolean);
-  },
-
-  verificationTasks() {
-    const config = this.coordinationConfig();
-    if (!fs.existsSync(config.tasksDir)) return [];
-    return fs.readdirSync(config.tasksDir, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .map((entry) => {
-        const taskPath = `tasks/${entry.name}`;
-        try {
-          return parseVerificationTask(
-            fs.readFileSync(path.join(config.tasksDir, entry.name), 'utf8'),
-            { taskPath },
-          );
-        } catch (error) {
-          log('warn', 'verification task read failed', { taskPath, error: error.message });
-          return null;
-        }
-      })
-      .filter(Boolean);
+      }
+    }
+    return snapshot;
   },
 
   coordinationPolicy(now = Date.now()) {
@@ -199,7 +185,8 @@ export const coordinationMethods = {
     if (policy.poolFull) return false;
     const state = this.coordinationState();
     let stateDirty = false;
-    const plans = this.coordinationPlans()
+    const snapshot = this.coordinationTaskSnapshot();
+    const plans = snapshot.plans
       .filter((task) => {
         const fingerprint = executionFingerprint(task);
         if (state[task.taskPath] === fingerprint) return false;
@@ -224,7 +211,7 @@ export const coordinationMethods = {
     }
     const verificationRemaining = Math.max(0, policy.remaining - plans.length);
     const today = shanghaiDateAt(now);
-    const verifications = this.verificationTasks()
+    const verifications = snapshot.verifications
       .filter((task) => task.due <= today && !this.verificationAlreadyDispatched(task))
       .slice(0, verificationRemaining);
     for (const task of verifications) {

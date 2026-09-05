@@ -37,7 +37,8 @@ const executionSamples = [
   },
 ];
 
-// 同一套规范化算法：server TS 实现与 worker mjs 实现必须逐字节一致
+// 两个入口使用同一实现；已落库的 key 与回执仍须逐字节兼容。
+assert.equal(executionFingerprint, triageCore.executionFingerprint);
 for (const sample of executionSamples) {
   assert.equal(
     executionFingerprint(sample),
@@ -59,6 +60,11 @@ assert.equal(
 
 // fingerprint 覆盖改派语义：Plan 不变、只改 executor 也必须换 key
 const base = executionSamples[0];
+assert.equal(
+  executionFingerprint(base),
+  '389c7b2718a9246412d91ede7c7e7ede9c426f10530ace89142db2954309a7a4',
+  'persisted v2 dispatch identities must survive the shared implementation move'
+);
 assert.notEqual(
   executionFingerprint({ ...base, executor: 'aye' }),
   executionFingerprint(base)

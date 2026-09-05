@@ -136,11 +136,34 @@ const visibleRoomJobs = visibleJobsForContact(
   [roomReceipt],
   [chengReceiptJob, unrelatedJob],
   new Set(['pending']),
+  'room',
 );
 assert.deepEqual(
   visibleRoomJobs.map((job) => job.id),
   ['job-room-receipt'],
   'the receipt-linked claude job is visible without leaking an unrelated job',
+);
+assert.deepEqual(
+  visibleJobsForContact(
+    'claude',
+    [roomReceipt],
+    [chengReceiptJob, unrelatedJob],
+    new Set(['pending', 'blocked']),
+    'dm',
+  ).map((job) => job.id),
+  [],
+  'DM chats do not surface JobThread cards even when origin_contact_id is that DM',
+);
+assert.deepEqual(
+  visibleJobsForContact(
+    'claude',
+    [],
+    [chengReceiptJob],
+    new Set(['blocked']),
+    'dm',
+  ).map((job) => job.id),
+  [],
+  'DM-origin jobs stay out of private chats even without receipt messages',
 );
 assert.ok(
   pendingReceiptCards([roomReceipt], visibleRoomJobs).length >= 1,

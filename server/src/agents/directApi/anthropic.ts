@@ -242,7 +242,19 @@ export class AnthropicProvider implements DirectApiProvider<AnthropicConversatio
       content: results.map((result) => ({
         type: 'tool_result',
         tool_use_id: result.id,
-        content: result.text,
+        content: result.image
+          ? [
+              { type: 'text', text: result.text },
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: result.image.mimeType,
+                  data: result.image.data,
+                },
+              },
+            ]
+          : result.text,
         ...(result.ok ? {} : { is_error: true }),
       })),
     });

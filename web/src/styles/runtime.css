@@ -1,0 +1,306 @@
+/* ===========================================================================
+   §8 需要改结构的新组件
+   =========================================================================== *//* §8.1 头像轨道 —— 桌面最左 72px，手机首页横置在标题下方
+   <nav class="rail"> <div class="rail-item"><span class="avatar">🤖</span>
+     <span class="rail-badge">2</span><span class="rail-busy"></span></div> … </nav> */.rail {
+  width: 72px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 0;
+  background: var(--bg-rail);
+  border-right: 1px solid var(--border);
+}.rail-logo {
+  width: 34px; height: 34px;
+  border-radius: var(--r-md);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: 700 15px/34px var(--mono);
+  text-align: center;
+}.rail-item { position: relative; cursor: pointer; }.rail-item .avatar {
+  width: 40px; height: 40px;
+  border-radius: var(--r-lg);
+  font-size: 19px;
+  background: var(--bg-hover) !important;
+}.rail-item.selected .avatar {
+  background: #242838 !important;
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}.rail-badge {
+  position: absolute; top: -3px; right: -3px;
+  min-width: 17px; height: 17px; padding: 0 4px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font: 700 10.5px/17px inherit;
+  text-align: center;
+}.rail-busy {
+  position: absolute; bottom: -2px; right: -2px;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--ok);
+  border: 2px solid var(--bg-rail);
+}.rail-spacer { flex: 1; }@media (max-width: 767px) {
+  .rail {
+    width: 100%;
+    flex-direction: row;
+    gap: 10px;
+    padding: 4px 14px 14px;
+    overflow-x: auto;
+    border-right: 0;
+    background: none;
+  }
+  .rail-item .avatar { width: 52px; height: 52px; border-radius: 17px; font-size: 24px; }
+  .rail-logo, .rail-spacer { display: none; }
+}/* §8.2 话题栏 —— 桌面第二栏，按会话里的话题/时间切片分组
+   <div class="topic-item selected">标题<span class="topic-meta">14:22 · 12 条</span></div> */.topic-pane {
+  width: 256px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+}.topic-item {
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  font: 13.5px/1.45 inherit;
+  color: #a9abb8;
+  cursor: pointer;
+}.topic-item:hover { background: var(--bg-hover); }.topic-item.selected {
+  background: #1a1d28;
+  border-left: 2px solid var(--accent);
+  color: var(--text);
+}.topic-meta { display: block; margin-top: 5px; font: 11.5px/1 var(--mono); color: var(--text-muted); }@media (max-width: 1023px) { .topic-pane { display: none; } }/* §8.3 运行时抽屉 —— 桌面右侧 284px，手机是标题下的下拉卡
+   额度 / token / 模型 / 推理强度 / 记忆 / 委派 / 批量 / 设置 / 打断都在这里 */.runtime-btn {
+  flex-shrink: 0;
+  width: 42px;
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--bg-hover);
+  color: var(--icon);
+  font: 13px/1 inherit;
+  cursor: pointer;
+}.runtime-btn.open {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--icon-active);
+}.runtime {
+  width: 284px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px 18px 20px;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+}.runtime h3 {
+  font: 11px/1 var(--mono);
+  color: var(--text-muted);
+  letter-spacing: 0.1em;
+  font-weight: 400;
+}.runtime section { display: flex; flex-direction: column; gap: 9px; }.runtime-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  background: var(--bg-hover);
+  font: 13px/1 inherit;
+  color: var(--text);
+}.runtime-kv {
+  display: flex;
+  justify-content: space-between;
+  font: 12.5px/1.6 var(--mono);
+  color: #a9abb8;
+}/* 额度条：取代 header 里那串 "5h剩62% · 周剩41%" */.quota { display: flex; flex-direction: column; gap: 6px; }.quota-head { display: flex; justify-content: space-between; font: 12.5px/1 inherit; color: var(--text-dim); }.quota-head b { color: var(--text); font-weight: 400; }.quota-track { height: 6px; border-radius: var(--r-pill); background: #22242f; overflow: hidden; }.quota-fill { height: 100%; background: var(--accent); }.quota-fill.week { background: var(--ok); }.quota-note { font: 11px/1 var(--mono); color: var(--text-muted); }.runtime-foot { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }.runtime-foot button {
+  border: 1px solid var(--border-strong);
+  background: var(--bg-card);
+  color: #c9cad4;
+  border-radius: var(--r-md);
+  padding: 10px 12px;
+  font: 13px/1 inherit;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}.runtime-foot button.danger {
+  color: var(--error);
+  border-color: var(--error-line);
+  background: var(--error-soft);
+}@media (max-width: 1023px) {
+  .runtime {
+    width: auto;
+    margin: 0 18px 12px;
+    padding: 15px 16px;
+    border: 1px solid var(--accent-line);
+    border-left-width: 1px;
+    border-radius: var(--r-xl);
+    background: var(--bg-card);
+    gap: 13px;
+  }
+}/* §8.4 主窗 / 后台分段控件 —— 取代 header 的 🛰 按钮
+   <div class="seg"><button class="seg-btn selected">主窗</button>
+                    <button class="seg-btn">后台 3</button></div> */.seg { display: flex; gap: 3px; padding: 3px; border-radius: var(--r-md); background: var(--bg-hover); }.seg-btn {
+  border: 0;
+  border-radius: var(--r-sm);
+  padding: 8px 15px;
+  background: none;
+  color: var(--text-dim);
+  font: 13px/1 inherit;
+  cursor: pointer;
+}.seg-btn.selected { background: #242838; color: var(--text); font-weight: 600; }.side-channel-btn { display: none; }@media (max-width: 767px) {
+  /* 手机上分段撑满一行，放在标题下面 */
+  .seg { background: none; padding: 0; gap: 4px; }
+  .seg-btn { flex: 1; padding: 10px 0; background: #131620; font-size: 14px; }
+  .seg-btn.selected { background: var(--bg-raised); }
+}/* §8.5 手机断点收尾 */@media (max-width: 767px) {
+  :root { --pad-pane: 18px; --gap-turn: 22px; }
+  .chat-header { padding: 16px 18px 12px; }
+  .chat-header-controls { display: flex; }   /* 现在只剩两个控件，不用再整组隐藏 */
+  .composer textarea { font-size: 16px; }
+  .bubble-row.mine .bubble, .bubble-mine { max-width: 86%; }
+}/* ── §9 运行时抽屉的桌面栅格（配合 ChatPane 的 .runtime-open） ─────────── */@media (min-width: 1024px) {
+  .chat-pane.runtime-open {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 284px;
+    grid-template-rows: auto auto minmax(0, 1fr) auto auto auto;
+  }
+  .chat-pane.runtime-open > .runtime { grid-column: 2; grid-row: 1 / -1; }
+  .chat-pane.runtime-open > .chat-header { grid-column: 1; grid-row: 1; }
+  .chat-pane.runtime-open > .bulk-tool-bar { grid-column: 1; grid-row: 2; }
+  .chat-pane.runtime-open > .message-scroll { grid-column: 1; grid-row: 3; }
+  .chat-pane.runtime-open > .send-error { grid-column: 1; grid-row: 5; }
+  .chat-pane.runtime-open > .composer,
+  .chat-pane.runtime-open > .side-readonly { grid-column: 1; grid-row: 6; }
+  .chat-pane.runtime-open > .composer-shell { grid-column: 1; grid-row: 6; }
+}/* 运行时抽屉里的下拉框（原 .model-select 已隐藏） */.runtime-select {
+  width: 100%;
+  background: none;
+  border: 0;
+  color: var(--text);
+  font: 13px/1 inherit;
+  cursor: pointer;
+}.runtime .seg { background: none; padding: 0; gap: 5px; }.runtime .seg-btn { flex: 1; text-align: center; background: var(--bg-hover); padding: 8px 0; font-size: 12.5px; }.runtime .seg-btn.selected { background: var(--accent); color: var(--accent-ink); }.heartbeat-idle,
+.heartbeat-active { display: flex; flex-direction: column; gap: 9px; }.heartbeat-status { color: var(--text); font-size: 13px; font-weight: 600; }.heartbeat-start,
+.heartbeat-stop {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+  background: var(--bg-hover);
+  color: var(--text);
+  cursor: pointer;
+}.heartbeat-start { background: var(--accent); color: var(--accent-ink); border-color: transparent; }.heartbeat-stop { color: var(--danger); }.heartbeat-start:disabled,
+.heartbeat-stop:disabled { cursor: default; opacity: .6; }.heartbeat-error { margin-top: 7px; color: var(--danger); }.runtime .side-unread-dot { display: none; }
+
+.model-picker {
+  position: relative;
+  min-width: 0;
+}
+.model-picker-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--bg-hover);
+  color: var(--text);
+  font: 13px/1.3 inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.model-picker-trigger:disabled {
+  cursor: default;
+  opacity: .6;
+}
+.model-picker-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-picker-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--bg-card);
+}
+.model-picker-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+  color: var(--icon-muted);
+}
+.model-picker-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: 12.5px/1.4 inherit;
+  padding: 8px 0;
+  outline: 0;
+}
+.model-picker-list {
+  list-style: none;
+  max-height: min(240px, 40vh);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-picker-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  border: 0;
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  background: none;
+  color: var(--text);
+  font: 12.5px/1.35 inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.model-picker-option small {
+  font: 11px/1.3 var(--mono);
+  color: var(--text-muted);
+}
+.model-picker-option:hover,
+.model-picker-option.active {
+  background: var(--bg-raised);
+}
+.model-picker-option.selected {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.model-picker-option.custom {
+  color: var(--accent-text);
+}
+.model-picker-empty,
+.model-picker-more {
+  padding: 8px 10px;
+  font: 11.5px/1.4 inherit;
+  color: var(--text-muted);
+}

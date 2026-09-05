@@ -54,7 +54,8 @@ export function messagesRouter(
        '$.roomHost.error', 'gateway restarted before room round completion'
      )
      WHERE sender = 'room-host'
-       AND json_extract(meta, '$.roomHost.status') = 'running'`
+       AND json_extract(meta, '$.roomHost.status') = 'running'
+       AND COALESCE(json_extract(meta, '$.roomDispatch.status'), '') NOT IN ('deferred', 'dispatching')`
   ).run();
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -320,16 +321,34 @@ export function messagesRouter(
       ...(coordination
         ? { coordinationDomain: true as const, coordination }
         : {}),
+      userMessageId: row.id,
     });
+    if (tracked.deferred) {
+      const current = db.prepare('SELECT meta FROM messages WHERE id = ?').get(row.id) as { meta: string };
+      const currentMeta = parseMeta({ ...row, meta: current.meta });
+      const deferredMeta = {
+        ...currentMeta,
+        roomHost: { ...currentMeta.roomHost, status: 'deferred' },
+      };
+      db.prepare('UPDATE messages SET meta = ? WHERE id = ?').run(JSON.stringify(deferredMeta), row.id);
+      const deferredRow = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow;
+      sse.broadcast('message', withAttachments(db, deferredRow));
+    }
     void tracked.completion.then((outcome) => {
+      const current = db.prepare('SELECT meta FROM messages WHERE id = ?').get(row.id) as { meta: string } | undefined;
+      const currentMeta: Record<string, any> = current
+        ? parseMeta({ ...row, meta: current.meta })
+        : initialMeta;
+      if (currentMeta.roomDispatch?.status === 'error'
+          && currentMeta.roomDispatch?.interruptionReason === 'deploy-restart') return;
       const lastMessageId = Number(
         (db.prepare('SELECT COALESCE(MAX(id), ?) AS id FROM messages WHERE contact_id = ?')
           .get(row.id, contact.id) as { id: number }).id
       );
       const doneMeta = {
-        ...initialMeta,
+        ...currentMeta,
         roomHost: {
-          ...initialMeta.roomHost,
+          ...currentMeta.roomHost,
           status: 'done',
           lastMessageId,
           completedAt: new Date().toISOString(),
@@ -340,10 +359,16 @@ export function messagesRouter(
       const doneRow = db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow;
       sse.broadcast('message', withAttachments(db, doneRow));
     }).catch((error: Error) => {
+      const current = db.prepare('SELECT meta FROM messages WHERE id = ?').get(row.id) as { meta: string } | undefined;
+      const currentMeta: Record<string, any> = current
+        ? parseMeta({ ...row, meta: current.meta })
+        : initialMeta;
+      if (currentMeta.roomDispatch?.status === 'error'
+          && currentMeta.roomDispatch?.interruptionReason === 'deploy-restart') return;
       const failedMeta = {
-        ...initialMeta,
+        ...currentMeta,
         roomHost: {
-          ...initialMeta.roomHost,
+          ...currentMeta.roomHost,
           status: 'error',
           completedAt: new Date().toISOString(),
           error: error.message.slice(0, 500),
@@ -354,7 +379,10 @@ export function messagesRouter(
       sse.broadcast('message', withAttachments(db, failedRow));
     });
 
-    res.status(202).json(roomHostResponse(row));
+    const responseRow = tracked.deferred
+      ? db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow
+      : row;
+    res.status(202).json(roomHostResponse(responseRow));
   });
 
   /** 编辑提示词并重新生成：内容可选更新，其后的消息全部软删，CLI 上下文重置回放。 */

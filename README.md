@@ -1,32 +1,41 @@
 # ai-hub
 
 自托管的 multi-agent harness，也是面向个人长期运行的 AI 基础设施。它把 Claude Code、Codex、
-Grok CLI 和任意 API 模型接进同一套持久会话、长期记忆、任务委派与协作总线，并自带 IM 式前端。
+Grok CLI、OpenCode 和任意 API 模型接进同一套持久会话、长期记忆、任务委派与协作总线，并自带 IM 式前端。
 
 它不只是一个多模型聊天页面：网关管理 agent 会话与权限，Memory Vault 提供长期记忆，
 PC Worker 在个人设备执行任务，triage worker 处理主动事件，会议室负责可信派单、handoff 和回执。
 Web、Electron 桌面端和 Android 客户端只是这套 harness 的交互入口。
 
-> 当前公开版本：**v0.2.1**（2026-08-25）。AI Hub 与 Memory Vault 独立版本化；
+> 当前公开版本：**v0.3.0**（2026-09-06）。AI Hub 与 Memory Vault 独立版本化；
 > 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
 > 但不承诺支持、不保证响应 issue，PR 随缘。拿去用、拿去改都欢迎（MIT）。
 
-## v0.2.1：任务账本一致性修复
+## v0.3.0：陪伴心跳、OpenCode 后端与路由分诊闭环
 
-- 任务改期会把新 `due` 同步写回 Memory Vault，SQLite 与 Agenda 不再保留两套日期。
-- Vault 投影只接受 `update_task` 的结构化 `ok: true`；开放任务的 `not_found` 会重试并
-  最终进入死信，不再静默结算。终态任务重复归档仍保持幂等。
-- 手动 runner override 的质量结果不计入 Profile 自动 fallback；任务卡片分别显示实际
-  runner 与 Profile 计划 runner。
-- Compose 默认固定到 Memory Vault `v0.7.1`，使用上述 due 与结构化结果契约。
+- **陪伴心跳**：CLI 与 API 联系人都可开启周期性自主 tick，间隔随机化，模型自行决定
+  这一拍要不要开口；支持手动无限模式与运行时抽屉里的开关。心跳还能桥接桌面 MCP 工具
+  （如电商购物车）与守护式 PC 相机捕获（帧以 MCP 图像返回）。
+- **OpenCode CLI 后端**：新增第四种 CLI 后端（OpenCode Go），含模型发现进选择器、
+  图片输入直通与 stdin/空闲超时修复。
+- **路由分诊闭环**：未路由任务先由巡逻联系人预筛给出路由建议，veto 窗口内无人否决即
+  自动派单；当日迟到回复可延迟收割；presence 判断时区安全。
+- **会议室加固**：结构化回执 + 部署闭环自动化（部署事件可 resume、回执分页有守护），
+  任务 outcome 与到期提醒统一走会议室，房间回执展示 worker 动作。
+- **前端**：Telegram 风格 shell、受控主题清单、动效与声音偏好、长会话渲染有界。
+- **账单导入**：支付宝/微信/招行账单导入，去重后生成月度建议。
+- **架构文档**：产品宪章（[docs/CHARTER.md](docs/CHARTER.md)）、living
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) + drift guard 测试、核心实现收敛
+  （Worker 状态、任务事务、网关契约统一，见 [docs/MINIMAL_IMPLEMENTATION.md](docs/MINIMAL_IMPLEMENTATION.md)）。
 
 ## 核心能力
 
 - **多 Agent 宿主**：把 `claude` CLI（stream-json 持久子进程 + resume）、
-  `codex app-server`（JSON-RPC）、Grok CLI 和 API 直连模型（Anthropic / OpenAI-compatible /
-  Gemini 原生协议）组织成长期在线的独立联系人；每个联系人保留自己的会话、人格、权限与工作目录
+  `codex app-server`（JSON-RPC）、Grok CLI、OpenCode CLI 和 API 直连模型（Anthropic /
+  OpenAI-compatible / Gemini 原生协议，模型列表可搜索选择）组织成长期在线的独立联系人；
+  每个联系人保留自己的会话、人格、权限与工作目录
 - **协作与 handoff**：拉现有联系人建群，用 `@名字` / `@all` 调度；Plan 就绪的任务可进入会议室工作总线，
   由网关签发可信派单，成员接单、委派、交付；任务控制器、协调指纹、durable outbox 和完成回执
   共同防止正文伪造状态、重复派单或崩溃后丢回执
@@ -39,6 +48,8 @@ Web、Electron 桌面端和 Android 客户端只是这套 harness 的交互入�
 - **自主 triage worker**：VPS 常驻事件分诊——daily 主动陪伴、纪念日/生日提醒、任务到期催办、
   临时离开跟进；每日 Agenda 只展示真实增量，未展示项轮转、长期静默项定期重新浮出；数据库异常时进入
   可观测 maintenance mode，不在坏状态下继续派单
+- **陪伴心跳**：联系人级周期性自主 tick（CLI 与 API 后端通用），间隔随机化、模型自行决定是否开口，
+  可挂接桌面 MCP 工具与守护式 PC 相机捕获，运行时抽屉直接开关
 - **IM 式交互入口**：每个 AI 是一个联系人，一条持续演进的对话；历史跨设备同步，支持群聊、
   改名、头像与主题色，Web、Electron 和 Android 共用同一套网关
 - **图片与模型能力**：选图或粘贴截图直接发送，API 联系人可按需配置独立视觉模型；
@@ -61,6 +72,7 @@ AI Hub harness / 网关 (Node/TS, :3900)
    ├─ claude --input-format stream-json --output-format stream-json [--resume]
    ├─ codex app-server (JSON-RPC over stdio, thread/resume)
    ├─ grok (CLI stream events, session/resume)
+   ├─ opencode (OpenCode Go CLI, run --file)
    └─ 直连 API (anthropic / openai-compat / gemini)
 
 PC Worker (主动出站长轮询，无入站端口)
@@ -106,7 +118,7 @@ cd web && npm install && npm run dev        # 前端 :5173（代理 /api → 390
 - 联系人级配置存在 DB（UI 可改）：模型、人设、记忆三开关、委派权限等
 - Agent 工作目录在 `server/agents/<联系人id>/`：`CLAUDE.md` 是人设
   （模板见 `server/agents/example/`），`mcp.json` 指向记忆库 MCP server，
-  `overlay.md` 是该联系人相对它家厂商 base prompt 的差分叠层（跟着仓库走，四个后端通用）
+  `overlay.md` 是该联系人相对它家厂商 base prompt 的差分叠层（跟着仓库走，各后端通用）
 - 系统提示词分几层、想改口吻该动哪一层：[docs/prompt-layers.md](docs/prompt-layers.md)
 - 自动消息 `origin` 兼容与 side 审计层约定（任务执行进会议室，daily 陪伴进 `main`）：
   [docs/split-private-and-side-channel-windows.md](docs/split-private-and-side-channel-windows.md) 文末「side 退役为审计层」

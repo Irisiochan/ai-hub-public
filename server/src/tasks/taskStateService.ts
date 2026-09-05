@@ -53,20 +53,8 @@ export interface TaskTransitionResult {
   replayed: boolean;
 }
 
-export interface TaskUpdateCommand {
-  commandId: string;
-  idempotencyKey: string;
-  taskId: string;
-  expectedVersion: number;
-  actor: string;
-  source: string;
-  reason: string;
-  evidence?: Record<string, unknown>;
-  projection: {
-    path: string;
-    note: string;
-    source: string;
-  };
+export interface TaskUpdateCommand extends Omit<TaskTransitionCommand, 'toStatus' | 'projection'> {
+  projection: NonNullable<TaskTransitionCommand['projection']>;
 }
 
 export interface RefreshedTask {
@@ -320,7 +308,28 @@ export class TaskStateService {
   }
 
   transition(command: TaskTransitionCommand): TaskTransitionResult {
+    return this.applyCommand('transition', command);
+  }
+
+  annotate(command: TaskUpdateCommand): TaskTransitionResult {
+    return this.applyCommand('annotate', command);
+  }
+
+  reschedule(command: TaskUpdateCommand, due: string): TaskTransitionResult {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(due)) {
+      throw new Error(`invalid reschedule due: ${due}`);
+    }
+    return this.applyCommand('reschedule', command, due);
+  }
+
+  /** All task mutations share one CAS, event and durable-projection transaction. */
+  private applyCommand(
+    kind: 'transition' | 'annotate' | 'reschedule',
+    command: TaskTransitionCommand | TaskUpdateCommand,
+    due?: string,
+  ): TaskTransitionResult {
     const execute = this.db.transaction((): TaskTransitionResult => {
+      const nextStatus = kind === 'transition' ? (command as TaskTransitionCommand).toStatus : 'open';
       const existing = this.db.prepare(
         'SELECT * FROM task_commands WHERE command_id = ? OR idempotency_key = ?'
       ).get(command.commandId, command.idempotencyKey) as CommandRow | undefined;
@@ -336,7 +345,7 @@ export class TaskStateService {
         command.idempotencyKey,
         command.taskId,
         command.expectedVersion,
-        command.toStatus,
+        nextStatus,
         command.actor,
         command.source,
         command.reason,
@@ -357,123 +366,21 @@ export class TaskStateService {
       if (current.version !== command.expectedVersion) {
         return reject(`version_conflict:expected=${command.expectedVersion}:actual=${current.version}`);
       }
-      if (!VALID_TRANSITIONS[current.status].has(command.toStatus)) {
-        return reject(`invalid_transition:${current.status}->${command.toStatus}`);
+      if (kind === 'transition') {
+        if (!VALID_TRANSITIONS[current.status].has(nextStatus)) {
+          return reject(`invalid_transition:${current.status}->${nextStatus}`);
+        }
+      } else if (current.status !== 'open') {
+        return reject(`invalid_update_status:${current.status}`);
       }
 
       const nextVersion = current.version + 1;
       const eventId = `command:${command.commandId}`;
       const changed = this.db.prepare(
-        `UPDATE work_items SET status = ?, version = ?, updated_at = datetime('now')
+        `UPDATE work_items SET status = ?, due = ?, version = ?, updated_at = datetime('now')
          WHERE task_id = ? AND version = ?`
-      ).run(command.toStatus, nextVersion, command.taskId, command.expectedVersion);
-      if (changed.changes !== 1) return reject('version_conflict:during_update');
-
-      const eventPayload = stablePayload({
-        commandId: command.commandId,
-        evidence: command.evidence ?? {},
-        reason: command.reason,
-      });
-      this.db.prepare(
-        `INSERT INTO task_events (
-           event_id, task_id, task_version, kind, previous_status, next_status, actor, source, payload
-         ) VALUES (?, ?, ?, 'status_transitioned', ?, ?, ?, ?, ?)`
-      ).run(
-        eventId, command.taskId, nextVersion, current.status, command.toStatus,
-        command.actor, command.source, eventPayload
-      );
-      this.db.prepare(
-        `INSERT INTO task_outbox (event_id, task_id, projection, payload)
-         VALUES (?, ?, 'vault-task', ?)`
-      ).run(eventId, command.taskId, stablePayload({
-        eventId,
-        expectedSourceVersion: command.expectedVersion,
-        nextStatus: command.toStatus,
-        ...(command.projection ?? {}),
-        taskId: command.taskId,
-        taskVersion: nextVersion,
-      }));
-      this.db.prepare(
-        `UPDATE task_commands SET result = 'applied', result_version = ?, event_id = ?,
-           completed_at = datetime('now') WHERE command_id = ?`
-      ).run(nextVersion, eventId, command.commandId);
-      return {
-        commandId: command.commandId,
-        taskId: command.taskId,
-        result: 'applied',
-        version: nextVersion,
-        eventId,
-        replayed: false,
-      };
-    });
-    return execute();
-  }
-
-  annotate(command: TaskUpdateCommand): TaskTransitionResult {
-    return this.applyUpdate('annotate', command, null);
-  }
-
-  reschedule(command: TaskUpdateCommand, due: string): TaskTransitionResult {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(due)) {
-      throw new Error(`invalid reschedule due: ${due}`);
-    }
-    return this.applyUpdate('reschedule', command, due);
-  }
-
-  private applyUpdate(
-    kind: 'annotate' | 'reschedule',
-    command: TaskUpdateCommand,
-    due: string | null,
-  ): TaskTransitionResult {
-    const execute = this.db.transaction((): TaskTransitionResult => {
-      const existing = this.db.prepare(
-        'SELECT * FROM task_commands WHERE command_id = ? OR idempotency_key = ?'
-      ).get(command.commandId, command.idempotencyKey) as CommandRow | undefined;
-      if (existing) return commandResult(existing, true);
-
-      this.db.prepare(
-        `INSERT INTO task_commands (
-           command_id, idempotency_key, task_id, expected_version, requested_status,
-           actor, source, reason, evidence, result
-         ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, 'processing')`
-      ).run(
-        command.commandId,
-        command.idempotencyKey,
-        command.taskId,
-        command.expectedVersion,
-        command.actor,
-        command.source,
-        command.reason,
-        stablePayload(command.evidence ?? {})
-      );
-
-      const reject = (error: string): TaskTransitionResult => {
-        this.db.prepare(
-          `UPDATE task_commands SET result = 'rejected', error = ?, completed_at = datetime('now')
-           WHERE command_id = ?`
-        ).run(error, command.commandId);
-        return { commandId: command.commandId, taskId: command.taskId, result: 'rejected', error, replayed: false };
-      };
-
-      const current = this.db.prepare('SELECT * FROM work_items WHERE task_id = ?')
-        .get(command.taskId) as WorkItemRow | undefined;
-      if (!current) return reject('task_not_found');
-      if (current.version !== command.expectedVersion) {
-        return reject(`version_conflict:expected=${command.expectedVersion}:actual=${current.version}`);
-      }
-      if (current.status !== 'open') return reject(`invalid_update_status:${current.status}`);
-
-      const nextVersion = current.version + 1;
-      const eventId = `command:${command.commandId}`;
-      const changed = kind === 'reschedule'
-        ? this.db.prepare(
-            `UPDATE work_items SET due = ?, version = ?, updated_at = datetime('now')
-             WHERE task_id = ? AND version = ? AND status = 'open'`
-          ).run(due, nextVersion, command.taskId, command.expectedVersion)
-        : this.db.prepare(
-            `UPDATE work_items SET version = ?, updated_at = datetime('now')
-             WHERE task_id = ? AND version = ? AND status = 'open'`
-          ).run(nextVersion, command.taskId, command.expectedVersion);
+      ).run(nextStatus, kind === 'reschedule' ? due! : current.due,
+        nextVersion, command.taskId, command.expectedVersion);
       if (changed.changes !== 1) return reject('version_conflict:during_update');
 
       const eventPayload = stablePayload({
@@ -485,12 +392,15 @@ export class TaskStateService {
       this.db.prepare(
         `INSERT INTO task_events (
            event_id, task_id, task_version, kind, previous_status, next_status, actor, source, payload
-         ) VALUES (?, ?, ?, ?, 'open', 'open', ?, ?, ?)`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         eventId,
         command.taskId,
         nextVersion,
-        kind === 'reschedule' ? 'task_rescheduled' : 'task_annotated',
+        kind === 'transition' ? 'status_transitioned'
+          : kind === 'reschedule' ? 'task_rescheduled' : 'task_annotated',
+        current.status,
+        nextStatus,
         command.actor,
         command.source,
         eventPayload
@@ -501,9 +411,9 @@ export class TaskStateService {
       ).run(eventId, command.taskId, stablePayload({
         eventId,
         expectedSourceVersion: command.expectedVersion,
-        nextStatus: 'open',
+        nextStatus,
         ...(kind === 'reschedule' ? { due } : {}),
-        ...command.projection,
+        ...(command.projection ?? {}),
         taskId: command.taskId,
         taskVersion: nextVersion,
       }));

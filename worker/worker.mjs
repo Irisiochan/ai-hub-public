@@ -5,6 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import {
   classifyDelivery,
+  collectStructuredReceipt,
   deliveryCompletesJob,
   DEFAULT_RECONCILE_GRACE_MS,
   extractDeliveryDeclaration,
@@ -16,6 +17,9 @@ import {
 import { acquireInstanceLock } from './instance-lock.mjs';
 import { buildRunnerSpec, supportsResume } from './runner.mjs';
 import { loadState, saveWorkerSpool } from './state-store.mjs';
+import { cameraCapabilities, captureFrame, handleSnapRequest } from './camera.mjs';
+import { TaobaoMcpClient, handleTaobaoRequest, taobaoCapabilities, taobaoMcpUrl } from './taobao.mjs';
+import { parseHubTimestampMs } from './hub-time.mjs';
 
 // The stateful Windows launcher runs hidden, so persist worker stdout/stderr here.
 // Timestamps are deliberately rendered in Asia/Shanghai, independent of device timezone.
@@ -45,6 +49,8 @@ const statePath = path.resolve(path.dirname(configPath), cfg.stateFile ?? 'worke
 const base = String(cfg.serverUrl ?? '').replace(/\/$/, '');
 if (!base || !cfg.token) throw new Error('serverUrl/token required');
 const maxConcurrent = Math.min(Math.max(Number(cfg.maxConcurrent) || 1, 1), 8);
+// One lazy session to the Taobao desktop client; only ever used when allowTaobao is true.
+const taobaoClient = new TaobaoMcpClient(taobaoMcpUrl(cfg));
 const eventFlushIntervalMs = Math.max(
   Number(process.env.AI_HUB_WORKER_EVENT_FLUSH_MS) || 15_000,
   100
@@ -150,14 +156,6 @@ function allowedWorkspace(value) {
   return workspaceSettings(value) !== null;
 }
 
-function sqliteUtcMillis(value) {
-  if (typeof value !== 'string' || !value.trim()) return Number.NaN;
-  const normalized = /(?:z|[+-]\d\d:\d\d)$/i.test(value.trim())
-    ? value.trim()
-    : `${value.trim().replace(' ', 'T')}Z`;
-  return Date.parse(normalized);
-}
-
 function processAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -238,7 +236,7 @@ async function reconcileBlockedJobs() {
       const ancestorIncluded = current && delivery.head
         ? await isGitAncestor(job.workspace, delivery.head, current.head)
         : false;
-      const updatedAtMs = sqliteUtcMillis(job.updated_at);
+      const updatedAtMs = parseHubTimestampMs(job.updated_at) ?? Number.NaN;
       const blockedForMs = Number.isFinite(updatedAtMs)
         ? Math.max(Date.now() - updatedAtMs, 0)
         : 0;
@@ -433,12 +431,19 @@ async function execute(job, options = {}) {
   }
   if (stdout.trim()) parseLine(job, stdout, state);
   const repoAfter = await snapshotRepo(job.workspace);
+  const receipt = await collectStructuredReceipt(
+    job.workspace,
+    repoBefore,
+    repoAfter,
+    state.deliveryDeclared,
+  );
   const delivery = {
     ...classifyDelivery(repoBefore, repoAfter, exit.code, {
       deliveryMode: workspace.deliveryMode,
       declaration: state.deliveryDeclared,
     }),
     ...repoDeliveryEvidence(repoBefore, repoAfter),
+    receipt,
   };
   if (state.action === 'pause') return { status: 'paused', result: state.result, delivery };
   if (state.action === 'cancel') return { status: 'interrupted', result: state.result, delivery };
@@ -597,6 +602,8 @@ async function connect() {
         ssh: cfg.allowSsh === true,
         maxConcurrent,
         protocolVersion: 2,
+        ...cameraCapabilities(cfg),
+        ...taobaoCapabilities(cfg),
       },
       bootId,
     }),
@@ -647,6 +654,28 @@ async function main() {
         paused = true;
         console.log('worker paused from ai-hub; running jobs continue');
         continue;
+      }
+      if (response.snapRequest) {
+        void handleSnapRequest(
+          cfg,
+          response.snapRequest,
+          (requestId, payload) => request(`/api/worker/snap/${encodeURIComponent(requestId)}`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+          }),
+          captureFrame,
+        ).catch((error) => console.error(`camera snapshot upload failed: ${error.message}`));
+      }
+      if (response.taobaoRequest) {
+        void handleTaobaoRequest(
+          cfg,
+          response.taobaoRequest,
+          (requestId, payload) => request(`/api/worker/taobao/${encodeURIComponent(requestId)}`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+          }),
+          taobaoClient,
+        ).catch((error) => console.error(`taobao bridge upload failed: ${error.message}`));
       }
       const job = claimedJob(response);
       if (!job) {

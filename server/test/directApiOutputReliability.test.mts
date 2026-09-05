@@ -148,6 +148,46 @@ async function providerUsageLastWriteNotSumAcrossChunks(): Promise<void> {
   }
 }
 
+function outputBackend(
+  provider: 'openai-compat' | 'gemini',
+  baseUrl: string,
+  db: ReturnType<typeof openDb>,
+  dir: string,
+  contactId: string,
+): DirectApiBackend {
+  return new DirectApiBackend({
+    provider,
+    baseUrl,
+    apiKey: 'test',
+    model: 'test',
+    maxHistoryMessages: 10,
+    historyTokenBudget: 2048,
+    minRecentTurns: 1,
+    summaryMaxTokens: 256,
+    historySummaryStrategy: 'off',
+    maxTokens: 8192,
+    contextWindowTokens: 20_000,
+    turnTimeoutMs: 5000,
+    db,
+    uploadsDir: path.join(dir, 'uploads'),
+    contactId,
+    log: () => {},
+  });
+}
+
+async function collectTurn(
+  backend: DirectApiBackend,
+  text: string,
+  userMessageId: number,
+  extra: { emptyVisibleText?: string } = {},
+): Promise<TurnEvent[]> {
+  await backend.start(null);
+  const handle = backend.sendTurn({ text, userMessageId, ...extra });
+  const events: TurnEvent[] = [];
+  for await (const event of handle.events) events.push(event);
+  return events;
+}
+
 async function thinkingOnlyBecomesVisibleError(): Promise<void> {
   const server = http.createServer((_req, res) => writeSse(res, [
     { choices: [{ delta: { reasoning_content: 'long private plan' } }] },
@@ -166,33 +206,103 @@ async function thinkingOnlyBecomesVisibleError(): Promise<void> {
       `INSERT INTO messages (contact_id, sender, role, kind, content, status)
        VALUES ('thinking-only', 'user', 'user', 'text', 'answer me', 'done')`
     ).run();
-    const backend = new DirectApiBackend({
-      provider: 'openai-compat',
-      baseUrl,
-      apiKey: 'test',
-      model: 'test',
-      maxHistoryMessages: 10,
-      historyTokenBudget: 2048,
-      minRecentTurns: 1,
-      summaryMaxTokens: 256,
-      historySummaryStrategy: 'off',
-      maxTokens: 8192,
-      contextWindowTokens: 20_000,
-      turnTimeoutMs: 5000,
-      db,
-      uploadsDir: path.join(dir, 'uploads'),
-      contactId: 'thinking-only',
-      log: () => {},
-    });
-    await backend.start(null);
-    const handle = backend.sendTurn({ text: 'answer me', userMessageId: Number(user.lastInsertRowid) });
-    const events: TurnEvent[] = [];
-    for await (const event of handle.events) events.push(event);
+    const events = await collectTurn(
+      outputBackend('openai-compat', baseUrl, db, dir, 'thinking-only'),
+      'answer me',
+      Number(user.lastInsertRowid),
+    );
     assert.ok(events.some((event) => event.type === 'thinking'));
     assert.ok(!events.some((event) => event.type === 'done'));
     const error = events.find((event) => event.type === 'error');
     assert.ok(error && error.type === 'error');
     assert.match(error.message, /没有可显示的正文.*输出预算已耗尽/);
+  } finally {
+    await close(server);
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function geminiThoughtOnlyIsVisibleErrorUnlessHeartbeat(): Promise<void> {
+  const thoughtOnly = {
+    candidates: [{
+      content: { role: 'model', parts: [{ text: '先看看要不要说话', thought: true }] },
+      finishReason: 'STOP',
+    }],
+    usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 0, thoughtsTokenCount: 20 },
+  };
+  const server = http.createServer((_req, res) => writeSse(res, [thoughtOnly]));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-output-reliability-'));
+  const db = openDb(path.join(dir, 'hub.sqlite'));
+  try {
+    const address = await listen(server);
+    const baseUrl = `${address}/v1beta/models/{model}:streamGenerateContent?alt=sse`;
+    db.prepare(
+      `INSERT INTO contacts (id, name, backend, kind, config)
+       VALUES ('gemini-silent', 'gemini-silent', 'api', 'dm', '{}')`
+    ).run();
+    const user = db.prepare(
+      `INSERT INTO messages (contact_id, sender, role, kind, content, status)
+       VALUES ('gemini-silent', 'system', 'user', 'text', '[心跳] tick', 'done')`
+    ).run();
+    const userMessageId = Number(user.lastInsertRowid);
+    const chatEvents = await collectTurn(
+      outputBackend('gemini', baseUrl, db, dir, 'gemini-silent'),
+      '[心跳] tick',
+      userMessageId,
+    );
+    const chatError = chatEvents.find((event) => event.type === 'error');
+    assert.ok(chatError && chatError.type === 'error');
+    assert.match(chatError.message, /没有可显示的正文/);
+    assert.doesNotMatch(chatError.message, /输出预算已耗尽/);
+    assert.ok(!chatEvents.some((event) => event.type === 'done'));
+
+    const heartbeatEvents = await collectTurn(
+      outputBackend('gemini', baseUrl, db, dir, 'gemini-silent'),
+      '[心跳] tick',
+      userMessageId,
+      { emptyVisibleText: 'HEARTBEAT_OK' },
+    );
+    assert.ok(heartbeatEvents.some((event) => event.type === 'thinking'));
+    const done = heartbeatEvents.find((event) => event.type === 'done');
+    assert.ok(done && done.type === 'done');
+    assert.equal(done.finalText, 'HEARTBEAT_OK');
+    assert.ok(!heartbeatEvents.some((event) => event.type === 'error'));
+  } finally {
+    await close(server);
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function heartbeatEmptyStillErrorsWhenBudgetExhausted(): Promise<void> {
+  const server = http.createServer((_req, res) => writeSse(res, [
+    { choices: [{ delta: { reasoning_content: 'still thinking' } }] },
+    { choices: [{ delta: {}, finish_reason: 'length' }], usage: { prompt_tokens: 10, completion_tokens: 8192 } },
+    '[DONE]',
+  ]));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-output-reliability-'));
+  const db = openDb(path.join(dir, 'hub.sqlite'));
+  try {
+    const baseUrl = await listen(server);
+    db.prepare(
+      `INSERT INTO contacts (id, name, backend, kind, config)
+       VALUES ('heartbeat-length', 'heartbeat-length', 'api', 'dm', '{}')`
+    ).run();
+    const user = db.prepare(
+      `INSERT INTO messages (contact_id, sender, role, kind, content, status)
+       VALUES ('heartbeat-length', 'system', 'user', 'text', '[心跳] tick', 'done')`
+    ).run();
+    const events = await collectTurn(
+      outputBackend('openai-compat', baseUrl, db, dir, 'heartbeat-length'),
+      '[心跳] tick',
+      Number(user.lastInsertRowid),
+      { emptyVisibleText: 'HEARTBEAT_OK' },
+    );
+    const error = events.find((event) => event.type === 'error');
+    assert.ok(error && error.type === 'error');
+    assert.match(error.message, /没有可显示的正文.*输出预算已耗尽/);
+    assert.ok(!events.some((event) => event.type === 'done'));
   } finally {
     await close(server);
     db.close();
@@ -227,5 +337,7 @@ dsmlFilterHandlesProductionShape();
 await providerStripsDsmlAndKeepsFinishReason();
 await providerUsageLastWriteNotSumAcrossChunks();
 await thinkingOnlyBecomesVisibleError();
+await geminiThoughtOnlyIsVisibleErrorUnlessHeartbeat();
+await heartbeatEmptyStillErrorsWhenBudgetExhausted();
 migrationRaisesOnlyLegacyBudget();
 console.log('direct API output reliability checks passed');

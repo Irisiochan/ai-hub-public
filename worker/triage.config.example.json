@@ -108,6 +108,28 @@
     "jobsLimit": 300,
     "resurfaceDays": 7
   },
+  "routeTriage": {
+    "enabled": false,
+    "reviewer": "aye",
+    "allowedRecipients": ["claude", "codex", "aye"],
+    "atHour": 9,
+    "atMinute": 10,
+    "maxItems": 8,
+    "reactionRounds": 1,
+    "roundPollMs": 2000,
+    "roundTimeoutMs": 1200000,
+    "resolveIntervalMinutes": 30,
+    "resolveMaxAgeDays": 30,
+    "statsWeekday": 1,
+    "statsWindowDays": 28,
+    "autoDispatch": {
+      "enabled": false,
+      "delayMinutes": 60,
+      "maxAgeHours": 48,
+      "dailyLimit": 3,
+      "vetoSenders": ["user", "claude"]
+    }
+  },
   "diary": {
     "enabled": false,
     "atHour": 2,

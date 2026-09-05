@@ -114,6 +114,9 @@ test('fresh db and every historical fixture upgrade to the latest schema', () =>
       for (const column of ['return_commitment', 'fallback_reminded_at']) {
         assert.ok(columns(db, 'triage_followups').includes(column), `${fixture.name}: followups.${column}`);
       }
+      for (const column of ['dispatch_message_id', 'dispatch_round_id']) {
+        assert.ok(columns(db, 'route_suggestions').includes(column), `${fixture.name}: route_suggestions.${column}`);
+      }
       assert.ok(indexes(db, 'triage_deliveries').includes('idx_triage_deliveries_pool'), fixture.name);
       // 幂等：重复迁移是 no-op
       const again = migrateTriageDb(db);

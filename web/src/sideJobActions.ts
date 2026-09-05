@@ -1,3 +1,4 @@
+import type { ContactKind } from '@ai-hub/contact-config';
 import type { Message, WorkerJob } from './api';
 
 export interface PendingReceiptCard {
@@ -28,7 +29,9 @@ export function visibleJobsForContact(
   messages: readonly Pick<Message, 'meta' | 'origin' | 'kind'>[],
   jobs: readonly WorkerJob[],
   activeStatuses: ReadonlySet<string>,
+  contactKind: ContactKind,
 ): WorkerJob[] {
+  if (contactKind !== 'room') return [];
   const receiptJobIds = new Set<string>();
   for (const message of messages) {
     const jobId = workerReceiptJobId(message);

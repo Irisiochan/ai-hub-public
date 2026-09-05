@@ -38,6 +38,18 @@ export interface Contact {
   readStates?: MessageReadStates;
 }
 
+export interface HeartbeatStatus {
+  contactId: string;
+  active: boolean;
+  mode?: 'timed' | 'unlimited';
+  startedAt?: string;
+  expiresAt?: string;
+  intervalMinutes?: number;
+  tickCount?: number;
+  pausedReason?: string;
+  stats?: { dispatched: number; silent: number; visible: number; failed: number; skipped: number; inputTokens: number; outputTokens: number; toolCount: number };
+}
+
 export interface Message {
   id: number;
   contact_id: string;
@@ -60,6 +72,73 @@ export interface Attachment {
   mimeType: string;
   size: number;
   url: string;
+}
+
+export type LedgerSource = 'alipay' | 'wechat' | 'cmb-cc';
+export type LedgerKind = 'expense' | 'income' | 'transfer' | 'ignored';
+
+export interface LedgerImportStats {
+  id: number;
+  source: LedgerSource;
+  originalName: string;
+  fileSha256: string;
+  periodStart: string | null;
+  periodEnd: string | null;
+  rowCount: number;
+  insertedCount: number;
+  duplicateCount: number;
+  transferCount: number;
+  ignoredCount: number;
+  createdAt: string;
+  reused?: boolean;
+}
+
+export interface LedgerTransaction {
+  id: number;
+  importId: number;
+  occurredAt: string;
+  amountCents: number;
+  kind: LedgerKind;
+  category: string;
+  payee: string;
+  description: string;
+  source: LedgerSource;
+  method: string;
+  statusText: string;
+  sourceTxnId: string;
+  fingerprint: string;
+  duplicateOf: number | null;
+}
+
+export interface LedgerMonthStats {
+  yearMonth: string;
+  incomeCents: number;
+  expenseCents: number;
+  transferCents: number;
+  netCents: number;
+  txnCount: number;
+  duplicateCount: number;
+  transferCount: number;
+  byCategory: Array<{ category: string; expenseCents: number; incomeCents: number }>;
+  bySource: Array<{ source: LedgerSource; expenseCents: number; incomeCents: number }>;
+  largeExpenses: Array<{
+    id: number;
+    occurredAt: string;
+    amountCents: number;
+    category: string;
+    payee: string;
+    description: string;
+    source: LedgerSource;
+  }>;
+}
+
+export interface LedgerMonthSummary {
+  yearMonth: string;
+  stats: LedgerMonthStats;
+  previous?: LedgerMonthStats | null;
+  advice: string | null;
+  generatedAt: string | null;
+  model: string | null;
 }
 
 export class ApiRequestError extends Error {
@@ -220,7 +299,7 @@ export interface WorkerJob {
     };
   } | null;
   delivery_summary?: {
-    state: 'in_progress' | 'completed_not_delivered' | 'delivered_waiting_deploy'
+    state: 'in_progress' | 'completed_not_delivered' | 'waiting_review' | 'delivered_waiting_deploy'
       | 'online_waiting_validation' | 'closed_loop' | 'user_decision' | 'rework_required'
       | 'failure_or_blocked';
     label: string;
@@ -337,6 +416,18 @@ export const api = {
   },
 
   contacts: () => req<{ contacts: Contact[] }>('/api/contacts'),
+
+  heartbeat: (id: string) => req<HeartbeatStatus>(`/api/contacts/${id}/heartbeat`),
+
+  startHeartbeat: (id: string, options: { minutes: number } | { unlimited: true }) =>
+    req<HeartbeatStatus>(`/api/contacts/${id}/heartbeat`, {
+      method: 'POST',
+      body: JSON.stringify(options),
+    }),
+
+  stopHeartbeat: (id: string) => req<HeartbeatStatus>(`/api/contacts/${id}/heartbeat`, {
+    method: 'DELETE',
+  }),
 
   createContact: (data: ContactPayload) =>
     req<Contact>('/api/contacts', { method: 'POST', body: JSON.stringify(data) }),
@@ -506,6 +597,31 @@ export const api = {
       method: 'DELETE',
       body: JSON.stringify({ force: opts.force === true }),
     }),
+
+  ledgerMonths: () => req<{ months: string[] }>('/api/ledger/months'),
+
+  ledgerMonth: (yearMonth: string) => req<LedgerMonthSummary>(`/api/ledger/months/${yearMonth}`),
+
+  ledgerSummarize: (yearMonth: string, force = false) =>
+    req<LedgerMonthSummary>(`/api/ledger/months/${yearMonth}/summarize`, {
+      method: 'POST',
+      body: JSON.stringify({ force }),
+    }),
+
+  ledgerTransactions: (opts: { month?: string; source?: LedgerSource; kind?: LedgerKind } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.month) q.set('month', opts.month);
+    if (opts.source) q.set('source', opts.source);
+    if (opts.kind) q.set('kind', opts.kind);
+    return req<{ transactions: LedgerTransaction[] }>(`/api/ledger/transactions?${q}`);
+  },
+
+  ledgerImport: async (file: File, source: LedgerSource | 'auto') => {
+    const body = new FormData();
+    body.append('file', file);
+    body.append('source', source);
+    return req<LedgerImportStats>('/api/ledger/import', { method: 'POST', body });
+  },
 };
 
 export interface SseHandlers {
@@ -519,6 +635,8 @@ export interface SseHandlers {
   onJob?(j: WorkerJob): void;
   onJobMessage?(m: JobMessage): void;
   onWorker?(w: Worker): void;
+  onWorkflowProfile?(): void;
+  onHeartbeat?(status: HeartbeatStatus): void;
   onReconnect(): void;
 }
 
@@ -567,6 +685,8 @@ export function connectEvents(
     es.addEventListener('job', (e) => handlers.onJob?.(JSON.parse(e.data)));
     es.addEventListener('job-message', (e) => handlers.onJobMessage?.(JSON.parse(e.data)));
     es.addEventListener('worker', (e) => handlers.onWorker?.(JSON.parse(e.data)));
+    es.addEventListener('workflow-profile', () => handlers.onWorkflowProfile?.());
+    es.addEventListener('heartbeat', (e) => handlers.onHeartbeat?.(JSON.parse(e.data)));
   };
 
   open();

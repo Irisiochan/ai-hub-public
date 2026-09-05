@@ -55,7 +55,12 @@ export class MessageRepo {
         `SELECT id, sender, content, meta, created_at FROM messages
          WHERE contact_id = ? AND id > ? AND deleted = 0 AND kind = 'text' AND status = 'done'
            AND sender != ?
-         ORDER BY id ASC LIMIT ?`
+         ORDER BY id DESC LIMIT ?`
+      ),
+      roomDeliveryTextById: db.prepare(
+        `SELECT id, sender, content, meta, created_at FROM messages
+         WHERE contact_id = ? AND id = ? AND deleted = 0 AND kind = 'text' AND status = 'done'
+           AND sender != ?`
       ),
       historyAfter: db.prepare(
         `SELECT * FROM messages
@@ -107,7 +112,19 @@ export class MessageRepo {
   }
 
   unreadRoomText(contactId: string, afterId: number, excludedSender: string, limit: number): RoomDeliveryRow[] {
-    return this.statements.unreadRoomText.all(contactId, afterId, excludedSender, limit) as RoomDeliveryRow[];
+    const newestFirst = this.statements.unreadRoomText.all(
+      contactId,
+      afterId,
+      excludedSender,
+      limit
+    ) as RoomDeliveryRow[];
+    return newestFirst.reverse();
+  }
+
+  roomDeliveryTextById(contactId: string, messageId: number, excludedSender: string): RoomDeliveryRow | undefined {
+    return this.statements.roomDeliveryTextById.get(contactId, messageId, excludedSender) as
+      | RoomDeliveryRow
+      | undefined;
   }
 
   historyAfter(contactId: string, afterId: number): MessageRow[] {

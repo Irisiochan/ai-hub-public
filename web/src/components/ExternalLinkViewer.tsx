@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { ExternalLinkView } from '../externalLinks';
+import { Icon } from './icons';
 
 interface Props {
   view: ExternalLinkView;
@@ -17,7 +18,8 @@ export default function ExternalLinkViewer({ view, onClose }: Props) {
     <div className="external-viewer" role="dialog" aria-modal="true" aria-label="外部链接">
       <header className="external-viewer-bar">
         <button className="external-close" onClick={onClose} autoFocus>
-          ← 回到聊天
+          <Icon name="arrow-left" />
+          <span>回到聊天</span>
         </button>
         <div className="external-url" title={view.url}>
           {view.url}

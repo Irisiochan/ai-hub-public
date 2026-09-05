@@ -15,10 +15,14 @@ export interface HubConfig {
   claude: {
     cliPath: string;
     turnTimeoutMs: number;
+    turnIdleTimeoutMs?: number;
+    turnHardTimeoutMs?: number;
   };
   codex: {
     cliPath: string;
     turnTimeoutMs: number;
+    turnIdleTimeoutMs?: number;
+    turnHardTimeoutMs?: number;
     nativeCompact?: {
       enabled?: boolean;
       inputTokens?: number;
@@ -27,10 +31,22 @@ export interface HubConfig {
   grok: {
     cliPath: string;
     turnTimeoutMs: number;
+    turnIdleTimeoutMs?: number;
+    turnHardTimeoutMs?: number;
+  };
+  opencode: {
+    cliPath: string;
+    turnTimeoutMs: number;
+    turnIdleTimeoutMs?: number;
+    turnHardTimeoutMs?: number;
   };
   memory: MemoryConfig;
   backup: BackupConfig;
   purge: PurgeConfig;
+  reviewBatch?: {
+    size: number;
+    intervalMinutes: number;
+  };
 }
 
 export interface MemoryConfig {
@@ -63,10 +79,14 @@ const defaults: HubConfig = {
   claude: {
     cliPath: 'claude',
     turnTimeoutMs: 300_000,
+    turnIdleTimeoutMs: 120_000,
+    turnHardTimeoutMs: 900_000,
   },
   codex: {
     cliPath: 'codex',
     turnTimeoutMs: 300_000,
+    turnIdleTimeoutMs: 120_000,
+    turnHardTimeoutMs: 900_000,
     nativeCompact: {
       enabled: true,
       inputTokens: DEFAULT_CODEX_NATIVE_COMPACT_INPUT_TOKENS,
@@ -75,6 +95,14 @@ const defaults: HubConfig = {
   grok: {
     cliPath: 'grok',
     turnTimeoutMs: 300_000,
+    turnIdleTimeoutMs: 120_000,
+    turnHardTimeoutMs: 900_000,
+  },
+  opencode: {
+    cliPath: 'opencode',
+    turnTimeoutMs: 300_000,
+    turnIdleTimeoutMs: 300_000,
+    turnHardTimeoutMs: 900_000,
   },
   memory: {
     mcpUrl: null,
@@ -99,6 +127,10 @@ const defaults: HubConfig = {
     intervalHours: 24,
     batchSize: 500,
   },
+  reviewBatch: {
+    size: 3,
+    intervalMinutes: 30,
+  },
 };
 
 export function loadConfig(): HubConfig {
@@ -122,9 +154,11 @@ export function loadConfig(): HubConfig {
       },
     },
     grok: { ...defaults.grok, ...(user.grok ?? {}) },
+    opencode: { ...defaults.opencode, ...(user.opencode ?? {}) },
     memory: { ...defaults.memory, ...(user.memory ?? {}) },
     backup: { ...defaults.backup, ...(user.backup ?? {}) },
     purge: { ...defaults.purge, ...(user.purge ?? {}) },
+    reviewBatch: { ...defaults.reviewBatch!, ...(user.reviewBatch ?? {}) },
   };
   // env overrides (desktop shell); absent vars leave web/VPS behavior untouched
   if (process.env.HUB_PORT) cfg.port = Number(process.env.HUB_PORT);
@@ -137,6 +171,13 @@ export function loadConfig(): HubConfig {
     inputTokens: Number.isFinite(nativeCompactInputTokens) && nativeCompactInputTokens > 0
       ? Math.floor(nativeCompactInputTokens)
       : DEFAULT_CODEX_NATIVE_COMPACT_INPUT_TOKENS,
+  };
+  cfg.reviewBatch = {
+    size: Math.min(Math.max(Math.floor(Number(cfg.reviewBatch?.size) || 3), 1), 100),
+    intervalMinutes: Math.min(
+      Math.max(Math.floor(Number(cfg.reviewBatch?.intervalMinutes) || 30), 1),
+      24 * 60,
+    ),
   };
   const dataDir = process.env.HUB_DATA_DIR;
   if (dataDir) {

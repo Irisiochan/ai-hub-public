@@ -15,6 +15,8 @@ import type { HubLogger } from '../logger.js';
 import { parsePositiveIntegerQuery } from '../queryParams.js';
 import type { WorkflowQuality } from '../workers/workflowProfiles.js';
 import { problemFingerprint, type WorkflowStage } from '../workers/workflowProfiles.js';
+import type { CameraSnapBroker } from '../workers/cameraSnap.js';
+import type { TaobaoBridge } from '../workers/taobaoBridge.js';
 
 // jobs.deleted = 1 is presentation soft-delete; claim/list hide those rows.
 
@@ -25,6 +27,8 @@ type Capabilities = {
   ssh?: boolean;
   maxConcurrent?: number;
   protocolVersion?: number;
+  camera?: boolean;
+  taobao?: boolean;
 };
 
 const BLOCKED_RECONCILE_GRACE_MS = 10 * 60_000;
@@ -39,8 +43,8 @@ const DELIVERY_CONTRACT = [
   'If SSH permission is absent but remote deployment is required, file one deploy-tail with the exact host, checkout, service, and verification steps.',
   'If your host safety policy asks for an exact push or deploy target, list the full repo URL, branch, deploy host, and service in one request and continue after confirmation. If the job must end while confirmation is pending, file one deploy-tail marked awaiting_exact_target_approval; do not misreport it as a code or validation failure.',
   'If validation, commit, push, or deploy is blocked, leave a precise handoff: changed files, checks passed/failed, blocker, and next step.',
-  'For a write task, finish with a machine-readable JSON object: {"delivery":{"committed":true|false,"pushed":true|false,"stage":"delivered_waiting_deploy|online_waiting_validation|closed_loop|user_decision","summary":"one human sentence","nextOwner":"unique owner"}}. It may be a standalone line or a fenced/multiline JSON block.',
-  'Use stage closed_loop only when every required validation including production post-deploy evidence is complete; otherwise choose the exact earlier stage. Use user_decision only for a real authorization or product choice and include blocker when useful.',
+  'For a write task, finish with a machine-readable JSON object: {"delivery":{"committed":true|false,"pushed":true|false,"stage":"waiting_review|delivered_waiting_deploy|online_waiting_validation|closed_loop|user_decision","summary":"one human sentence","nextOwner":"unique owner","diffstat":"git diff --shortstat style summary","changedFiles":["path/or an object with files,total,truncated"],"tests":[{"suite":"exact command or suite","status":"pass|fail"}]}}. It may be a standalone line or a fenced/multiline JSON block.',
+  'Use waiting_review only when implementation validation passed and the work is intentionally stopped for independent review. Use stage closed_loop only when every required validation including production post-deploy evidence is complete; otherwise choose the exact earlier stage. Use user_decision only for a real authorization or product choice and include blocker when useful.',
   'Use false/false only when requested changes remain uncommitted; omit this line for read-only tasks.',
 ].join(' ');
 
@@ -94,7 +98,14 @@ function workerFrom(req: Request, db: Db): WorkerRow | null {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected) ? worker : null;
 }
 
-export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubLogger): Router {
+export function workersRouter(
+  db: Db,
+  sse: SseHub,
+  jobs: JobStore,
+  logger?: HubLogger,
+  broker?: CameraSnapBroker,
+  taobao?: TaobaoBridge,
+): Router {
   const r = Router();
   const logAcceptance = (workerId: string, from: number, to: number, actor: string, reason: string): void => {
     if (from === to) return;
@@ -107,14 +118,19 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
     `SELECT * FROM jobs
      WHERE worker_id = ? AND status IN ('claimed','running','recovering','pause_requested','cancel_requested')`
   ).all(workerId) as JobRow[];
-  const updateWorkerRuntimeStatus = (workerId: string, touch = true): void => {
+  const updateWorkerRuntimeStatus = (workerId: string, touch = true, notify = true): void => {
     const worker = db.prepare('SELECT * FROM workers WHERE id = ?').get(workerId) as WorkerRow;
+    const previousStatus = publicWorker(worker).status;
     const status = activeRows(workerId).length > 0
       ? 'busy'
       : worker.accepting_jobs === 1 ? 'online' : 'paused';
     db.prepare(
       `UPDATE workers SET status = ?${touch ? ", last_seen_at = datetime('now')" : ''} WHERE id = ?`
     ).run(status, workerId);
+    if (notify && previousStatus !== status) {
+      const updated = db.prepare('SELECT * FROM workers WHERE id = ?').get(workerId) as WorkerRow;
+      sse.broadcast('worker', publicWorker(updated));
+    }
   };
 
   r.get('/workers', (_req, res) => {
@@ -174,6 +190,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
     ).run(id, name, hash(token));
     if (prior) logAcceptance(id, prior.accepting_jobs, 1, 'User', 're-pair reset');
     const worker = db.prepare('SELECT * FROM workers WHERE id = ?').get(id) as WorkerRow;
+    sse.broadcast('worker', publicWorker(worker));
     res.status(201).json({ worker: publicWorker(worker), token });
   });
 
@@ -203,7 +220,7 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
     db.prepare('UPDATE workers SET accepting_jobs = ? WHERE id = ?')
       .run(enabled ? 1 : 0, worker.id);
     logAcceptance(worker.id, worker.accepting_jobs, enabled ? 1 : 0, 'User', 'panel control');
-    updateWorkerRuntimeStatus(worker.id, false);
+    updateWorkerRuntimeStatus(worker.id, false, false);
     const updated = db.prepare('SELECT * FROM workers WHERE id = ?').get(worker.id) as WorkerRow;
     const payload = publicWorker(updated);
     sse.broadcast('worker', payload);
@@ -396,11 +413,62 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
       `UPDATE workers SET capabilities = ?,
        boot_id = CASE WHEN ? <> '' THEN ? ELSE boot_id END, last_seen_at = datetime('now') WHERE id = ?`
     ).run(JSON.stringify(caps), bootId, bootId, worker.id);
-    updateWorkerRuntimeStatus(worker.id);
+    updateWorkerRuntimeStatus(worker.id, true, false);
     const updated = db.prepare('SELECT * FROM workers WHERE id = ?').get(worker.id) as WorkerRow;
     jobs.signalUnservablePendingJobs();
     sse.broadcast('worker', publicWorker(updated));
     res.json({ worker: publicWorker(updated), leaseSeconds: LEASE_SECONDS });
+  });
+
+  r.post('/worker/snap/:requestId', (req, res) => {
+    const worker = workerFrom(req, db);
+    if (!worker) return res.status(401).json({ error: 'invalid worker token' });
+    if (!broker) return res.status(503).json({ error: 'camera broker unavailable' });
+    if (typeof req.body?.error === 'string') {
+      const accepted = broker.fail(req.params.requestId, req.body.error);
+      return accepted
+        ? res.json({ ok: true })
+        : res.status(410).json({ error: 'snapshot request expired or unknown' });
+    }
+    const encoded = req.body?.imageBase64;
+    if (typeof encoded !== 'string' || encoded.length === 0
+      || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+      broker.fail(req.params.requestId, 'worker returned invalid base64 image data');
+      return res.status(400).json({ error: 'valid imageBase64 required' });
+    }
+    const bytes = Buffer.from(encoded, 'base64');
+    if (bytes.length > Math.floor(1.4 * 1024 * 1024)) {
+      broker.fail(req.params.requestId, 'worker returned a frame larger than 1.4MB');
+      return res.status(413).json({ error: 'JPEG exceeds 1.4MB limit' });
+    }
+    if (bytes.length < 2 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+      broker.fail(req.params.requestId, 'worker returned a non-JPEG frame');
+      return res.status(400).json({ error: 'JPEG image required' });
+    }
+    return broker.fulfill(req.params.requestId, bytes)
+      ? res.json({ ok: true })
+      : res.status(410).json({ error: 'snapshot request expired or unknown' });
+  });
+
+  // Worker posts the Taobao client's tools/call result (or a bounded error) back
+  // for the request id it claimed through /worker/claim.
+  r.post('/worker/taobao/:requestId', (req, res) => {
+    const worker = workerFrom(req, db);
+    if (!worker) return res.status(401).json({ error: 'invalid worker token' });
+    if (!taobao) return res.status(503).json({ error: 'taobao bridge unavailable' });
+    if (typeof req.body?.error === 'string') {
+      return taobao.fail(req.params.requestId, req.body.error)
+        ? res.json({ ok: true })
+        : res.status(410).json({ error: 'taobao request expired or unknown' });
+    }
+    const result = req.body?.result;
+    if (!result || typeof result !== 'object' || !Array.isArray(result.content)) {
+      taobao.fail(req.params.requestId, 'worker returned a malformed taobao result');
+      return res.status(400).json({ error: 'result.content array required' });
+    }
+    return taobao.fulfill(req.params.requestId, result)
+      ? res.json({ ok: true })
+      : res.status(410).json({ error: 'taobao request expired or unknown' });
   });
 
   const tryClaim = (worker: WorkerRow): JobRow | null => {
@@ -459,6 +527,15 @@ export function workersRouter(db: Db, sse: SseHub, jobs: JobStore, logger?: HubL
           protocolVersion: WORKER_PROTOCOL_VERSION,
           deliveryContract: DELIVERY_CONTRACT,
         });
+      }
+      const caps = json<Capabilities>(current.capabilities, {});
+      const snapRequest = broker?.takePending(caps);
+      if (snapRequest) {
+        return res.json({ job: null, acceptingJobs: true, snapRequest });
+      }
+      const taobaoRequest = taobao?.takePending(caps);
+      if (taobaoRequest) {
+        return res.json({ job: null, acceptingJobs: true, taobaoRequest });
       }
       if (Date.now() >= deadline) return res.json({ job: null, acceptingJobs: true });
       await new Promise((resolve) => setTimeout(resolve, 500));

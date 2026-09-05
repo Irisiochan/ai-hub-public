@@ -548,7 +548,7 @@ Generated component versions: **706**.
 | [negotiator](https://www.npmjs.com/package/negotiator/v/1.0.0) | 1.0.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [node-abi](https://www.npmjs.com/package/node-abi/v/3.94.0) | 3.94.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [node-abi](https://www.npmjs.com/package/node-abi/v/4.33.0) | 4.33.0 | MIT | Desktop | build/dev |
-| [node-api-version](https://www.npmjs.com/package/node-api-version/v/0.2.1) | 0.2.1 | MIT | Desktop | build/dev |
+| [node-api-version](https://www.npmjs.com/package/node-api-version/v/0.3.0) | 0.3.0 | MIT | Desktop | build/dev |
 | [node-gyp](https://www.npmjs.com/package/node-gyp/v/12.4.0) | 12.4.0 | MIT | Desktop | build/dev |
 | [node-int64](https://www.npmjs.com/package/node-int64/v/0.4.0) | 0.4.0 | MIT | Desktop | build/dev |
 | [node-releases](https://www.npmjs.com/package/node-releases/v/2.0.53) | 2.0.53 | MIT | Web UI | build/dev |

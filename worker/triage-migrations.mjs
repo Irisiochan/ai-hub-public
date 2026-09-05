@@ -12,7 +12,7 @@
  * - 重复启动幂等：user_version 已达标的迁移直接跳过。
  */
 
-export const TRIAGE_SCHEMA_VERSION = 8;
+export const TRIAGE_SCHEMA_VERSION = 11;
 
 function userVersion(db) {
   return Number(db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
@@ -176,6 +176,115 @@ export const TRIAGE_MIGRATIONS = [
           ON triage_deliveries(pool, delivered_at);
         CREATE INDEX IF NOT EXISTS idx_triage_deliveries_message
           ON triage_deliveries(message_id)
+      `);
+    },
+  },
+  {
+    // 路由初筛影子账本：每条建议一行，(item_path, suggest_date) 幂等，
+    // 归宿标签驱动改派率统计（followed/overridden）。
+    version: 9,
+    name: 'route-suggestions',
+    up(db) {
+      db.exec(`
+        CREATE TABLE route_suggestions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          item_path TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'task' CHECK(kind IN ('task', 'inbox')),
+          suggest_date TEXT NOT NULL,
+          stage TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          reason TEXT,
+          status TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending', 'followed', 'overridden', 'closed', 'expired')),
+          resolved_recipient TEXT,
+          resolved_via TEXT,
+          event_id TEXT,
+          message_id INTEGER,
+          created_at INTEGER NOT NULL,
+          resolved_at INTEGER,
+          UNIQUE(item_path, suggest_date)
+        );
+        CREATE INDEX idx_route_suggestions_status
+          ON route_suggestions(status, created_at);
+      `);
+    },
+  },
+  {
+    // 阶段二（自动派单）新增 dispatched/vetoed 两个终态。SQLite 的 CHECK
+    // 无法 ALTER，只能整表重建搬数据；表极小，单事务安全。
+    version: 10,
+    name: 'route-suggestions-auto-dispatch-statuses',
+    up(db) {
+      db.exec(`
+        ALTER TABLE route_suggestions RENAME TO route_suggestions_v9;
+        CREATE TABLE route_suggestions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          item_path TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'task' CHECK(kind IN ('task', 'inbox')),
+          suggest_date TEXT NOT NULL,
+          stage TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          reason TEXT,
+          status TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending', 'followed', 'overridden', 'closed', 'expired', 'dispatched', 'vetoed')),
+          resolved_recipient TEXT,
+          resolved_via TEXT,
+          event_id TEXT,
+          message_id INTEGER,
+          created_at INTEGER NOT NULL,
+          resolved_at INTEGER,
+          UNIQUE(item_path, suggest_date)
+        );
+        INSERT INTO route_suggestions
+          (id, item_path, kind, suggest_date, stage, recipient, reason, status,
+           resolved_recipient, resolved_via, event_id, message_id, created_at, resolved_at)
+        SELECT id, item_path, kind, suggest_date, stage, recipient, reason, status,
+               resolved_recipient, resolved_via, event_id, message_id, created_at, resolved_at
+        FROM route_suggestions_v9;
+        DROP TABLE route_suggestions_v9;
+        CREATE INDEX IF NOT EXISTS idx_route_suggestions_status
+          ON route_suggestions(status, created_at);
+      `);
+    },
+  },
+  {
+    // 裸 PASS 的 route-auto 派单不是完成：新增 passed 状态，并持久化实际
+    // host round，供运行时对账与存量 claim 清理。旧行的 round 字段为空，
+    // worker 会按稳定 idempotencyKey 从房间消息反查。
+    version: 11,
+    name: 'route-auto-pass-reconciliation',
+    up(db) {
+      db.exec(`
+        ALTER TABLE route_suggestions RENAME TO route_suggestions_v10;
+        CREATE TABLE route_suggestions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          item_path TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'task' CHECK(kind IN ('task', 'inbox')),
+          suggest_date TEXT NOT NULL,
+          stage TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          reason TEXT,
+          status TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending', 'followed', 'overridden', 'closed', 'expired', 'dispatched', 'vetoed', 'passed')),
+          resolved_recipient TEXT,
+          resolved_via TEXT,
+          event_id TEXT,
+          message_id INTEGER,
+          dispatch_message_id INTEGER,
+          dispatch_round_id TEXT,
+          created_at INTEGER NOT NULL,
+          resolved_at INTEGER,
+          UNIQUE(item_path, suggest_date)
+        );
+        INSERT INTO route_suggestions
+          (id, item_path, kind, suggest_date, stage, recipient, reason, status,
+           resolved_recipient, resolved_via, event_id, message_id, created_at, resolved_at)
+        SELECT id, item_path, kind, suggest_date, stage, recipient, reason, status,
+               resolved_recipient, resolved_via, event_id, message_id, created_at, resolved_at
+        FROM route_suggestions_v10;
+        DROP TABLE route_suggestions_v10;
+        CREATE INDEX idx_route_suggestions_status
+          ON route_suggestions(status, created_at);
       `);
     },
   },

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Icon } from './icons';
 
 const MAX_IMAGES = 4;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -88,7 +89,7 @@ export function ImagePreviewStrip({ images, onRemove }: ImagePreviewStripProps) 
             aria-label={`移除 ${image.file.name}`}
             onClick={() => onRemove(index)}
           >
-            ×
+            <Icon name="close" />
           </button>
         </div>
       ))}
@@ -125,7 +126,7 @@ export function ImageAttachButton({ disabled, onAdd }: ImageAttachButtonProps) {
         disabled={disabled}
         onClick={() => imageInputRef.current?.click()}
       >
-        ＋
+        <Icon name="image" size={24} />
       </button>
     </>
   );

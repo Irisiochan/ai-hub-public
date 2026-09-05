@@ -1,0 +1,115 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}:root {
+  /* ThemeManifest semantic defaults. Runtime changes are limited to these
+     variables and an allow-listed wallpaper resource. */
+  color-scheme: dark;
+  --bg: #0d0e13;
+  --bg-canvas: #0d0e13;
+  --bg-panel: #0f1117;
+  --bg-rail: #101219;
+  --bg-elev: #111319;
+  --bg-card: #141620;
+  --bg-hover: #171a23;
+  --bg-raised: #1e2130;
+  --bg-code: #0a0b10;
+  --border: rgba(255, 255, 255, 0.06);
+  --border-strong: rgba(255, 255, 255, 0.1);
+  --text: #e8e8ee;
+  --text-body: #dfe0e8;
+  --text-dim: #8b8c99;
+  --text-muted: #63646f;
+  --accent: #9d8cf5;
+  --accent-soft: rgba(157, 140, 245, 0.14);
+  --accent-line: rgba(157, 140, 245, 0.4);
+  --accent-ink: #0d0a1a;
+  --accent-text: #c3b6fb;
+  --accent-glow: rgba(157, 140, 245, 0.25);
+  --ok: #6fd39a;
+  --ok-soft: rgba(111, 211, 154, 0.12);
+  --ok-line: rgba(111, 211, 154, 0.22);
+  --ok-text: #8fd6b0;
+  --error: #e56a6a;
+  --error-soft: rgba(229, 90, 90, 0.12);
+  --error-line: rgba(229, 90, 90, 0.32);
+  --bubble-mine: #4a3f78;
+  --bubble-theirs: #151821;
+  --bubble-mine-bg: var(--bubble-mine);
+  --bubble-theirs-bg: var(--bubble-theirs);
+  --bubble-mine-text: #f8f6ff;
+  --bubble-theirs-text: #dfe0e8;
+  --icon: #c9cad4;
+  --icon-muted: #8b8c99;
+  --icon-active: #c3b6fb;
+  --chat-wallpaper: url('/themes/violet-bloom.svg');
+  --chat-wallpaper-color: #0d0e13;
+  --chat-wallpaper-size: 480px;
+  /* Geometry remains stable across themes. */
+  --r-sm: 9px;
+  --r-md: 11px;
+  --r-lg: 13px;
+  --r-xl: 16px;
+  --r-pill: 999px;
+  --gap-turn: 24px;
+  --gap-block: 13px;
+  --pad-pane: 24px;
+  --measure: 940px;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* viewport-fit=cover 适配 */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+}html {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}body {
+  width: 100%;
+  height: 100%;
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+}#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}.app {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}.icon {
+  display: block;
+  flex: 0 0 auto;
+  pointer-events: none;
+}button:disabled .icon {
+  opacity: 0.7;
+}/* iOS WebKit 表单放大防护 */@media (hover: none) and (pointer: coarse) {
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}/* ── 自定义滚动条样式 ─────────────────────── */::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}::-webkit-scrollbar-track {
+  background: transparent;
+}::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+}::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
+}

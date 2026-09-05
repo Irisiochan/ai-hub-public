@@ -1,7 +1,7 @@
 /**
  * Token round2 mainline 4 gates (撤闸必红):
  * C1 nsfwCraft switch + intimate fail-open scene gate
- * C2 TEMPORAL_CONTEXT_RULES only when replay/history present
+ * Temporal rules: API unconditional; CLI only when replay/history present
  *
  * Reverting the round2 demotion / conditional temporal injection must turn this red.
  */
@@ -209,6 +209,17 @@ try {
   // C1 off: absent in start and turn
   const offStart = await composer.composeStart(ctxFor(off), 'resume-token');
   assert.doesNotMatch(offStart.preamble, new RegExp(NSFW_MARK), 'compose off has no nsfw in start');
+  const apiFreshStart = await composer.composeStart(ctxFor(off), null);
+  assert.match(
+    apiFreshStart.preamble,
+    new RegExp(TEMPORAL_MARK),
+    'fresh API session unconditionally carries temporal rules'
+  );
+  assert.match(
+    apiFreshStart.preamble,
+    /生成回复时引用“昨天、刚才、今晚、最近”等相对指示语，只能相对所引消息的绝对时间锚点使用，禁止把它顺延到当前轮时间。/,
+    'API temporal rules constrain relative wording in generated replies'
+  );
   const offTurn = await composer.composeTurn(ctxFor(off), '你好', '今晚抱紧我亲我', new Set());
   assert.doesNotMatch(offTurn, new RegExp(NSFW_MARK), 'compose off has no nsfw on intimate turn');
 
@@ -334,6 +345,8 @@ try {
       c1_soft_intimate_sparse_eng_injects: true,
       c1_fail_open: true,
       c2_fresh_omits_temporal: true,
+      c2_api_fresh_has_temporal: true,
+      c2_generation_relative_terms_anchored: true,
       c2_resume_has_temporal: true,
       c2_replay_has_temporal: true,
     },

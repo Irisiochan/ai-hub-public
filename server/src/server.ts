@@ -39,7 +39,21 @@ import { type JobStore } from './workers/jobStore.js';
 import { deriveDeliverySummary } from './workers/deliveryStatus.js';
 import { coordinationMarkerDispatchKey, formatCoordinationReceipt, parseCoordinationMarker } from './workers/coordinationReceipt.js';
 import { formatWorkerReceiptPreview } from './workers/receiptPreview.js';
+import { deliveryMeta, structuredReceiptFields } from './workers/receiptFields.js';
+import {
+  ensureAutomaticReviewJob,
+  isHarnessAutoReview,
+  isWaitingReviewGate,
+  ReviewBatchCoordinator,
+} from './workers/reviewAutomation.js';
+import { ensureAutomaticClosureJob } from './workers/closureAutomation.js';
 import type { WechatChannel } from './wechat/channel.js';
+import type { CompanionHeartbeat } from './agents/companionHeartbeat.js';
+import type { CameraSnapBroker } from './workers/cameraSnap.js';
+import type { TaobaoBridge } from './workers/taobaoBridge.js';
+import { heartbeatRouter } from './routes/heartbeat.js';
+import { ledgerRouter } from './routes/ledger.js';
+import { LedgerSummaryService } from './ledger/summary.js';
 
 export interface ServerDependencies {
   config: HubConfig;
@@ -48,6 +62,9 @@ export interface ServerDependencies {
   vault: VaultClient | null;
   jobStore: JobStore;
   manager: AgentManager;
+  heartbeat: CompanionHeartbeat;
+  broker: CameraSnapBroker;
+  taobao?: TaobaoBridge;
   dbBackup: DbBackup;
   softPurge: SoftDeletePurge;
   quotaPoller: ClaudeQuotaPoller;
@@ -57,23 +74,22 @@ export interface ServerDependencies {
   wechatChannel?: Pick<WechatChannel, 'status'>;
   hubToken?: string;
   corsOrigins?: string;
-}
-
-function parseDeliveryMeta(raw: string | null): { dirtyFiles?: string[]; head?: string | null; ahead?: number | null } {
-  try {
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
+  ledgerSummary?: LedgerSummaryService;
 }
 
 export function attachWorkerCompletion(deps: ServerDependencies): void {
   const { config, db, jobStore, logger, manager, sse, vault } = deps;
-  const tasksDir = config.memory.repoPath ? path.join(config.memory.repoPath, 'tasks') : null;
+  const tasksDir = config?.memory?.repoPath ? path.join(config.memory.repoPath, 'tasks') : null;
   const taskState = new TaskStateService(db);
+  const reviewBatch = new ReviewBatchCoordinator(
+    { db, sse, manager, logger },
+    config?.reviewBatch,
+  );
+  reviewBatch.start();
 
   const workerTailNote = (job: JobRow): string => {
-    const meta = parseDeliveryMeta(job.delivery_meta);
+    const meta = deliveryMeta(job);
+    const receipt = structuredReceiptFields(job);
     const files = Array.isArray(meta.dirtyFiles) && meta.dirtyFiles.length
       ? meta.dirtyFiles.map((file) => `- \`${file}\``).join('\n')
       : '- （工作区干净；存在尚未推送的 commit）';
@@ -81,7 +97,8 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
       `Worker job：\`${job.id}\``,
       `交付状态：\`${job.delivery_state}\``,
       `workspace：\`${job.workspace}\``,
-      meta.head ? `HEAD：\`${meta.head}\`${typeof meta.ahead === 'number' ? `（领先 upstream ${meta.ahead}）` : ''}` : '',
+      `branch：\`${receipt.branch ?? '未报告'}\``,
+      receipt.head ? `HEAD：\`${receipt.head}\`${typeof meta.ahead === 'number' ? `（领先 upstream ${meta.ahead}）` : ''}` : '',
       '', '### 本地状态', files, '', '### 原始需求', job.prompt.slice(0, 6000), '', '### Worker 回执',
       (job.result || job.error || '（无输出）').slice(0, 8000), '', '### 下一步',
       '从现有工作区续接，核对改动后完成剩余验证；验证通过再只提交本任务文件并 push。禁止从头派单覆盖本地改动。',
@@ -118,7 +135,8 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
     if (!tasksDir) return;
     const note = workerTailNote(job);
     const source = job.requested_by || 'codex';
-    const meta = parseDeliveryMeta(job.delivery_meta);
+    const meta = deliveryMeta(job);
+    const receipt = structuredReceiptFields(job);
     const result = db.transaction(() => {
       const current = taskState.refreshTask(tasksDir, taskPath);
       const transition = taskState.annotate({
@@ -133,7 +151,8 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
           ahead: meta.ahead ?? null,
           deliveryState: job.delivery_state,
           dirtyFiles: meta.dirtyFiles ?? [],
-          head: meta.head ?? null,
+          branch: receipt.branch,
+          head: receipt.head,
           jobId: job.id,
           nextAction: 'continue existing workspace and finish validation before push',
           workspace: job.workspace,
@@ -200,6 +219,7 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
 
   const syncWorkerTail = async (job: JobRow): Promise<void> => {
     if (!vault) return;
+    if (isWaitingReviewGate(job)) return;
     if (job.status === 'done' && ['delivered', 'delivered_out_of_band'].includes(job.delivery_state ?? '')) {
       closeLegacyWorkerTail(job);
       return;
@@ -213,12 +233,23 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
     await ensureLegacyWorkerTail(job);
   };
 
-  const dispatchCoordinationReceipt = (job: JobRow): 'sent' | 'unavailable' | 'not-coordination' => {
+  const dispatchRoomReceipt = (
+    job: JobRow,
+    input: Parameters<typeof dispatchCoordinationRoomHost>[1],
+    allowPool: boolean,
+  ) => allowPool && (isWaitingReviewGate(job) || isHarnessAutoReview(job))
+    ? reviewBatch.dispatchReceipt(job, input)
+    : dispatchCoordinationRoomHost({ db, sse, manager, logger }, input);
+
+  const dispatchCoordinationReceipt = (
+    job: JobRow,
+    allowPool: boolean,
+  ): 'sent' | 'unavailable' | 'not-coordination' => {
     const marker = parseCoordinationMarker(job.prompt);
     if (!marker) return 'not-coordination';
     const dispatchKey = coordinationMarkerDispatchKey(marker);
     const text = formatCoordinationReceipt(job, marker);
-    const outcome = dispatchCoordinationRoomHost({ db, sse, manager, logger }, {
+    const outcome = dispatchRoomReceipt(job, {
       content: text,
       kind: 'receipt',
       exactDispatchKey: dispatchKey,
@@ -237,7 +268,7 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
           originAnchorId: job.origin_anchor_id,
         },
       },
-    });
+    }, allowPool);
     if (outcome.status === 'unavailable') {
       logger.warn({ component: 'jobs', jobId: job.id, reason: outcome.reason }, 'coordination receipt room unavailable');
       return 'unavailable';
@@ -278,6 +309,69 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
   // 处理器把仍然失败的行转 dead（outboxCounts 可观测）。回执幂等键保证整个
   // 重试/重启链路上恰好一条用户可见回执。
   jobStore.onFinished = async (job, ctx) => {
+    if (!ctx.meta.reviewDone) {
+      try {
+        const review = ensureAutomaticReviewJob(jobStore, job);
+        if (review.status !== 'not-eligible') {
+          ctx.setMeta({
+            reviewDone: true,
+            ...(review.job ? { reviewJobId: review.job.id } : {}),
+          });
+        }
+        if (review.status === 'created') {
+          logger.info({
+            component: 'jobs',
+            parentJobId: job.id,
+            reviewJobId: review.job?.id,
+          }, 'automatic review job created');
+        }
+      } catch (error) {
+        logger.error({ component: 'jobs', jobId: job.id, err: error }, 'automatic review creation failed');
+        if (!ctx.finalAttempt) throw error;
+        ctx.setMeta({
+          reviewDone: true,
+          reviewCreationFailed: true,
+          reviewError: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+        });
+      }
+    }
+    if (!ctx.meta.closureDone) {
+      try {
+        const closure = ensureAutomaticClosureJob(jobStore, job);
+        if (closure.status !== 'not-eligible') {
+          ctx.setMeta({
+            closureDone: true,
+            closureStatus: closure.status,
+            ...(closure.kind ? { closureKind: closure.kind } : {}),
+            ...(closure.job ? { closureJobId: closure.job.id } : {}),
+            ...(closure.reason ? { closureReason: closure.reason.slice(0, 500) } : {}),
+          });
+        }
+        if (closure.status === 'created') {
+          logger.info({
+            component: 'jobs',
+            sourceJobId: job.id,
+            closureJobId: closure.job?.id,
+            closureKind: closure.kind,
+          }, 'automatic closure job created');
+        } else if (closure.status === 'rejected') {
+          logger.info({
+            component: 'jobs',
+            sourceJobId: job.id,
+            closureKind: closure.kind,
+            reason: closure.reason,
+          }, 'automatic closure gate rejected terminal job');
+        }
+      } catch (error) {
+        logger.error({ component: 'jobs', jobId: job.id, err: error }, 'automatic closure creation failed');
+        if (!ctx.finalAttempt) throw error;
+        ctx.setMeta({
+          closureDone: true,
+          closureStatus: 'failed',
+          closureError: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+        });
+      }
+    }
     if (!ctx.meta.tailDone) {
       try {
         await syncWorkerTail(job);
@@ -298,14 +392,15 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
       logger.info({ component: 'jobs', jobId: job.id, messageId: receiptUpdate.messageId }, 'worker receipt state updated');
       return;
     }
-    const coordinationOutcome = dispatchCoordinationReceipt(job);
+    const allowPool = ctx.meta.reviewCreationFailed !== true;
+    const coordinationOutcome = dispatchCoordinationReceipt(job, allowPool);
     if (coordinationOutcome === 'sent') return;
     if (coordinationOutcome === 'unavailable' && !ctx.finalAttempt) {
       throw new Error('coordination room unavailable for receipt; will retry');
     }
     if (!job.requested_by || job.requested_by === 'User') return;
     const roomText = `@${job.requested_by} ${formatWorkerReceiptPreview(job)}`;
-    const roomOutcome = dispatchCoordinationRoomHost({ db, sse, manager, logger }, {
+    const roomOutcome = dispatchRoomReceipt(job, {
       targetId: job.requested_by,
       content: roomText,
       kind: 'receipt',
@@ -318,7 +413,7 @@ export function attachWorkerCompletion(deps: ServerDependencies): void {
           deliveryState: job.delivery_state ?? 'unknown',
         },
       },
-    });
+    }, allowPool);
     if (roomOutcome.status !== 'unavailable') return;
     if (!ctx.finalAttempt) {
       throw new Error(`worker receipt room unavailable (${roomOutcome.reason ?? 'unknown'}); will retry`);
@@ -340,7 +435,7 @@ export function createServer(deps: ServerDependencies): Express {
   const app = express();
   app.use(localCors(deps.corsOrigins));
   app.use(express.json({ limit: '2mb' }));
-  app.use('/api', deployControlRouter());
+  app.use('/api', deployControlRouter(manager));
   const auth = sessionAuth(deps.hubToken);
   if (auth) app.use(auth);
 
@@ -378,15 +473,18 @@ export function createServer(deps: ServerDependencies): Express {
   app.use('/api/app', appReleaseRouter(config.releasesDir));
   app.use('/api/contacts', contactsRouter(db, sse, manager, config, deps.logger));
   app.use('/api/contacts', messagesRouter(db, sse, manager, config.uploadsDir, captions, jobStore));
+  app.use('/api/contacts', heartbeatRouter(db, deps.heartbeat));
   app.use('/api/attachments', attachmentsRouter(db, config.uploadsDir));
+  const ledgerSummary = deps.ledgerSummary ?? new LedgerSummaryService(db, logMessage(deps.logger, 'ledger'));
+  app.use('/api/ledger', ledgerRouter(db, ledgerSummary));
   app.use('/api/user', userRouter(db, sse));
   app.use('/api', journalRouter(db));
-  app.use('/api', workersRouter(db, sse, jobStore, deps.logger));
+  app.use('/api', workersRouter(db, sse, jobStore, deps.logger, deps.broker, deps.taobao));
   app.use('/api', hubMcpRouter(db, jobStore, {
     hubToken: deps.hubToken,
     envMode: process.env.HUB_MCP_AUTH_MODE,
     logger: deps.logger,
-  }));
+  }, { broker: deps.broker, heartbeat: deps.heartbeat, taobao: deps.taobao }));
   app.use('/api/vault', vaultTasksRouter({
     db,
     tasksDir: config.memory.repoPath ? path.join(config.memory.repoPath, 'tasks') : null,

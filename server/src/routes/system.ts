@@ -17,6 +17,57 @@ const LEGACY_DEPLOY_UNIT = 'ai-hub-deploy';
 const DEPLOY_UNIT = 'ai-hub-update';
 const HARDENING_UNIT = 'ai-hub-m15-hardening';
 
+export const DEPLOY_DRAIN_TIMEOUT_MS = 10 * 60_000;
+
+export interface DeployDrainManager {
+  beginRoomDispatchDrain(): boolean;
+  endRoomDispatchDrain(): number;
+  activeRoomRoundCount(): number;
+  roomDispatchDrainPendingCount(): number;
+}
+
+export async function waitForDeployDrain(
+  manager: Pick<DeployDrainManager, 'activeRoomRoundCount'>,
+  timeoutMs = DEPLOY_DRAIN_TIMEOUT_MS,
+  pollMs = 250,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (manager.activeRoomRoundCount() > 0) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(deadline - Date.now(), 1))));
+  }
+  return true;
+}
+
+export type DeployDrainPreparation =
+  | { ok: true }
+  | { ok: false; error: string; activeRounds?: number; deferredDispatches?: number };
+
+export async function prepareDeployDrain(
+  manager: DeployDrainManager,
+  timeoutMs = DEPLOY_DRAIN_TIMEOUT_MS,
+  pollMs = 250,
+): Promise<DeployDrainPreparation> {
+  if (!manager.beginRoomDispatchDrain()) return { ok: false, error: '部署 drain 已在进行中' };
+  const drained = await waitForDeployDrain(manager, timeoutMs, pollMs);
+  if (!drained) {
+    const activeRounds = manager.activeRoomRoundCount();
+    const deferredDispatches = manager.roomDispatchDrainPendingCount();
+    manager.endRoomDispatchDrain();
+    return {
+      ok: false,
+      error: '部署已取消：会议室在途轮次 10 分钟内未清空',
+      activeRounds,
+      deferredDispatches,
+    };
+  }
+  if (manager.activeRoomRoundCount() !== 0) {
+    manager.endRoomDispatchDrain();
+    return { ok: false, error: '部署已取消：restart 前复检仍有会议室在途轮次' };
+  }
+  return { ok: true };
+}
+
 function bearerMatches(header: string | undefined, token: string): boolean {
   const m = /^Bearer\s+(.+)$/.exec(header ?? '');
   if (!m) return false;
@@ -116,7 +167,7 @@ export function systemRouter(config: HubConfig): Router {
  * router before sessionAuth so enabling HUB_TOKEN cannot break the recovery
  * channel, while ordinary /api/system routes remain behind the Web session.
  */
-export function deployControlRouter(): Router {
+export function deployControlRouter(manager?: DeployDrainManager): Router {
   const router = Router();
   const deployToken = process.env.DEPLOY_TOKEN ?? '';
   const deployLog = process.env.DEPLOY_LOG ?? '/var/log/ai-hub-deploy.log';
@@ -125,6 +176,36 @@ export function deployControlRouter(): Router {
   const hardeningScript = process.env.HARDENING_SCRIPT
     ?? path.resolve(serverRoot, '..', 'deploy', 'migrate-m15.sh');
   const deployRequest = process.env.DEPLOY_REQUEST ?? '/var/lib/ai-hub/deploy.request';
+
+  const monitorDrainReleaseOnFailedDeploy = (unit: string): void => {
+    if (!manager) return;
+    let seenActivity = fs.existsSync(deployRequest);
+    let inactiveChecks = 0;
+    const monitorStartedAt = Date.now();
+    const timer = setInterval(async () => {
+      try {
+        let logRunning = false;
+        try { logRunning = deployLogRunning(fs.readFileSync(deployLog, 'utf8').slice(-65_536)); } catch {}
+        const active = await unitActive(unit);
+        const requestPending = fs.existsSync(deployRequest);
+        if (active || requestPending || logRunning) {
+          seenActivity = true;
+          inactiveChecks = 0;
+          return;
+        }
+        if (!seenActivity && Date.now() - monitorStartedAt < 10_000) return;
+        inactiveChecks++;
+        if (inactiveChecks < 3 && Date.now() - monitorStartedAt < DEPLOY_LOG_STALE_MS) return;
+        clearInterval(timer);
+        manager.endRoomDispatchDrain();
+      } catch {
+        // A broken monitor must not leave the gateway permanently drained.
+        clearInterval(timer);
+        manager.endRoomDispatchDrain();
+      }
+    }, 1_000);
+    timer.unref();
+  };
 
   function requireDeployAuth(req: Request, res: Response): boolean {
     if (!deployToken) {
@@ -149,13 +230,23 @@ export function deployControlRouter(): Router {
     if (await unitActive(DEPLOY_UNIT) || await unitActive(LEGACY_DEPLOY_UNIT) || fs.existsSync(deployRequest)) {
       return res.status(409).json({ error: '已有部署在进行中', log: deployLog });
     }
+    let drainStarted = false;
     try {
-      if (await pathActive(DEPLOY_UNIT)) {
-        fs.writeFileSync(deployRequest, `${new Date().toISOString()}\n`, { flag: 'wx', mode: 0o600 });
-        return res.status(202).json({ started: true, unit: DEPLOY_UNIT, log: deployLog });
-      }
-      if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+      const usePathUnit = await pathActive(DEPLOY_UNIT);
+      if (!usePathUnit && typeof process.getuid === 'function' && process.getuid() !== 0) {
         return res.status(503).json({ error: '非 root 网关的部署触发器尚未安装' });
+      }
+      if (manager) {
+        const prepared = await prepareDeployDrain(manager);
+        if (!prepared.ok) return res.status(409).json(prepared);
+        drainStarted = true;
+        // Restart 前复检放在网关编排层：drain 已阻止新派发，因此这次为 0 后
+        // 从构建到 restart 都不会再出现新会议室轮次。
+      }
+      if (usePathUnit) {
+        fs.writeFileSync(deployRequest, `${new Date().toISOString()}\n`, { flag: 'wx', mode: 0o600 });
+        monitorDrainReleaseOnFailedDeploy(DEPLOY_UNIT);
+        return res.status(202).json({ started: true, unit: DEPLOY_UNIT, log: deployLog });
       }
       await execFileAsync('systemd-run', [
         `--unit=${LEGACY_DEPLOY_UNIT}`,
@@ -165,8 +256,10 @@ export function deployControlRouter(): Router {
         '/bin/bash',
         deployScript,
       ], { encoding: 'utf8', timeout: 10_000 });
+      monitorDrainReleaseOnFailedDeploy(LEGACY_DEPLOY_UNIT);
       return res.status(202).json({ started: true, unit: LEGACY_DEPLOY_UNIT, log: deployLog });
     } catch (e) {
+      if (drainStarted) manager?.endRoomDispatchDrain();
       return res.status(500).json({ error: `部署启动失败：${e instanceof Error ? e.message : String(e)}` });
     }
   });

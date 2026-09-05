@@ -13,17 +13,33 @@ import {
   PROJECT_WRITE_GIT_GUARD,
   buildDelegateTools,
   type DelegationCfg,
+  type GatewayTool,
 } from './gatewayTools.js';
 import { GrokCliBackend } from './grokCli.js';
+import { OpencodeCliBackend } from './opencodeCli.js';
+import { resolveTurnTimeouts } from './turnTimeouts.js';
 import { hubMcpBearerToken } from '../middleware/hubMcpAuth.js';
 import type { PromptComposer, PromptContext, StartPrompt } from './promptComposer.js';
 import type { AgentBackend } from './types.js';
+import { HEARTBEAT_GUIDANCE, buildCameraTool } from './cameraTool.js';
+import type { CameraSnapBroker } from '../workers/cameraSnap.js';
+import type { TaobaoBridge } from '../workers/taobaoBridge.js';
+import type { CompanionHeartbeat } from './companionHeartbeat.js';
+import { buildTaobaoTools, taobaoGuidance, taobaoModeFor, taobaoToolNames, type TaobaoMode } from './taobaoTools.js';
 
 /** HUB_TOKEN 存在时为该联系人生成 hub-mcp 的 Authorization header。 */
 function hubMcpAuthHeaders(contactId: string): Record<string, string> | undefined {
   const hubToken = process.env.HUB_TOKEN;
   return hubToken
     ? { Authorization: `Bearer ${hubMcpBearerToken(hubToken, contactId)}` }
+    : undefined;
+}
+
+/** VAULT_TOKEN 存在时直接写入 memory-vault HTTP MCP 的 Authorization header。 */
+function memoryVaultMcpAuthHeaders(): Record<string, string> | undefined {
+  const vaultToken = process.env.VAULT_TOKEN;
+  return vaultToken
+    ? { Authorization: `Bearer ${vaultToken}` }
     : undefined;
 }
 
@@ -37,6 +53,9 @@ interface FactoryDeps {
   config: HubConfig;
   vault: VaultClient | null;
   jobStore: JobStore | null;
+  broker?: CameraSnapBroker;
+  heartbeat?: CompanionHeartbeat;
+  taobao?: TaobaoBridge;
   prompts: PromptComposer;
 }
 
@@ -46,6 +65,9 @@ interface BuildInput {
   prompt: StartPrompt;
   delegation: DelegationCfg;
   delegationOn: boolean;
+  heartbeatOn: boolean;
+  /** Taobao policy for this contact, or null when the tools are not offered. */
+  taobaoMode: TaobaoMode | null;
   deps: FactoryDeps;
   managedMcp: ManagedMcpConfig;
 }
@@ -72,7 +94,7 @@ function workspace(input: BuildInput, allowProjectAccess: boolean): { cwd: strin
 
 class ClaudeBuilder implements BackendBuilder {
   build(input: BuildInput): AgentBackend {
-    const { cfg, ctx, deps, delegation, delegationOn, managedMcp } = input;
+    const { cfg, ctx, deps, delegation, delegationOn, heartbeatOn, taobaoMode, managedMcp } = input;
     const { cwd, access } = workspace(input, true);
     const writeTools = access.enabled
       ? ['Read', 'Grep', 'Glob', 'Write', 'Edit', ...(access.allowShell ? ['Bash'] : [])]
@@ -91,13 +113,24 @@ class ClaudeBuilder implements BackendBuilder {
       cwd,
       cwdName: cfg.cwd,
       includeMemoryVault: memoryMcpOn,
-      includeHub: delegationOn,
+      includeHub: delegationOn || heartbeatOn,
     });
     if (delegationOn) {
       allowedTools.push('mcp__hub__*');
       preamble = deps.prompts.withDelegation(preamble, delegation, 'mcp__hub__', ctx.log);
       ctx.log('worker delegation enabled (mcp hub tools)');
     }
+    if (heartbeatOn) {
+      allowedTools.push('mcp__hub__camera_snap');
+      preamble = [preamble, HEARTBEAT_GUIDANCE].filter(Boolean).join('\n');
+      ctx.log('companion heartbeat enabled (claude hub MCP camera_snap)');
+    }
+    if (taobaoMode) {
+      allowedTools.push(...taobaoToolNames(taobaoMode).map((name) => `mcp__hub__${name}`));
+      preamble = [preamble, taobaoGuidance(taobaoMode)].filter(Boolean).join('\n');
+      ctx.log(`heartbeat taobao bridge enabled (claude hub MCP taobao_* mode=${taobaoMode})`);
+    }
+    const timeouts = resolveTurnTimeouts(deps.config.claude, cfg);
     return new ClaudeCliBackend({
       cliPath: cfg.cliPath ?? deps.config.claude.cliPath,
       cwd,
@@ -108,7 +141,8 @@ class ClaudeBuilder implements BackendBuilder {
       appendSystemPrompt: [cfg.appendSystemPrompt, preamble].filter(Boolean).join('\n') || undefined,
       permissionMode: cfg.permissionMode ?? undefined,
       mcpConfig,
-      turnTimeoutMs: deps.config.claude.turnTimeoutMs,
+      turnIdleTimeoutMs: timeouts.idleTimeoutMs,
+      turnHardTimeoutMs: timeouts.hardTimeoutMs,
       log: ctx.log,
     });
   }
@@ -116,7 +150,7 @@ class ClaudeBuilder implements BackendBuilder {
 
 class CodexBuilder implements BackendBuilder {
   build(input: BuildInput): AgentBackend {
-    const { cfg, ctx, deps, delegation, delegationOn } = input;
+    const { cfg, ctx, deps, delegation, delegationOn, heartbeatOn, taobaoMode } = input;
     const { cwd, access } = workspace(input, true);
     let preamble = input.prompt.preamble;
     if (access.enabled) {
@@ -124,19 +158,37 @@ class CodexBuilder implements BackendBuilder {
       preamble = [preamble, PROJECT_WRITE_GIT_GUARD].join('\n');
     }
     let mcpServers;
-    if (delegationOn) {
+    if (delegationOn || heartbeatOn) {
       const host = ['0.0.0.0', '::'].includes(deps.config.host) ? '127.0.0.1' : deps.config.host;
+      const enabledTools = [
+        ...(delegationOn
+          ? ['delegate_to_worker', 'worker_job_status', 'worker_job_cancel', 'worker_job_update_delivery']
+          : []),
+        ...(heartbeatOn ? ['camera_snap'] : []),
+        ...(taobaoMode ? taobaoToolNames(taobaoMode) : []),
+      ];
       mcpServers = [{
         name: 'hub',
         url: `http://${host}:${deps.config.port}/api/hub-mcp/${encodeURIComponent(ctx.agent.id)}`,
-        enabledTools: ['delegate_to_worker', 'worker_job_status', 'worker_job_cancel', 'worker_job_update_delivery'],
+        enabledTools,
         required: true,
         defaultToolsApprovalMode: 'approve' as const,
         httpHeaders: hubMcpAuthHeaders(ctx.agent.id),
       }];
-      preamble = deps.prompts.withDelegation(preamble, delegation, 'mcp__hub__', ctx.log);
-      ctx.log('worker delegation enabled (codex hub MCP)');
+      if (delegationOn) {
+        preamble = deps.prompts.withDelegation(preamble, delegation, 'mcp__hub__', ctx.log);
+        ctx.log('worker delegation enabled (codex hub MCP)');
+      }
+      if (heartbeatOn) {
+        preamble = [preamble, HEARTBEAT_GUIDANCE].filter(Boolean).join('\n');
+        ctx.log('companion heartbeat enabled (codex hub MCP camera_snap)');
+      }
+      if (taobaoMode) {
+        preamble = [preamble, taobaoGuidance(taobaoMode)].filter(Boolean).join('\n');
+        ctx.log(`heartbeat taobao bridge enabled (codex hub MCP taobao_* mode=${taobaoMode})`);
+      }
     }
+    const timeouts = resolveTurnTimeouts(deps.config.codex, cfg);
     return new CodexAppServerBackend({
       cliPath: cfg.cliPath ?? deps.config.codex.cliPath,
       cwd,
@@ -146,7 +198,8 @@ class CodexBuilder implements BackendBuilder {
       mcpServers,
       sandbox: access.enabled ? 'workspace-write' : 'read-only',
       nativeCompact: deps.config.codex.nativeCompact,
-      turnTimeoutMs: deps.config.codex.turnTimeoutMs,
+      turnIdleTimeoutMs: timeouts.idleTimeoutMs,
+      turnHardTimeoutMs: timeouts.hardTimeoutMs,
       log: ctx.log,
     });
   }
@@ -154,7 +207,7 @@ class CodexBuilder implements BackendBuilder {
 
 class GrokBuilder implements BackendBuilder {
   build(input: BuildInput): AgentBackend {
-    const { cfg, ctx, deps, delegation, delegationOn } = input;
+    const { cfg, ctx, deps, delegation, delegationOn, heartbeatOn, taobaoMode, managedMcp } = input;
     const { cwd } = workspace(input, false);
     let preamble = input.prompt.preamble;
     const memoryMcpOn = !!deps.vault && ctx.memory.injectOnSpawn;
@@ -165,6 +218,18 @@ class GrokBuilder implements BackendBuilder {
       preamble = deps.prompts.withDelegation(preamble, delegation, 'hub__', ctx.log);
       ctx.log('worker delegation enabled (grok hub MCP)');
     }
+    if (heartbeatOn) {
+      allowRules.push('MCPTool(hub__camera_snap)');
+      preamble = [preamble, HEARTBEAT_GUIDANCE].filter(Boolean).join('\n');
+      ctx.log('companion heartbeat enabled (grok hub MCP camera_snap)');
+    }
+    if (taobaoMode) {
+      allowRules.push(...taobaoToolNames(taobaoMode).map((name) => `MCPTool(hub__${name})`));
+      preamble = [preamble, taobaoGuidance(taobaoMode)].filter(Boolean).join('\n');
+      ctx.log(`heartbeat taobao bridge enabled (grok hub MCP taobao_* mode=${taobaoMode})`);
+    }
+    managedMcp.writeGrok({ cwd, includeHub: delegationOn || heartbeatOn });
+    const timeouts = resolveTurnTimeouts(deps.config.grok, cfg);
     return new GrokCliBackend({
       cliPath: cfg.cliPath ?? deps.config.grok.cliPath,
       cwd,
@@ -177,7 +242,36 @@ class GrokBuilder implements BackendBuilder {
       // 没人点 → 整轮 stop_reason=cancelled（2026-07-31 阿野写记忆库就是这么断的）。
       alwaysApprove: true,
       preamble: [cfg.appendSystemPrompt, preamble].filter(Boolean).join('\n') || undefined,
-      turnTimeoutMs: deps.config.grok.turnTimeoutMs,
+      turnIdleTimeoutMs: timeouts.idleTimeoutMs,
+      turnHardTimeoutMs: timeouts.hardTimeoutMs,
+      log: ctx.log,
+    });
+  }
+}
+
+class OpencodeBuilder implements BackendBuilder {
+  build(input: BuildInput): AgentBackend {
+    const { cfg, ctx, deps, heartbeatOn, taobaoMode, managedMcp } = input;
+    const { cwd } = workspace(input, false);
+    const preamble = [
+      cfg.appendSystemPrompt,
+      input.prompt.preamble,
+      ...(heartbeatOn ? [HEARTBEAT_GUIDANCE] : []),
+      ...(taobaoMode ? [taobaoGuidance(taobaoMode)] : []),
+    ].filter(Boolean).join('\n');
+    const configPath = heartbeatOn ? managedMcp.writeOpencode({ cwd }) : undefined;
+    if (heartbeatOn) ctx.log('companion heartbeat enabled (opencode hub MCP camera_snap)');
+    if (taobaoMode) ctx.log(`heartbeat taobao bridge enabled (opencode hub MCP taobao_* mode=${taobaoMode})`);
+    const timeouts = resolveTurnTimeouts(deps.config.opencode, cfg);
+    return new OpencodeCliBackend({
+      cliPath: cfg.cliPath ?? deps.config.opencode.cliPath,
+      cwd,
+      model: cfg.model || undefined,
+      variant: cfg.effort || undefined,
+      preamble: preamble || undefined,
+      configPath,
+      turnIdleTimeoutMs: timeouts.idleTimeoutMs,
+      turnHardTimeoutMs: timeouts.hardTimeoutMs,
       log: ctx.log,
     });
   }
@@ -185,21 +279,32 @@ class GrokBuilder implements BackendBuilder {
 
 class ApiBuilder implements BackendBuilder {
   build(input: BuildInput): AgentBackend {
-    const { cfg, ctx, deps, delegation, delegationOn } = input;
+    const { cfg, ctx, deps, delegation, delegationOn, heartbeatOn, taobaoMode } = input;
     let preamble = input.prompt.preamble;
-    let extraTools;
+    const extraTools: GatewayTool[] = [];
     if (delegationOn) {
-      extraTools = buildDelegateTools(
+      extraTools.push(...buildDelegateTools(
         deps.jobStore!, deps.db, ctx.agent.id, delegation, ctx.convo.id
-      );
+      ));
       preamble = deps.prompts.withDelegation(preamble, delegation, '', ctx.log);
       ctx.log('worker delegation enabled (native tools)');
+    }
+    const harnessOn = cfg.harness?.enabled === true;
+    if (!harnessOn && heartbeatOn && deps.broker && deps.heartbeat) {
+      extraTools.push(buildCameraTool(deps.broker, deps.heartbeat, deps.db, ctx.agent.id));
+      preamble = [preamble, HEARTBEAT_GUIDANCE].filter(Boolean).join('\n');
+      ctx.log('companion heartbeat enabled (api native camera_snap)');
+    }
+    if (!harnessOn && taobaoMode && deps.taobao && deps.heartbeat) {
+      extraTools.push(...buildTaobaoTools(deps.taobao, deps.heartbeat, deps.db, ctx.agent.id, taobaoMode));
+      preamble = [preamble, taobaoGuidance(taobaoMode)].filter(Boolean).join('\n');
+      ctx.log(`heartbeat taobao bridge enabled (api native taobao_* mode=${taobaoMode})`);
     }
     const provider = cfg.provider === 'anthropic'
       ? 'anthropic'
       : cfg.provider === 'gemini' ? 'gemini' : 'openai-compat';
     const systemPrompt = [cfg.systemPrompt, preamble].filter(Boolean).join('\n');
-    if (cfg.harness?.enabled === true) {
+    if (harnessOn) {
       if (provider !== 'openai-compat') {
         throw new Error('DSH harness 当前只支持 DeepSeek openai-compatible 联系人');
       }
@@ -256,7 +361,7 @@ class ApiBuilder implements BackendBuilder {
       memberId: ctx.memberId,
       log: ctx.log,
       vault: ctx.memory.injectOnSpawn ? deps.vault ?? undefined : undefined,
-      extraTools,
+      extraTools: extraTools.length ? extraTools : undefined,
       roomMode: ctx.isRoom ? { selfId: ctx.agent.id, nameOf: ctx.nameOf } : undefined,
     });
   }
@@ -285,10 +390,11 @@ class ManagedMcpConfig {
     }
     const { config } = this.deps;
     if (opts.includeMemoryVault && config.memory.mcpUrl) {
+      const headers = memoryVaultMcpAuthHeaders();
       servers['memory-vault'] = {
         type: 'http',
         url: config.memory.mcpUrl,
-        ...(process.env.VAULT_TOKEN ? { headers: { Authorization: 'Bearer ${VAULT_TOKEN}' } } : {}),
+        ...(headers ? { headers } : {}),
       };
     }
     if (opts.includeHub) {
@@ -313,6 +419,161 @@ class ManagedMcpConfig {
     return file;
   }
 
+  writeOpencode(opts: { cwd: string }): string {
+    const basePath = path.join(opts.cwd, 'opencode.json');
+    let base: Record<string, any> = {};
+    if (fs.existsSync(basePath)) {
+      try {
+        base = JSON.parse(fs.readFileSync(basePath, 'utf-8'));
+      } catch (error: any) {
+        this.log(`base opencode config unreadable (${error.message}) - using heartbeat MCP defaults`);
+      }
+    }
+    const host = ['0.0.0.0', '::'].includes(this.deps.config.host) ? '127.0.0.1' : this.deps.config.host;
+    const headers = hubMcpAuthHeaders(this.agent.id);
+    const body = JSON.stringify({
+      ...base,
+      mcp: {
+        ...(base.mcp && typeof base.mcp === 'object' ? base.mcp : {}),
+        hub: {
+          type: 'remote',
+          url: `http://${host}:${this.deps.config.port}/api/hub-mcp/${this.agent.id}`,
+          enabled: true,
+          oauth: false,
+          ...(headers ? { headers } : {}),
+        },
+      },
+    }, null, 2);
+    const dir = path.resolve(path.dirname(this.deps.config.dbPath), 'agents', this.agent.id);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'opencode.gateway.json');
+    fs.writeFileSync(file, body, { encoding: 'utf-8', mode: 0o600 });
+    this.log(`opencode config written heartbeatMcp=true bytes=${body.length} ~tokens=${Math.ceil(body.length / 4)} file=${path.basename(file)}`);
+    return file;
+  }
+
+  writeGrok(opts: { cwd: string; includeHub: boolean }): string | undefined {
+    const dir = path.join(opts.cwd, '.grok');
+    const file = path.join(dir, 'config.toml');
+    try {
+      return this.writeGrokProject(file, opts.includeHub);
+    } catch (error: any) {
+      const code = typeof error?.code === 'string' ? error.code : 'unknown';
+      this.log(`grok project config unavailable (${code}: ${error?.message ?? error}) - continuing without project config`);
+      if (!opts.includeHub) return undefined;
+      try {
+        return this.refreshMatchingGrokUserConfig();
+      } catch (fallbackError: any) {
+        const fallbackCode = typeof fallbackError?.code === 'string' ? fallbackError.code : 'unknown';
+        this.log(`grok user config refresh unavailable (${fallbackCode}: ${fallbackError?.message ?? fallbackError}) - backend will use existing Grok config`);
+        return undefined;
+      }
+    }
+  }
+
+  private writeGrokProject(file: string, includeHub: boolean): string | undefined {
+    const dir = path.dirname(file);
+    const start = '# >>> AI Hub managed MCP: hub';
+    const end = '# <<< AI Hub managed MCP: hub';
+    const original = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
+    const managedBlock = new RegExp(
+      `${start.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${end.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\r?\\n?`,
+      'g',
+    );
+    const hadManagedBlock = managedBlock.test(original);
+    managedBlock.lastIndex = 0;
+    const base = original.replace(managedBlock, '').trimEnd();
+    if (!includeHub) {
+      if (hadManagedBlock) fs.writeFileSync(file, base ? `${base}\n` : '', { encoding: 'utf-8', mode: 0o600 });
+      return undefined;
+    }
+    if (/^\s*\[mcp_servers\.hub(?:\.[^\]]+)?\]\s*$/m.test(base)) {
+      this.log('project grok config already defines mcp_servers.hub - preserving user-managed server');
+      return file;
+    }
+    const host = ['0.0.0.0', '::'].includes(this.deps.config.host) ? '127.0.0.1' : this.deps.config.host;
+    const headers = hubMcpAuthHeaders(this.agent.id);
+    const lines = [
+      start,
+      '[mcp_servers.hub]',
+      `url = ${JSON.stringify(`http://${host}:${this.deps.config.port}/api/hub-mcp/${this.agent.id}`)}`,
+      'enabled = true',
+      ...(headers ? ['', '[mcp_servers.hub.headers]', `Authorization = ${JSON.stringify(headers.Authorization)}`] : []),
+      end,
+    ];
+    fs.mkdirSync(dir, { recursive: true });
+    const body = `${base ? `${base}\n\n` : ''}${lines.join('\n')}\n`;
+    fs.writeFileSync(file, body, { encoding: 'utf-8', mode: 0o600 });
+    this.log(`grok project config written heartbeatMcp=true bytes=${body.length} ~tokens=${Math.ceil(body.length / 4)}`);
+    return file;
+  }
+
+  /**
+   * Production keeps /opt/ai-hub read-only, so a legacy Grok contact may be
+   * unable to create <cwd>/.grok/config.toml. If the user-level config already
+   * belongs to this exact contact, refresh only that server's URL and bearer.
+   * A config for another contact is never overwritten.
+   */
+  private refreshMatchingGrokUserConfig(): string | undefined {
+    const home = process.env.HOME?.trim();
+    if (!home) {
+      this.log('grok user config refresh skipped: HOME is not set');
+      return undefined;
+    }
+    const file = path.join(home, '.grok', 'config.toml');
+    if (!fs.existsSync(file)) {
+      this.log('grok user config refresh skipped: config.toml not found');
+      return undefined;
+    }
+
+    const original = fs.readFileSync(file, 'utf-8');
+    const eol = original.includes('\r\n') ? '\r\n' : '\n';
+    const lines = original.split(/\r?\n/);
+    const section = (header: string): { start: number; end: number } | undefined => {
+      const start = lines.findIndex((line) => line.trim() === header);
+      if (start < 0) return undefined;
+      let end = start + 1;
+      while (end < lines.length && !/^\s*\[/.test(lines[end]!)) end += 1;
+      return { start, end };
+    };
+    const hub = section('[mcp_servers.hub]');
+    if (!hub) {
+      this.log('grok user config refresh skipped: mcp_servers.hub not found');
+      return undefined;
+    }
+    const urlLine = lines.slice(hub.start + 1, hub.end).find((line) => /^\s*url\s*=/.test(line));
+    if (!urlLine || !urlLine.includes(`/api/hub-mcp/${this.agent.id}`)) {
+      this.log('grok user config refresh skipped: hub server belongs to another contact');
+      return undefined;
+    }
+
+    const host = ['0.0.0.0', '::'].includes(this.deps.config.host) ? '127.0.0.1' : this.deps.config.host;
+    const url = `http://${host}:${this.deps.config.port}/api/hub-mcp/${this.agent.id}`;
+    const urlIndex = lines.findIndex((line, index) => index > hub.start && index < hub.end && /^\s*url\s*=/.test(line));
+    lines[urlIndex] = `url = ${JSON.stringify(url)}`;
+
+    const headers = hubMcpAuthHeaders(this.agent.id);
+    if (headers) {
+      const headerSection = section('[mcp_servers.hub.headers]');
+      if (headerSection) {
+        const authIndex = lines.findIndex((line, index) => (
+          index > headerSection.start && index < headerSection.end && /^\s*Authorization\s*=/.test(line)
+        ));
+        const authLine = `Authorization = ${JSON.stringify(headers.Authorization)}`;
+        if (authIndex >= 0) lines[authIndex] = authLine;
+        else lines.splice(headerSection.end, 0, authLine);
+      } else {
+        if (lines.at(-1) !== '') lines.push('');
+        lines.push('[mcp_servers.hub.headers]', `Authorization = ${JSON.stringify(headers.Authorization)}`, '');
+      }
+    }
+
+    const body = lines.join(eol);
+    if (body !== original) fs.writeFileSync(file, body, { encoding: 'utf-8', mode: 0o600 });
+    this.log(`grok user config refreshed for contact=${this.agent.id} bytes=${body.length} ~tokens=${Math.ceil(body.length / 4)}`);
+    return file;
+  }
+
   private resolve(file: string, cwd: string): string {
     if (path.isAbsolute(file)) return file;
     const cwdRelative = path.resolve(cwd, file);
@@ -325,6 +586,7 @@ export class BackendFactory {
     'claude-cli': new ClaudeBuilder(),
     codex: new CodexBuilder(),
     'grok-cli': new GrokBuilder(),
+    'opencode-cli': new OpencodeBuilder(),
     api: new ApiBuilder(),
     room: { build: () => { throw new Error('room 不能直接启动后端'); } },
   };
@@ -336,6 +598,10 @@ export class BackendFactory {
     const prompt = await this.deps.prompts.composeStart(ctx, ctx.resumeToken);
     const delegation: DelegationCfg = cfg.delegation ?? {};
     const delegationOn = delegation.enabled === true && !!this.deps.jobStore;
+    const heartbeatOn = cfg.heartbeat?.enabled === true
+      && !!this.deps.broker
+      && !!this.deps.heartbeat;
+    const taobaoMode = heartbeatOn && this.deps.taobao ? taobaoModeFor(cfg) : null;
     const builder = this.builders[ctx.agent.backend];
     if (!builder) throw new Error(`backend "${ctx.agent.backend}" 不认识`);
     return builder.build({
@@ -344,6 +610,8 @@ export class BackendFactory {
       prompt,
       delegation,
       delegationOn,
+      heartbeatOn,
+      taobaoMode,
       deps: this.deps,
       managedMcp: new ManagedMcpConfig(this.deps, ctx.agent, ctx.log),
     });

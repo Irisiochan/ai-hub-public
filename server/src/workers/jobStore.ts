@@ -44,6 +44,7 @@ export const RUNNING_WINDOW_STATUSES = new Set([
 ]);
 export const LEASE_SECONDS = 45;
 export const DELIVERY_STAGES = new Set([
+  'waiting_review',
   'delivered_waiting_deploy',
   'online_waiting_validation',
   'closed_loop',
@@ -116,6 +117,12 @@ export interface CreateJobInput {
     problemFingerprint?: string;
     taskPath?: string;
     workflow?: WorkflowSnapshot;
+    /** Harness-created review jobs retain their source and dispatch provenance here. */
+    parentJobId?: string;
+    sourceReviewJobId?: string;
+    closureKind?: 'merge' | 'deploy';
+    frozenSha?: string;
+    dispatchSource?: 'harness-auto';
   };
   /** 委派发生的聊天（DM/群）与当时的最后一条消息 id——前端把任务 thread 挂回这条消息下。 */
   originContactId?: string | null;
@@ -198,6 +205,7 @@ export class JobStore {
     this.workflowProfiles = new WorkflowProfileStore(db);
     this.statements = {
       get: db.prepare('SELECT * FROM jobs WHERE id = ?'),
+      getByIdempotencyKey: db.prepare('SELECT * FROM jobs WHERE idempotency_key = ?'),
       softDelete: db.prepare(
         `UPDATE jobs SET deleted = 1, updated_at = datetime('now') WHERE id = ? AND deleted = 0`
       ),
@@ -297,7 +305,11 @@ export class JobStore {
          ORDER BY updated_at DESC LIMIT 500`
       ),
       outboxEnqueue: db.prepare(
-        `INSERT OR IGNORE INTO job_outbox (job_id, kind) VALUES (?, 'finished')`
+        `INSERT INTO job_outbox (job_id, kind) VALUES (?, 'finished')
+         ON CONFLICT(job_id, kind) DO UPDATE SET
+           status = 'pending', attempts = 0, next_attempt_at = 0,
+           meta = '{}', last_error = NULL, updated_at = datetime('now')
+         WHERE job_outbox.status IN ('done', 'dead')`
       ),
       outboxClaimNext: db.prepare(
         `SELECT * FROM job_outbox WHERE status = 'pending' AND next_attempt_at <= ?
@@ -348,6 +360,10 @@ export class JobStore {
 
   get(id: string): JobRow | undefined {
     return this.statements.get.get(id) as JobRow | undefined;
+  }
+
+  getByIdempotencyKey(key: string): JobRow | undefined {
+    return this.statements.getByIdempotencyKey.get(key) as JobRow | undefined;
   }
 
   /**

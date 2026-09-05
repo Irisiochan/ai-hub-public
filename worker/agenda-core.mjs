@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { parseHubTimestampMs } from './hub-time.mjs';
 
 const ACTIVE_JOB_STATUSES = new Set([
   'pending',
@@ -16,7 +17,7 @@ const EXCEPTION_JOB_STATUSES = new Set([
   'expired',
 ]);
 
-const T3_PATTERN = /(?:删除|清空|force[ -]?push|强推|回滚生产|生产部署|正式部署|外发|发送给第三方|权限扩张|凭据|密钥|付费|付款)/iu;
+export const T3_PATTERN = /(?:删除|清空|force[ -]?push|强推|回滚生产|生产部署|正式部署|外发|发送给第三方|权限扩张|凭据|密钥|付费|付款)/iu;
 const T2_PATTERN = /(?:依赖.{0,12}升级|升级.{0,12}依赖|数据库.{0,12}迁移|迁移.{0,12}数据库|部署|发布候选|共享环境|范围不清|待拆分|产品取舍|权限|账号设置)/iu;
 const T0_PATTERN = /(?:只读|读取|扫描|审计|盘点|检查|验证|测试|报告|草稿|排序|去重)/iu;
 const T1_PATTERN = /(?:修复|实现|新增|补齐|文档|格式化|重构|代码|回归测试)/iu;
@@ -140,8 +141,7 @@ function jobTaskPath(job) {
 }
 
 function timestamp(value) {
-  const parsed = Date.parse(String(value ?? ''));
-  return Number.isFinite(parsed) ? parsed : null;
+  return parseHubTimestampMs(value);
 }
 
 export function reconcileAgendaJobs(jobs, tasks, now = Date.now()) {

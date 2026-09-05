@@ -296,11 +296,80 @@ async function unexpectedEofInterruptsStreamingRows(): Promise<void> {
   assert.deepEqual(terminalRow, { content: 'almost done', status: 'interrupted' });
 }
 
+async function deployRestartReasonIsPersisted(): Promise<void> {
+  db.prepare(
+    `INSERT INTO contacts (id, name, backend, kind, config)
+     VALUES ('runtime-deploy-restart', 'Claude', 'api', 'dm', ?)`
+  ).run(JSON.stringify({
+    provider: 'openai-compat',
+    apiKey: 'test',
+    model: 'test',
+    memory: { injectOnSpawn: false, searchPerTurn: false, capture: false },
+  }));
+  const contact = openContact(
+    db.prepare('SELECT * FROM contacts WHERE id = ?').get('runtime-deploy-restart') as any
+  );
+  const inserted = db.prepare(
+    `INSERT INTO messages (contact_id, sender, role, kind, content, status)
+     VALUES ('runtime-deploy-restart', 'user', 'user', 'text', 'hello', 'done')`
+  ).run();
+  let events: AsyncQueue<TurnEvent> | null = null;
+  const fakeBackend: AgentBackend = {
+    kind: 'api',
+    alive: () => true,
+    start: async () => {},
+    stop: async () => { events?.end(); },
+    sendTurn: () => {
+      events = new AsyncQueue<TurnEvent>();
+      events.push({ type: 'thinking', text: 'working' });
+      return { events, interrupt: async () => { events?.end(); } };
+    },
+  };
+  const config: HubConfig = {
+    port: 3900,
+    host: '127.0.0.1',
+    dbPath: path.join(tempDir, 'test.sqlite'),
+    agentsDir: path.join(tempDir, 'agents'),
+    webDist: '',
+    uploadsDir,
+    releasesDir: path.join(tempDir, 'releases'),
+    claude: { cliPath: 'claude', turnTimeoutMs: 5000 },
+    codex: { cliPath: 'codex', turnTimeoutMs: 5000 },
+    grok: { cliPath: 'grok', turnTimeoutMs: 5000 },
+    memory: {
+      mcpUrl: null, repoPath: null, injectOnSpawn: false, searchPerTurn: false,
+      capture: false, maxTurnChars: 1200, sessionMaxAgeHours: 0,
+    },
+    backup: { enabled: false, dir: tempDir, intervalHours: 24, keep: 1 },
+    purge: {
+      enabled: false, messagesRetentionDays: 14, jobsRetentionDays: 30,
+      intervalHours: 24, batchSize: 100,
+    },
+  };
+  const runtime = new AgentRuntime(contact, contact, {
+    db, sse, config, vault: null, jobStore: null,
+  });
+  (runtime as any).backend = fakeBackend;
+  runtime.enqueue({ userMessageId: Number(inserted.lastInsertRowid), text: 'hello' });
+  for (let attempt = 0; attempt < 100 && runtime.state === 'idle'; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await runtime.stop('deploy-restart');
+  const row = db.prepare(
+    `SELECT content, meta FROM messages
+     WHERE contact_id = 'runtime-deploy-restart' AND kind = 'error'
+     ORDER BY id DESC LIMIT 1`
+  ).get() as { content: string; meta: string };
+  assert.equal(row.content, '部署重启中断');
+  assert.equal(JSON.parse(row.meta).interruptionReason, 'deploy-restart');
+}
+
 try {
   await authPathBoundary();
   await workerCompletionIsIdempotent();
   await directApiStopAbortsTurn();
   await unexpectedEofInterruptsStreamingRows();
+  await deployRestartReasonIsPersisted();
 } finally {
   sse.close();
   db.close();

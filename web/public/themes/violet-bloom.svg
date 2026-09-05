@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="480" viewBox="0 0 480 480">
+  <title>AI Hub User bloom low-contrast wallpaper</title>
+  <g fill="none" stroke="#9d8cf5" stroke-width="1.2" opacity="0.055">
+    <path d="M72 120c34-54 86-54 120 0-34 54-86 54-120 0Z"/>
+    <path d="M132 60c54 34 54 86 0 120-54-34-54-86 0-120Z"/>
+    <circle cx="132" cy="120" r="12"/>
+    <path d="M302 334c28-44 72-44 100 0-28 44-72 44-100 0Z"/>
+    <path d="M352 284c44 28 44 72 0 100-44-28-44-72 0-100Z"/>
+    <circle cx="352" cy="334" r="10"/>
+    <path d="M18 408c62-24 115-10 158 42M286 24c62 18 108 54 138 108"/>
+  </g>
+</svg>

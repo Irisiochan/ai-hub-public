@@ -4,27 +4,40 @@ import {
   connectEvents,
   type Contact,
   type ContactStatus,
+  type HeartbeatStatus,
   type Message,
   type MessageOrigin,
   type MessageReadState,
   type MessageReadStates,
   type UserProfile,
+  type WorkerJob,
 } from './api';
 import ChatPane from './components/ChatPane';
 import ContactConfig from './components/ContactConfig';
 import ContactList from './components/ContactList';
 import PublishStatusPanel from './components/PublishStatusPanel';
 import UserConfig from './components/UserConfig';
+import LedgerPanel from './components/LedgerPanel';
 import WorkerPanel from './components/WorkerPanel';
 import {
-  appendMessageDelta,
   createTrailingMessageReconciler,
   mergeIncomingMessage,
   mergeMessageRows,
   shouldReconcileMessagesAfterStatus,
 } from './messageMerge';
+import {
+  applyMessageDeltaBatch,
+  MessageDeltaBatcher,
+  rememberRecentMessageId,
+  trimMessageCache,
+} from './messagePerformance';
 import { effectiveMessageOrigin } from './messageSource.ts';
 import { incrementReadStateForIncoming, unreadHydrationAfter } from './unreadState';
+import { playSoundEvent } from './sound';
+import { getUiPreferenceSnapshot } from './preferences/store';
+import type { MotionState } from './motionPresence';
+import { workerState } from './useWorkerState';
+import { WORKER_RECONCILE_MS } from './workerState';
 
 const emptyReadStates = (): MessageReadStates => ({
   main: { origin: 'main', lastReadMessageId: 0, firstUnreadId: null, unreadCount: 0 },
@@ -35,12 +48,15 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Record<string, Message[]>>({});
   const [statuses, setStatuses] = useState<Record<string, ContactStatus>>({});
+  const [heartbeats, setHeartbeats] = useState<Record<string, HeartbeatStatus>>({});
   const [readStates, setReadStates] = useState<Record<string, MessageReadStates>>({});
   const [configFor, setConfigFor] = useState<{ contact: Contact | null } | null>(null);
   const [user, setUser] = useState<UserProfile>({ name: 'User', avatar: '🦋', color: '#e94560' });
   const [userConfigOpen, setUserConfigOpen] = useState(false);
   const [workerPanelOpen, setWorkerPanelOpen] = useState(false);
+  const [ledgerPanelOpen, setLedgerPanelOpen] = useState(false);
   const [publishStatusOpen, setPublishStatusOpen] = useState(false);
+  const [chatMotionState, setChatMotionState] = useState<MotionState>('enter');
 
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -50,7 +66,15 @@ export default function App() {
   statusesRef.current = statuses;
   const eventsRef = useRef<{ refresh(): void } | null>(null);
   const lastSubscriptionRef = useRef<string | null>(selectedId);
-  const incomingIdsRef = useRef(new Set<string>());
+  const incomingIdsRef = useRef(new Map<string, true>());
+  const deltaBatcherRef = useRef<MessageDeltaBatcher | null>(null);
+  const liveEventsReadyRef = useRef(false);
+  const contactSwitchTimerRef = useRef<number | null>(null);
+
+  const soundContext = (contactId: string | null) => ({
+    currentConversation: contactId !== null && selectedRef.current === contactId,
+    pageVisible: typeof document !== 'undefined' && document.visibilityState === 'visible',
+  });
 
   const applyReadState = useCallback((contactId: string, state: MessageReadState) => {
     setReadStates((prev) => {
@@ -59,13 +83,25 @@ export default function App() {
     });
   }, []);
 
+  const applyHeartbeat = useCallback((status: HeartbeatStatus) => {
+    setHeartbeats((prev) => ({ ...prev, [status.contactId]: status }));
+  }, []);
+
   const upsertMessage = useCallback((msg: Message) => {
     if (effectiveMessageOrigin(msg) !== 'main') return;
     const incomingKey = `${msg.contact_id}:${msg.id}`;
+    deltaBatcherRef.current?.discard(msg.contact_id, msg.id);
     const alreadyPresent =
-      incomingIdsRef.current.has(incomingKey) ||
+      rememberRecentMessageId(incomingIdsRef.current, incomingKey) ||
       (messagesRef.current[msg.contact_id] ?? []).some((message) => message.id === msg.id);
-    incomingIdsRef.current.add(incomingKey);
+    if (liveEventsReadyRef.current && !alreadyPresent) {
+      if (msg.kind === 'error' || msg.status === 'error') {
+        void playSoundEvent('error', `message:${incomingKey}:error`, soundContext(msg.contact_id));
+      } else if (msg.role === 'assistant' && msg.kind === 'text' && msg.status === 'done') {
+        const turnKey = msg.turn_id ?? String(msg.id);
+        void playSoundEvent('assistant', `turn:${msg.contact_id}:${turnKey}:done`, soundContext(msg.contact_id));
+      }
+    }
     setMessages((prev) => {
       const list = prev[msg.contact_id] ?? [];
       const idx = list.findIndex((m) => m.id === msg.id);
@@ -73,7 +109,7 @@ export default function App() {
         idx >= 0
           ? [...list.slice(0, idx), mergeIncomingMessage(list[idx], msg), ...list.slice(idx + 1)]
           : [...list, msg].sort((a, b) => a.id - b.id);
-      return { ...prev, [msg.contact_id]: next };
+      return { ...prev, [msg.contact_id]: trimMessageCache(next) };
     });
     setContacts((prev) =>
       prev.map((c) =>
@@ -102,7 +138,7 @@ export default function App() {
     }
     setMessages((prev) => {
       const existing = prev[contactId] ?? [];
-      return { ...prev, [contactId]: mergeMessageRows(existing, rows) };
+      return { ...prev, [contactId]: trimMessageCache(mergeMessageRows(existing, rows)) };
     });
     setReadStates((prev) => ({
       ...prev,
@@ -115,15 +151,16 @@ export default function App() {
     [loadMessages]
   );
 
-  const loadEarlier = useCallback(async (contactId: string) => {
+  const loadEarlier = useCallback(async (contactId: string): Promise<number> => {
     const list = (messagesRef.current[contactId] ?? []).filter((message) => message.origin === 'main');
-    if (list.length === 0) return;
+    if (list.length === 0) return 0;
     const { messages: rows } = await api.messages(contactId, { before: list[0].id, limit: 50, origin: 'main' });
-    if (rows.length === 0) return;
+    if (rows.length === 0) return 0;
     setMessages((prev) => {
       const existing = prev[contactId] ?? [];
-      return { ...prev, [contactId]: mergeMessageRows(rows, existing) };
+      return { ...prev, [contactId]: trimMessageCache(mergeMessageRows(rows, existing)) };
     });
+    return rows.length;
   }, []);
 
   const resync = useCallback(async () => {
@@ -152,8 +189,14 @@ export default function App() {
     statusesRef.current = nextStatuses;
     setStatuses(nextStatuses);
     if (selectedRef.current) reconcileIds.add(selectedRef.current);
-    await Promise.all([...reconcileIds].map((contactId) => reconcileMessages(contactId)));
-  }, [reconcileMessages]);
+    const selectedContactId = selectedRef.current;
+    await Promise.all([
+      ...[...reconcileIds].map((contactId) => reconcileMessages(contactId)),
+      ...(selectedContactId
+        ? [api.heartbeat(selectedContactId).then(applyHeartbeat).catch(() => {})]
+        : []),
+    ]);
+  }, [applyHeartbeat, reconcileMessages]);
 
   const handleStatus = useCallback(({ contactId, state, member, origin }: {
     contactId: string;
@@ -171,19 +214,43 @@ export default function App() {
   }, [reconcileMessages]);
 
   useEffect(() => {
-    void resync();
+    const deltaBatcher = new MessageDeltaBatcher((batches) => {
+      setMessages((prev) => {
+        let next = prev;
+        for (const batch of batches) {
+          const list = next[batch.contactId];
+          if (!list) continue;
+          const updated = applyMessageDeltaBatch(list, batch.deltas);
+          if (updated === list) continue;
+          if (next === prev) next = { ...prev };
+          next[batch.contactId] = trimMessageCache(updated);
+        }
+        return next;
+      });
+    });
+    deltaBatcherRef.current = deltaBatcher;
+    let disposed = false;
+    liveEventsReadyRef.current = false;
+    void workerState.refresh().catch(() => {});
+    const workerFallback = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void workerState.refresh().catch(() => {});
+    }, WORKER_RECONCILE_MS);
+    void resync().finally(() => {
+      if (!disposed) liveEventsReadyRef.current = true;
+    });
     const connection = connectEvents({
       onMessage: upsertMessage,
-      onDelta: ({ contactId, messageId, text }) => {
-        setMessages((prev) => {
-          const list = prev[contactId];
-          if (!list) return prev;
-          return { ...prev, [contactId]: appendMessageDelta(list, messageId, text) };
-        });
+      // Delta only mutates text through the frame batcher. It never changes a
+      // motion class or emits sound; completion is handled by terminal events.
+      onDelta: (delta) => deltaBatcher.add(delta),
+      onStatus: (status) => {
+        deltaBatcher.flushNow();
+        handleStatus(status);
       },
-      onStatus: handleStatus,
       onReadState: ({ contactId, ...state }) => applyReadState(contactId, state),
-      onPrune: ({ contactId, ids, afterId }) =>
+      onPrune: ({ contactId, ids, afterId }) => {
+        deltaBatcher.flushNow();
+        for (const id of ids ?? []) incomingIdsRef.current.delete(`${contactId}:${id}`);
         setMessages((prev) => {
           const list = prev[contactId];
           if (!list) return prev;
@@ -193,7 +260,8 @@ export default function App() {
             return true;
           });
           return { ...prev, [contactId]: keep };
-        }),
+        });
+      },
       onUser: setUser,
       onContact: (c: Contact & { enabled?: number }) =>
         setContacts((prev) => {
@@ -205,11 +273,33 @@ export default function App() {
             ? prev.map((p) => (p.id === c.id ? { ...p, ...c } : p))
             : [...prev, c];
         }),
-      onReconnect: () => void resync(),
+      onHeartbeat: applyHeartbeat,
+      onWorker: workerState.applyWorker,
+      onJobMessage: workerState.applyJobMessage,
+      onWorkflowProfile: () => { void workerState.reconcile().catch(() => {}); },
+      onJob: (job: WorkerJob) => {
+        workerState.applyJob(job);
+        if (!liveEventsReadyRef.current) return;
+        const context = soundContext(job.origin_contact_id);
+        if (job.status === 'done') void playSoundEvent('worker', `job:${job.id}:done`, context);
+        else if (job.status === 'failed') void playSoundEvent('error', `job:${job.id}:failed`, context);
+      },
+      onReconnect: () => {
+        deltaBatcher.flushNow();
+        void resync();
+        void workerState.reconcile().catch(() => {});
+      },
     }, () => selectedRef.current ? [selectedRef.current] : []);
     eventsRef.current = connection;
-    return () => connection.disconnect();
-  }, [handleStatus, resync, upsertMessage]);
+    return () => {
+      disposed = true;
+      connection.disconnect();
+      window.clearInterval(workerFallback);
+      workerState.reset();
+      deltaBatcher.close();
+      if (deltaBatcherRef.current === deltaBatcher) deltaBatcherRef.current = null;
+    };
+  }, [applyHeartbeat, handleStatus, resync, upsertMessage]);
 
   useEffect(() => {
     if (lastSubscriptionRef.current === selectedId) return;
@@ -217,10 +307,31 @@ export default function App() {
     eventsRef.current?.refresh();
   }, [selectedId]);
 
+  useEffect(() => () => {
+    if (contactSwitchTimerRef.current !== null) window.clearTimeout(contactSwitchTimerRef.current);
+  }, []);
+
   const select = useCallback((id: string | null) => {
-    setSelectedId(id);
-    if (id) void reconcileMessages(id);
-  }, [reconcileMessages]);
+    const current = selectedRef.current;
+    if (current === id) return;
+    if (id) {
+      void reconcileMessages(id);
+      void api.heartbeat(id).then(applyHeartbeat).catch(() => {});
+    }
+    if (contactSwitchTimerRef.current !== null) window.clearTimeout(contactSwitchTimerRef.current);
+    if (current === null) {
+      setChatMotionState('enter');
+      setSelectedId(id);
+      return;
+    }
+    setChatMotionState('exit');
+    const delay = getUiPreferenceSnapshot().effectiveMotion === 'off' ? 0 : 260;
+    contactSwitchTimerRef.current = window.setTimeout(() => {
+      contactSwitchTimerRef.current = null;
+      setSelectedId(id);
+      setChatMotionState('enter');
+    }, delay);
+  }, [applyHeartbeat, reconcileMessages]);
 
   const unread = useMemo(() => Object.fromEntries(
     contacts.map((contact) => [contact.id, readStates[contact.id]?.main.unreadCount ?? 0])
@@ -239,14 +350,19 @@ export default function App() {
         user={user}
         onUserClick={() => setUserConfigOpen(true)}
         onWorkers={() => setWorkerPanelOpen(true)}
+        onLedger={() => setLedgerPanelOpen(true)}
         onPublishStatus={() => setPublishStatusOpen(true)}
       />
       {selected ? (
         <ChatPane
+          key={selected.id}
+          motionState={chatMotionState}
           contact={selected}
           contacts={contacts}
           messages={messages[selected.id] ?? []}
           status={statuses[selected.id] ?? { state: 'idle' }}
+          heartbeat={heartbeats[selected.id] ?? { contactId: selected.id, active: false }}
+          onHeartbeat={applyHeartbeat}
           user={user}
           onBack={() => select(null)}
           readState={(readStates[selected.id] ?? emptyReadStates()).main}
@@ -255,7 +371,7 @@ export default function App() {
               .then(({ readState }) => applyReadState(selected.id, readState))
               .catch(() => {});
           }}
-          onLoadEarlier={() => void loadEarlier(selected.id)}
+          onLoadEarlier={() => loadEarlier(selected.id)}
           onSettings={() => setConfigFor({ contact: selected })}
         />
       ) : (
@@ -266,6 +382,7 @@ export default function App() {
       )}
       {userConfigOpen && <UserConfig user={user} onClose={() => setUserConfigOpen(false)} />}
       {workerPanelOpen && <WorkerPanel onClose={() => setWorkerPanelOpen(false)} />}
+      {ledgerPanelOpen && <LedgerPanel onClose={() => setLedgerPanelOpen(false)} />}
       {publishStatusOpen && <PublishStatusPanel onClose={() => setPublishStatusOpen(false)} />}
     </div>
   );

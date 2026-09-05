@@ -22,8 +22,12 @@ fs.mkdirSync(dataDir, { recursive: true });
 
 const dbPath = path.join(dataDir, 'hub.db');
 const db = openDb(dbPath);
+const previousHubToken = process.env.HUB_TOKEN;
+const previousVaultToken = process.env.VAULT_TOKEN;
+process.env.HUB_TOKEN = 'smoke-only-hub-token';
+process.env.VAULT_TOKEN = 'smoke-only-vault-token';
 db.prepare('INSERT INTO contacts (id, name, backend, kind, config) VALUES (?, ?, ?, ?, ?)').run(
-  'claude', 'Claude', 'claude-cli', 'dm', JSON.stringify({ cwd: 'claude' })
+  'claude', 'Claude', 'claude-cli', 'dm', JSON.stringify({ cwd: 'claude', heartbeat: { enabled: true } })
 );
 const agent = db.prepare('SELECT * FROM contacts WHERE id = ?').get('claude') as ContactRow;
 
@@ -41,6 +45,8 @@ const factory = new BackendFactory({
   config,
   vault: {} as any, // 只用于开关 memory MCP，不发请求
   jobStore: null,
+  broker: {} as any,
+  heartbeat: {} as any,
   prompts: new PromptComposer(null, new MessageRepo(db), agentsDir),
 });
 
@@ -65,13 +71,21 @@ assert.ok(
   !fs.existsSync(path.join(agentsDir, 'claude', 'mcp.gateway.json')),
   '不得写进代码检出的 agents 目录——那里在生产上是只读挂载'
 );
-assert.ok(
-  JSON.parse(fs.readFileSync(generated, 'utf-8')).mcpServers['memory-vault'],
-  '生成内容仍应包含 memory-vault server'
-);
+const generatedConfig = JSON.parse(fs.readFileSync(generated, 'utf-8'));
+const memoryAuthorization = generatedConfig.mcpServers['memory-vault']?.headers?.Authorization;
+const hubAuthorization = generatedConfig.mcpServers.hub?.headers?.Authorization;
+assert.equal(memoryAuthorization, `Bearer ${process.env.VAULT_TOKEN}`);
+assert.match(memoryAuthorization, /^Bearer /);
+assert.doesNotMatch(memoryAuthorization, /\$\{/);
+assert.match(hubAuthorization, /^Bearer /, 'hub MCP 同样应在生成时写入真实 bearer');
+assert.doesNotMatch(hubAuthorization, /\$\{/);
 
 // Windows 上 sqlite 句柄没关就删目录会 EPERM；清理是尽力而为，别因此判失败。
 db.close();
+if (previousHubToken === undefined) delete process.env.HUB_TOKEN;
+else process.env.HUB_TOKEN = previousHubToken;
+if (previousVaultToken === undefined) delete process.env.VAULT_TOKEN;
+else process.env.VAULT_TOKEN = previousVaultToken;
 try {
   fs.rmSync(root, { recursive: true, force: true });
 } catch {}

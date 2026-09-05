@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Hub Telegram shell visual fixture</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <style>
+      *, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }
+      button, textarea, select, input { pointer-events: none; }
+      .fixture-swatch { width: 64px; height: 64px; border-radius: 12px; background: linear-gradient(135deg, #9d8cf5, #52e0a2); }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import { BUILTIN_THEMES } from '/src/theme/builtins.ts';
+      import { applyThemeManifest } from '/src/theme/store.ts';
+
+      let capturedErrors = 0;
+      window.addEventListener('error', () => { capturedErrors += 1; });
+      window.addEventListener('unhandledrejection', () => { capturedErrors += 1; });
+      const originalConsoleError = console.error;
+      console.error = (...args) => { capturedErrors += 1; originalConsoleError(...args); };
+      const params = new URLSearchParams(location.search);
+      const scenario = params.get('scenario') || 'contacts';
+      const theme = BUILTIN_THEMES.find((candidate) => candidate.id === params.get('theme')) || BUILTIN_THEMES[0];
+      const mode = params.get('mode') === 'light' ? 'light' : 'dark';
+      applyThemeManifest(theme, mode);
+      const paths = {
+        back: '<path d="M19 12H5"/><path d="m11 18-6-6 6-6"/>',
+        check: '<path d="m5 12 4 4L19 6"/>',
+        close: '<path d="m6 6 12 12"/><path d="m18 6-12 12"/>',
+        copy: '<rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+        down: '<path d="m7 10 5 5 5-5"/>',
+        image: '<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="8.5" cy="9" r="1.5"/><path d="m21 15-5-5L5 20"/>',
+        plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+        refresh: '<path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.1 9A7 7 0 0 1 18.3 6L20 8"/><path d="M17.9 15A7 7 0 0 1 5.7 18L4 16"/>',
+        runtime: '<path d="M4 5h16v14H4z"/><path d="m7 13 3-3-3-3"/><path d="M12 15h5"/>',
+        search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>',
+        send: '<path d="m4 4 17 8-17 8 3-8Z"/><path d="M7 12h14"/>',
+        settings: '<circle cx="12" cy="12" r="3"/><path d="M4 12h2m12 0h2M12 4v2m0 12v2m-6-4 1.5-1.5m9-9L18 4m0 16-1.5-1.5m-9-9L6 8"/>',
+        thinking: '<path d="M8 18h8"/><path d="M9 22h6"/><path d="M12 2a7 7 0 0 0-4 12.7V16h8v-1.3A7 7 0 0 0 12 2Z"/>',
+        tool: '<path d="M14.7 6.3a4 4 0 0 0-5-5L12 3.6 9.6 6 7.3 3.7a4 4 0 0 0 5 5L20 16.4a2.5 2.5 0 0 1-3.6 3.6L8.7 12.3a4 4 0 0 0-5-5"/>',
+        trash: '<path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="m6 7 1 14h10l1-14"/>',
+        worker: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4m-4-8 2-2-2-2m5 4h3"/>',
+      };
+      const icon = (name, size = 20) => `<svg class="icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name]}</svg>`;
+
+      const contactRow = (avatar, name, note, time, options = {}) => `<button class="contact-item${options.selected ? ' selected' : ''}"><span class="avatar">${avatar}</span><span class="contact-info"><span class="contact-name">${name}${options.busy ? '<span class="state-dot busy"></span>' : ''}</span><span class="contact-preview">${note}</span><span class="contact-kind-note">${options.kind || '订阅'}</span></span><span class="contact-meta"><span class="contact-time">${time}</span>${options.unread ? `<span class="unread-badge">${options.unread}</span>` : ''}</span></button>`;
+      const contacts = `<aside class="contact-list"><header class="contact-list-header"><h1>ai-hub</h1><span class="header-btns"><button class="add-btn publish-btn">${icon('refresh')}</button><button class="add-btn">${icon('worker')}</button><button class="user-btn avatar">鸢</button></span></header><div class="contact-discovery"><label class="contact-search">${icon('search')}<input placeholder="搜索会话"/><button>${icon('close')}</button></label><div class="contact-folders"><button class="selected">全部</button><button>订阅</button><button>API</button><button>群聊</button></div></div><div class="contact-scroll">${contactRow('🦊', 'Codex', '正在整理 Telegram shell…', '14:31', { selected: true, busy: true, unread: 2 })}${contactRow('🍊', 'Claude', '长会话性能约束保持生效', '14:22')}${contactRow('✨', 'Aye', 'Worker 在线', '13:58')}${contactRow('💎', 'Gem', '暂无新消息', '昨天', { kind: 'API' })}${contactRow('🌌', '协作会议室', 'Codex：视觉后对照已生成', '14:28', { kind: '群聊', unread: 5 })}</div><button class="primary-fab">${icon('plus')}<span>接入新 AI</span></button></aside>`;
+
+      const header = (name, avatar, runtime = false) => `<header class="chat-header"><button class="back-btn">${icon('back', 24)}</button><span class="avatar chat-avatar">${avatar}</span><div class="chat-title"><span class="chat-title-name"><span>${name}</span></span><span class="chat-state-dot"></span><span class="chat-status">正在输入…</span></div><div class="chat-header-controls"><button class="runtime-btn${runtime ? ' open' : ''}">${icon('runtime', 24)}</button></div></header>`;
+      const userBubble = `<div class="message-timeline-item"><div class="msg-group"><div class="bubble-row mine"><div class="bubble bubble-mine"><div class="markdown"><p>把第二步做成完整 Telegram shell，性能机制一条都别动。</p></div></div><span class="avatar bubble-avatar">鸢</span></div><div class="msg-actions mine"><time class="msg-time">14:25</time><button>${icon('trash')}<span>删除</span></button></div></div></div>`;
+      const cluster = (avatar, name, body, options = {}) => `<div class="assistant-turn-cluster"><div class="assistant-turn-layout"><span class="avatar turn-avatar">${avatar}</span><div class="assistant-turn-content"><span class="assistant-turn-name">${name}</span>${options.process === false ? '' : `<div class="turn-process"><button class="proc-strip">${icon('thinking')}<span>过程</span><small>1 段思考 · 3 次工具</small>${icon('down')}</button></div>`}<div class="assistant-turn-body"><div class="message-timeline-item"><div class="msg-group"><div class="bubble-row theirs clustered"><div class="bubble bubble-theirs"><div class="markdown">${body}</div></div></div></div>${options.extra || ''}</div></div>${options.jobs || ''}<div class="msg-actions"><time class="msg-time">${options.time || '14:27'}</time><button class="del">${icon('trash')}<span>删除</span></button></div></div></div></div>`;
+      const codeBody = `<p>骨架已经收敛：标题栏只保留身份与即时状态，过程默认折叠。</p><ul><li>历史列表最多渲染 200 条</li><li>流式 delta 仍按帧合并</li></ul><blockquote>代码块和表格会突破普通气泡宽度。</blockquote><div class="code-card"><div class="code-card-bar"><span class="code-lang">TSX</span><span class="spacer"></span><button class="code-act primary">${icon('copy')}<span>复制</span></button><button class="code-act">${icon('down')}<span>折叠</span></button></div><pre><code>const cluster = memo(AssistantTurnCluster, sameMessageReferences);</code></pre></div>`;
+      const receipt = `<div class="side-system-card receipt"><div class="side-system-head">WORKER RECEIPT · DELIVERED</div><pre>Telegram shell validation passed\n8 张“后”截图已生成</pre></div>`;
+      const job = `<div class="job-thread done"><div class="job-thread-head-row"><button class="job-thread-head"><span class="job-dot done"></span><b class="icon-label">${icon('worker')}Telegram shell</b><span class="job-thread-brief">pc-User · 前端视觉改造</span><small>12m 08s</small><span class="job-thread-open">查看执行过程</span></button><button class="job-thread-hide">${icon('close')}</button></div></div>`;
+      const composer = `<div class="composer-shell has-attachments"><div class="image-preview-strip"><div class="image-preview"><div class="fixture-swatch"></div><button>${icon('close')}</button></div><span class="image-privacy-note">图片会发送给目标模型；请先确认敏感信息。</span></div><footer class="composer"><button class="attach-btn">${icon('image', 24)}</button><textarea rows="1">附件预览从浮动面板上方展开</textarea><button class="send-btn">${icon('send', 24)}</button></footer></div>`;
+      const runtime = `<aside class="runtime" aria-label="运行时"><div class="runtime-row" style="background:none;padding:0"><b style="font-size:14px">运行时</b><button class="code-act">${icon('close')}</button></div><section><h3>订阅额度</h3><div class="quota"><div class="quota-head"><span>5 小时</span><b>62%</b></div><div class="quota-track"><div class="quota-fill" style="width:62%"></div></div><div class="quota-note">02:18 后重置</div></div><div class="quota"><div class="quota-head"><span>每周</span><b>41%</b></div><div class="quota-track"><div class="quota-fill week" style="width:41%"></div></div></div></section><section><h3>TOKEN</h3><div class="runtime-kv"><span>本轮</span><span>8.4k↑ 1.7k↓</span></div><div class="runtime-kv"><span>缓存</span><span>31k读 0建</span></div><div class="runtime-kv"><span>今日</span><span>56k↑ 12k↓</span></div></section><section><h3>模型</h3><div class="runtime-row"><select class="runtime-select"><option>GPT-5 Codex</option></select></div><div class="seg"><button class="seg-btn">低</button><button class="seg-btn selected">高</button><button class="seg-btn">超高</button></div></section><section class="heartbeat-section"><h3>心跳</h3><div class="heartbeat-active"><div class="heartbeat-status">心跳中 · 手动常开</div><button class="heartbeat-stop">停止心跳</button></div></section><div class="runtime-foot"><button>${icon('check')}<span>批量选择消息</span></button><button>${icon('settings')}<span>联系人设置</span></button></div></aside>`;
+      const privateChat = `<main class="chat-pane runtime-open">${header('Codex', '🦊', true)}${runtime}<div class="message-scroll"><button class="load-earlier">加载更早的</button>${userBubble}${cluster('🦊', 'Codex', codeBody)}</div>${composer}</main>`;
+      const groupChat = `<main class="chat-pane">${header('协作会议室', '🌌')}<div class="message-scroll">${cluster('🍊', 'Claude', '<p>冻结修复已经合并，200 条 DOM 上限和 50ms 合并仍在。</p>', { process: false, time: '14:21' })}${userBubble}${cluster('🦊', 'Codex', '<p>收到。群聊只显示一次成员头像和名字，Worker 回执继续保留独立语义。</p>', { extra: receipt, jobs: job })}</div>${composer}</main>`;
+      const worker = `<div class="modal-backdrop"><section class="worker-panel has-selection"><header class="worker-topbar"><b>PC Worker</b><small>任务与执行过程</small><span class="spacer"></span><button class="primary-btn">${icon('plus')}<span>派单</span></button><button class="modal-close">${icon('close')}</button><div class="worker-chips"><span class="worker-chip"><span class="job-dot done"></span>pc-User <small>在线</small></span><span class="worker-chip paused"><span class="job-dot paused"></span>laptop <small>暂停</small></span></div></header><div class="worker-main"><div class="job-list"><button class="job-item selected"><span class="job-item-head"><span class="job-dot done"></span><b>Telegram shell</b><small>14:32</small></span><span class="job-item-prompt">重做会话骨架、turn cluster 与移动端</span><code>d7c632ee</code></button><button class="job-item"><span class="job-item-head"><span class="job-dot running"></span><b>发布验收</b><small>14:18</small></span><span class="job-item-prompt">等待 User 确认部署</span></button></div><section class="job-detail"><header class="job-detail-head"><button class="job-detail-back">${icon('back')}<span>列表</span></button><span class="job-dot done"></span><b>Telegram shell</b><small>pc-User · 已完成</small><code>origin/master</code><span class="perm-chip">Shell</span></header><div class="job-detail-scroll"><section class="delivery-summary closed_loop"><strong>交付状态 · 等待部署</strong><span>构建、测试和视觉截图已通过</span></section><div class="job-msg prompt"><small>任务</small><pre>只改前端交互骨架与视觉结构。</pre></div><article class="job-msg result"><small><span class="job-msg-kind">RESULT</span> Codex · 14:32</small><pre>web build 通过\nweb tests 通过\n375px 无横向溢出</pre></article></div></section></div></section></div>`;
+      const themeCard = (candidate) => {
+        const variant = candidate.variants[mode];
+        const selected = candidate.id === theme.id;
+        const incoming = variant.bubbles.incomingGradient.enabled ? `linear-gradient(${variant.bubbles.incomingGradient.angle}deg, ${variant.bubbles.incomingGradient.from}, ${variant.bubbles.incomingGradient.to})` : variant.bubbles.incoming;
+        const outgoing = variant.bubbles.outgoingGradient.enabled ? `linear-gradient(${variant.bubbles.outgoingGradient.angle}deg, ${variant.bubbles.outgoingGradient.from}, ${variant.bubbles.outgoingGradient.to})` : variant.bubbles.outgoing;
+        return `<button class="theme-card${selected ? ' selected' : ''}"><span class="theme-preview" style="--preview-canvas:${variant.surfaces.canvas};--preview-panel:${variant.surfaces.panel};--preview-accent:${variant.primary.accent};--preview-incoming:${incoming};--preview-outgoing:${outgoing}"><span class="theme-preview-rail"></span><span class="theme-preview-chat"><span class="theme-preview-bubble incoming"></span><span class="theme-preview-bubble outgoing"></span></span></span><span class="theme-card-copy"><b>${candidate.name}</b><small>${candidate.description}</small><em>${candidate.wallpaperAttribution.source} · ${candidate.wallpaperAttribution.license}</em></span><span class="theme-selected-mark">${selected ? '使用中' : '选择'}</span></button>`;
+      };
+      const themes = `<div class="modal-backdrop"><section class="modal user-config-modal theme-settings-modal"><header class="modal-header"><h2>我的资料与设置</h2><button class="modal-close">${icon('close')}</button></header><div class="modal-body"><section class="theme-settings-card"><div class="theme-settings-head"><span><strong>主题</strong><small>只替换语义色与内置壁纸，不执行主题包中的样式或脚本。</small></span><span class="theme-mode"><button class="${mode === 'light' ? 'selected' : ''}">亮色</button><button class="${mode === 'dark' ? 'selected' : ''}">暗色</button><button>跟随系统</button></span></div><div class="theme-list">${BUILTIN_THEMES.map(themeCard).join('')}</div><div class="theme-package-actions"><button class="ghost-btn">导入 JSON 主题包</button><button class="ghost-btn">导出当前主题</button><small>ThemeManifest v1 · 最大 128 KiB · 未知字段会被拒绝</small></div></section></div><footer class="modal-footer"><span class="spacer"></span><button class="ghost-btn">取消</button><button class="primary-btn">保存</button></footer></section></div>`;
+      const shell = scenario === 'contacts'
+        ? `<div class="app">${contacts}<div class="chat-empty">选择一个会话</div></div>`
+        : scenario === 'private'
+          ? `<div class="app chat-open">${contacts}${privateChat}</div>`
+          : scenario === 'group'
+            ? `<div class="app chat-open">${contacts}${groupChat}</div>`
+            : scenario === 'worker'
+              ? worker
+              : themes;
+      document.querySelector('#root').innerHTML = shell;
+      document.documentElement.dataset.visualReady = 'true';
+      requestAnimationFrame(() => {
+        const app = document.querySelector('.app, .worker-panel');
+        const messageScroll = document.querySelector('.message-scroll');
+        document.documentElement.dataset.pageOverflow = String(Math.max(0, (app?.scrollWidth || 0) - innerWidth));
+        document.documentElement.dataset.messageOverflow = String(Math.max(0, (messageScroll?.scrollWidth || 0) - (messageScroll?.clientWidth || 0)));
+        document.documentElement.dataset.messageScrollTop = String(messageScroll?.scrollTop || 0);
+        document.documentElement.dataset.consoleErrors = String(capturedErrors);
+      });
+    </script>
+  </body>
+</html>

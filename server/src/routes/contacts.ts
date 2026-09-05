@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import type { AgentManager } from '../agents/manager.js';
 import { CodexAppServerBackend, type CodexModelOption } from '../agents/codexAppServer.js';
+import { composeApiModels, listApiModels } from '../agents/apiModels.js';
 import { GrokCliBackend, type GrokModelOption } from '../agents/grokCli.js';
+import { OpencodeCliBackend, type OpencodeModelOption } from '../agents/opencodeCli.js';
 import type { HubConfig } from '../config.js';
 import type { Db, ContactRow } from '../db.js';
 import type { SseHub } from '../sse.js';
@@ -63,6 +65,21 @@ function dedupeModels(models: ModelOption[], current: string): ModelOption[] {
   return all.filter((model, index) => all.findIndex((m) => m.id === model.id) === index);
 }
 
+/** Catalog JSON can override live CLI labels without waiting for a restart. */
+function applyCatalogMeta(models: ModelOption[], catalog: ModelOption[]): ModelOption[] {
+  const byId = new Map(catalog.filter((item) => item.id).map((item) => [item.id, item]));
+  return models.map((model) => {
+    const overlay = byId.get(model.id);
+    if (!overlay) return model;
+    return {
+      id: model.id,
+      label: overlay.label || model.label,
+      description: overlay.description ?? model.description,
+      isDefault: overlay.isDefault === true || model.isDefault === true,
+    };
+  });
+}
+
 export function contactsRouter(
   db: Db,
   sse: SseHub,
@@ -73,6 +90,8 @@ export function contactsRouter(
   const r = Router();
   let codexCache: { expires: number; models: CodexModelOption[] } | null = null;
   let grokCache: { expires: number; models: GrokModelOption[] } | null = null;
+  let opencodeCache: { expires: number; models: OpencodeModelOption[] } | null = null;
+  const apiCaches = new Map<string, { expires: number; models: ModelOption[] }>();
 
   const catalogLog = (message: string) => logger?.warn({ component: 'models' }, message);
   const catalogOf = (backend: string) => modelCatalog(backend, catalogLog);
@@ -103,6 +122,48 @@ export function contactsRouter(
       };
     }
     return grokCache.models;
+  };
+
+  const loadOpencodeModels = async (cfg: Record<string, any>): Promise<OpencodeModelOption[]> => {
+    if (!opencodeCache || opencodeCache.expires < Date.now()) {
+      opencodeCache = {
+        expires: Date.now() + 10 * 60_000,
+        models: await OpencodeCliBackend.listModels({
+          cliPath: cfg.cliPath ?? hubConfig.opencode.cliPath,
+          cwd: hubConfig.agentsDir,
+          log: (message) => logger?.info({ component: 'models' }, message),
+        }),
+      };
+    }
+    return opencodeCache.models;
+  };
+
+  const resolveApiKey = (cfg: Record<string, any>): string => {
+    if (typeof cfg.apiKey === 'string' && cfg.apiKey) return cfg.apiKey;
+    if (typeof cfg.apiKeyRef === 'string' && cfg.apiKeyRef) return process.env[cfg.apiKeyRef] ?? '';
+    return '';
+  };
+
+  const loadApiProviderModels = async (cfg: Record<string, any>): Promise<ModelOption[]> => {
+    const provider = typeof cfg.provider === 'string' ? cfg.provider : 'openai-compat';
+    const baseUrl = typeof cfg.baseUrl === 'string' ? cfg.baseUrl : '';
+    const apiKey = resolveApiKey(cfg);
+    if (!apiKey) throw new Error('缺少 API Key');
+    const cacheKey = `${provider}\0${baseUrl}\0${apiKey}`;
+    const cached = apiCaches.get(cacheKey);
+    if (cached && cached.expires > Date.now()) return cached.models;
+    const models = await listApiModels({
+      provider,
+      baseUrl,
+      apiKey,
+      log: (message) => logger?.info({ component: 'models' }, message),
+    });
+    if (apiCaches.size > 32) {
+      const oldest = apiCaches.keys().next().value;
+      if (oldest) apiCaches.delete(oldest);
+    }
+    apiCaches.set(cacheKey, { expires: Date.now() + 10 * 60_000, models });
+    return models;
   };
 
   const publicRow = (c: ContactRow) => {
@@ -190,6 +251,42 @@ export function contactsRouter(
       if (current && !models.some((model) => model.id === current)) {
         models.push({ id: current, label: current });
       }
+    } else if (contact.backend === 'opencode-cli') {
+      const catalog = catalogOf('opencode-cli');
+      const defaultModel = catalog.models.find((model) => model.id === '')
+        ?? { id: '', label: '默认（OpenCode 自动选择）', isDefault: true };
+      try {
+        models = applyCatalogMeta(await loadOpencodeModels(cfg), catalog.models);
+        dynamic = true;
+      } catch (e: any) {
+        warning = `OpenCode 模型列表暂时不可用：${e.message}`;
+      }
+      models = [
+        defaultModel,
+        ...models,
+        ...catalog.models.filter((model) => model.id !== ''),
+        ...customModels(cfg),
+      ];
+      efforts = catalog.efforts;
+      currentEffort = typeof cfg.effort === 'string' ? cfg.effort : '';
+    } else if (contact.backend === 'api') {
+      const provider = typeof cfg.provider === 'string' ? cfg.provider : 'openai-compat';
+      const catalog = [
+        ...catalogOf('api').models,
+        ...catalogOf(`api:${provider}`).models,
+      ];
+      try {
+        models = await loadApiProviderModels(cfg);
+        dynamic = true;
+      } catch (e: any) {
+        warning = `API 模型列表暂时不可用：${e.message}`;
+      }
+      models = composeApiModels({
+        live: models,
+        catalog,
+        custom: customModels(cfg),
+        current,
+      });
     } else {
       models = [...customModels(cfg)];
       if (current) models.unshift({ id: current, label: current });
@@ -257,16 +354,16 @@ export function contactsRouter(
       .prepare('SELECT * FROM contacts WHERE id = ? AND enabled = 1')
       .get(req.params.id) as ContactRow | undefined;
     if (!contact) return res.status(404).json({ error: 'contact not found' });
-    if (contact.backend !== 'claude-cli' && contact.backend !== 'codex')
+    if (contact.backend !== 'claude-cli' && contact.backend !== 'codex' && contact.backend !== 'opencode-cli')
       return res.status(400).json({ error: '当前联系人不支持推理强度' });
     if (manager.isAgentBusy(contact.id)) {
       return res.status(409).json({ error: '正在回复，等这轮结束再切强度' });
     }
 
     const effort: string | null = typeof req.body?.effort === 'string' ? req.body.effort.trim() : null;
-    const validEffort = contact.backend === 'claude-cli'
-      ? (catalogOf('claude-cli').efforts ?? []).some((item) => item.id === effort)
-      : effort === '' || CODEX_EFFORT_IDS.some((id) => id === effort);
+    const validEffort = contact.backend === 'codex'
+      ? effort === '' || CODEX_EFFORT_IDS.some((id) => id === effort)
+      : (catalogOf(contact.backend).efforts ?? []).some((item) => item.id === effort);
     if (effort === null || !validEffort) {
       return res.status(400).json({ error: 'effort 无效' });
     }
@@ -348,7 +445,7 @@ export function contactsRouter(
     }
     const backendKind = isRoom
       ? 'room'
-      : ['claude-cli', 'codex', 'grok-cli', 'api'].includes(backend)
+      : ['claude-cli', 'codex', 'grok-cli', 'opencode-cli', 'api'].includes(backend)
         ? backend
         : 'api';
     const checked = validateContactConfig(backendKind, isRoom ? 'room' : 'dm', cfg);

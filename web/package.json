@@ -1,11 +1,14 @@
 {
   "name": "web",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node test/externalLinks.test.mjs && node test/messageMerge.test.mjs && node test/messageWarnings.test.mjs && node test/events.test.mjs && node test/sendIdempotency.test.mjs && node test/statusText.test.mjs && node test/appUpdate.test.mjs && node test/jobThread.test.mjs && node test/sideJobActions.test.mjs && node test/unreadState.test.mjs && node test/messagePresentation.test.mjs && node test/time.test.mjs && node test/confirmDialog.test.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "node test/sourceLint.test.mjs",
+    "test:browser-motion": "node test/browserMotionValidation.mjs",
+    "test": "node test/externalLinks.test.mjs && node test/messageMerge.test.mjs && node test/longSessionPerformance.test.mjs && node test/messageWarnings.test.mjs && node test/events.test.mjs && node test/workerState.test.mjs && node test/sendIdempotency.test.mjs && node test/statusText.test.mjs && node test/appUpdate.test.mjs && node test/jobThread.test.mjs && node test/sideJobActions.test.mjs && node test/unreadState.test.mjs && node test/messagePresentation.test.mjs && node test/telegramShell.test.mjs && node test/themeManifest.test.mjs && node test/motionSound.test.mjs && node test/time.test.mjs && node test/confirmDialog.test.mjs && node test/modelPicker.test.mjs",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "preview": "vite preview"
   },

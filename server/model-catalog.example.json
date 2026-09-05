@@ -6,6 +6,8 @@
       { "id": "", "label": "默认（Claude CLI 自动选择）", "isDefault": true },
       { "id": "opus", "label": "Opus（最新）" },
       { "id": "sonnet", "label": "Sonnet（最新）" },
+      { "id": "fable", "label": "Fable（最新）" },
+      { "id": "claude-fable-5-1", "label": "Fable 5.1" },
       { "id": "claude-opus-5", "label": "Opus 5" },
       { "id": "claude-opus-4-8", "label": "Opus 4.8" }
     ],
@@ -18,5 +20,27 @@
   },
 
   "_shorthand": "只想给旧版 Grok CLI 配兜底模型，可以直接写成数组；新版优先运行 grok models 动态发现：",
-  "grok-cli": ["grok-4.6", "grok-4.5"]
+  "grok-cli": ["grok-4.6", "grok-4.5"],
+
+  "_api": "API 联系人优先拉上游 /models；下面两段是热更新标签覆盖和查询失败时的兜底，改完存盘立即生效。",
+  "api:gemini": [
+    { "id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash" },
+    { "id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro" }
+  ],
+  "api:anthropic": [
+    { "id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6" }
+  ],
+  "api:openai-compat": [],
+
+  "opencode-cli": {
+    "models": [
+      { "id": "", "label": "默认（OpenCode 自动选择）", "isDefault": true },
+      { "id": "opencode-go/muse-spark-1.2-contributor", "label": "Muse Spark 1.2 Contributor (Go)" }
+    ],
+    "efforts": [
+      { "id": "", "label": "默认强度", "isDefault": true },
+      { "id": "high", "label": "high" },
+      { "id": "xhigh", "label": "xhigh" }
+    ]
+  }
 }

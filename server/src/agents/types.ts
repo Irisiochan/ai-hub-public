@@ -1,3 +1,5 @@
+import type { TurnInterruptionReason } from './turnInterruption.js';
+
 export type TurnEvent =
   | { type: 'session'; sessionId: string }
   | { type: 'delta'; text: string }
@@ -5,7 +7,7 @@ export type TurnEvent =
   | { type: 'tool_use'; name: string; inputSummary: string }
   | { type: 'tool_result'; name: string; ok: boolean; summary: string }
   | { type: 'done'; finalText: string; usage?: TokenUsage }
-  | { type: 'error'; message: string; fatal: boolean };
+  | { type: 'error'; message: string; fatal: boolean; reason?: TurnInterruptionReason };
 
 export interface TokenUsage {
   /**
@@ -53,10 +55,15 @@ export interface TurnInput {
   roomMessageIds?: number[];
   /** Trusted absolute paths resolved by the gateway from persisted attachments. */
   imagePaths?: string[];
+  /**
+   * 上游只返回思考/工具、没有可见正文时的替代文本。心跳轮用 HEARTBEAT_OK，
+   * 好走静默剪枝；普通聊天不设，仍报「没有可显示的正文」。输出预算耗尽不走这条。
+   */
+  emptyVisibleText?: string;
 }
 
 export interface AgentBackend {
-  readonly kind: 'claude-cli' | 'codex' | 'grok-cli' | 'api';
+  readonly kind: 'claude-cli' | 'codex' | 'grok-cli' | 'opencode-cli' | 'api';
   /** Spawn/connect. resumeToken = claude session_id / codex threadId / null.
    *  Must not throw on a stale token — fall back to fresh and emit a new 'session'. */
   start(resumeToken: string | null): Promise<void>;

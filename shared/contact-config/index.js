@@ -33,6 +33,22 @@ export const DelegationConfigSchema = z.object({
   maxOpenJobs: z.coerce.number().int().min(1).max(10).default(3),
 }).passthrough().default({});
 
+// Taobao desktop-client bridge inside the heartbeat window. `mode` is the
+// gateway-side policy: browse = look only, cart = browse + add_to_cart,
+// full = everything. Default is cart. The PC Worker's own `allowTaobao`
+// gate must also be open for any of it to work.
+export const HeartbeatTaobaoConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  mode: z.enum(['browse', 'cart', 'full']).default('cart'),
+}).passthrough().default({});
+
+export const HeartbeatConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  taobao: HeartbeatTaobaoConfigSchema,
+  // Consume and discard the retired fixed interval while preserving other future fields.
+  intervalMinutes: z.unknown().optional(),
+}).passthrough().transform(({ intervalMinutes: _retired, ...config }) => config).default({});
+
 export const RoutingConfigSchema = z.object({
   enabled: z.boolean().default(false),
   recipientKey: trimmed(200).optional(),
@@ -48,14 +64,20 @@ const modelOption = z.union([
   z.object({ id: trimmed(200).min(1), label: trimmed(300).optional() }).passthrough(),
 ]);
 
+const optionalTurnTimeout = z.coerce.number().int().positive().max(24 * 60 * 60_000).optional();
+
 const commonShape = {
   cliPath: optionalText(1000),
   cwd: optionalText(1000),
   model: z.string().trim().max(200).default(''),
   modelOptions: z.array(modelOption).max(100).default([]),
   effort: z.string().trim().max(40).default(''),
+  turnTimeoutMs: optionalTurnTimeout,
+  turnIdleTimeoutMs: optionalTurnTimeout,
+  turnHardTimeoutMs: optionalTurnTimeout,
   memory: MemoryConfigSchema,
   delegation: DelegationConfigSchema,
+  heartbeat: HeartbeatConfigSchema,
   routing: RoutingConfigSchema,
   projectAccess: ProjectAccessSchema,
   affect: z.enum(['on', 'off']).default('off'),
@@ -131,24 +153,37 @@ export const ContactConfigSchemas = {
   'claude-cli': ClaudeContactConfigSchema,
   codex: CodexContactConfigSchema,
   'grok-cli': GrokContactConfigSchema,
+  'opencode-cli': GrokContactConfigSchema,
   api: ApiContactConfigSchema,
   room: RoomContactConfigSchema,
 };
+
+export const CLI_CONTACT_BACKENDS = ['claude-cli', 'codex', 'grok-cli', 'opencode-cli'];
+
+export function isCliContactBackend(backend) {
+  return CLI_CONTACT_BACKENDS.includes(backend);
+}
 
 export function contactConfigSchema(backend, kind = 'dm') {
   if (kind === 'room' || backend === 'room') return RoomContactConfigSchema;
   return ContactConfigSchemas[backend] ?? ApiContactConfigSchema;
 }
 
-function derivedDefaults(backend, parsed) {
-  if (backend !== 'api') return parsed;
-  if (parsed.baseUrl) return parsed;
+function derivedDefaults(backend, parsed, input) {
+  let derived = parsed;
+  const heartbeatInput = input && typeof input === 'object' && input.heartbeat && typeof input.heartbeat === 'object'
+    ? input.heartbeat
+    : null;
+  if ((isCliContactBackend(backend) || backend === 'api') && heartbeatInput?.enabled === undefined) {
+    derived = { ...derived, heartbeat: { ...derived.heartbeat, enabled: true } };
+  }
+  if (backend !== 'api' || derived.baseUrl) return derived;
   const baseUrl = parsed.provider === 'anthropic'
     ? 'https://api.anthropic.com/v1/messages'
     : parsed.provider === 'gemini'
       ? 'https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse'
       : 'https://api.openai.com/v1/chat/completions';
-  return { ...parsed, baseUrl };
+  return { ...derived, baseUrl };
 }
 
 export function parseStoredContactConfig(backend, kind, raw) {
@@ -161,16 +196,17 @@ export function parseStoredContactConfig(backend, kind, raw) {
     }
   }
   const schema = contactConfigSchema(backend, kind);
-  const parsed = schema.safeParse(value && typeof value === 'object' ? value : {});
+  const input = value && typeof value === 'object' ? value : {};
+  const parsed = schema.safeParse(input);
   const data = parsed.success ? parsed.data : schema.parse({});
-  return derivedDefaults(backend, data);
+  return derivedDefaults(backend, data, input);
 }
 
 export function validateContactConfig(backend, kind, input) {
   const schema = contactConfigSchema(backend, kind);
   const parsed = schema.safeParse(input);
   if (!parsed.success) return parsed;
-  const data = derivedDefaults(backend, parsed.data);
+  const data = derivedDefaults(backend, parsed.data, input);
   const issues = [];
   if (backend === 'api') {
     if (!data.model) issues.push({ code: z.ZodIssueCode.custom, path: ['model'], message: 'model required' });

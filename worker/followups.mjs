@@ -2,6 +2,7 @@
  * Temporary-absence followups: "去洗澡" → later ask if done.
  * Cancel rules matter more than triggers — never nag after User already returned.
  */
+import { parseHubTimestampMs } from './hub-time.mjs';
 
 export const FOLLOWUP_STATUS_PENDING = 'pending';
 export const FOLLOWUP_STATUS_QUEUED = 'queued';
@@ -128,15 +129,9 @@ export function irisPresenceFromMessages(messages, {
   const thresholdMs = minutes * 60_000;
   const tsOf = typeof messageTimestampMs === 'function'
     ? messageTimestampMs
-    : (message) => {
-      const raw = message?.created_at ?? message?.createdAt ?? message?.timestamp ?? null;
-      if (raw == null || raw === '') return null;
-      if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
-      const asNumber = Number(raw);
-      if (Number.isFinite(asNumber) && !/[-T:]/.test(String(raw))) return asNumber;
-      const parsed = Date.parse(String(raw));
-      return Number.isFinite(parsed) ? parsed : null;
-    };
+    : (message) => parseHubTimestampMs(
+      message?.created_at ?? message?.createdAt ?? message?.timestamp ?? null,
+    );
   let latest = null;
   for (const message of Array.isArray(messages) ? messages : []) {
     if (!isUserMessage(message)) continue;

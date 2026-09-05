@@ -26,6 +26,7 @@
 - **条件注入（token round2）**：`TEMPORAL_CONTEXT_RULES` 仅在有回放/历史摘要/既有消息/resume
   时注入；`nsfwCraft` 联系人开关 `always|intimate|off`（默认 `intimate`，亲密场景 fail-open
   per-turn；`always` 才进 session preamble）。
+- per-turn 记忆检索会把标题/片段中的事件日相对本轮上海日标成已发生、当天、即将到来、未来或进行中；文件名的“记于”只表示记录日。
 
 ### ③b 联系人叠层 overlay——「某家 base 缺什么 / 多什么」
 

@@ -19,14 +19,14 @@ function fmtTokens(value: number): string {
 
 export default function CliFields(props: Props) {
   const { contact } = props;
-  const grok = contact.backend === 'grok-cli';
+  const grok = contact.backend === 'grok-cli' || contact.backend === 'opencode-cli';
 
   return (
     <>
       <div className="cfg-group">
         <h3>项目访问</h3>
         {grok ? (
-          <p className="cfg-note">grok-cli 后端暂不支持项目写权限。</p>
+          <p className="cfg-note">这个 CLI 后端暂不支持项目写权限。</p>
         ) : (
           <>
             <div className="switch-row">

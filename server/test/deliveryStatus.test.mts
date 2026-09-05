@@ -35,6 +35,23 @@ test('write delivery remains waiting for deploy without post-deploy evidence', (
   assert.match(value.label, /未收到部署证据/);
 });
 
+test('waiting_review is distinct from an authorization decision and generic unpushed work', () => {
+  const value = deriveDeliverySummary(job({
+    status: 'blocked',
+    delivery_state: 'blocked_unpushed',
+    delivery_meta: JSON.stringify({
+      declared: {
+        stage: 'waiting_review',
+        summary: '实现与全量验证已完成，等待独立 review。',
+        nextOwner: 'claude-review',
+      },
+    }),
+  }) as never);
+  assert.equal(value.state, 'waiting_review');
+  assert.equal(value.needsUserDecision, false);
+  assert.equal(value.nextOwner, 'claude-review');
+});
+
 test('declared production stages override the conservative delivery default', () => {
   const value = deriveDeliverySummary(job({
     delivery_meta: JSON.stringify({

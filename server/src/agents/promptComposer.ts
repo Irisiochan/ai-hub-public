@@ -110,8 +110,8 @@ export class PromptComposer {
 
     const memoryBlock = preamble;
     const roomBlock = this.roomFraming(ctx);
-    // C2：先算回放/既有历史，再决定是否注入时间语义。
-    // 红线：回放或历史摘要/既有消息在场时时间语义必须同场；纯新会话无历史才可省。
+    // API 每轮请求都复用这份静态 preamble，必须从空会话开始就带时间语义；
+    // CLI 仍按 C2：回放或历史摘要/既有消息在场时同场，纯新会话无历史可省。
     let replayBlock = '';
     if (!resumeToken) {
       replayBlock = this.bridge(ctx);
@@ -232,15 +232,16 @@ export class PromptComposer {
   }
 
   /**
-   * C2 gate: temporal rules co-present with replay/history/summary context.
-   * Pure brand-new conversation (no resume, no replay, no prior messages, no saved summary)
-   * may omit the block.
+   * API requests always carry temporal rules, including a process spawned from an empty
+   * conversation and kept alive for later turns. CLI keeps the C2 gate: replay/history/
+   * summary context requires the block; a pure brand-new CLI conversation may omit it.
    */
   private needsTemporalRules(
     ctx: PromptContext,
     resumeToken: string | null,
     replayBlock: string
   ): boolean {
+    if (ctx.agent.backend === 'api') return true;
     if (resumeToken) return true;
     if (replayBlock) return true;
     // 群聊共享摘要：member_id=''（与 DM 同一存储键）

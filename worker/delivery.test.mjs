@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   classifyDelivery,
+  collectStructuredReceipt,
   deliveryCompletesJob,
   DEFAULT_RECONCILE_GRACE_MS,
   extractDeliveryDeclaration,
@@ -245,6 +246,80 @@ test('delivery declarations preserve the human delivery milestone evidence', () 
       nextOwner: 'Codex',
     },
   );
+});
+
+test('waiting_review is accepted as a declared delivery stage', () => {
+  assert.deepEqual(
+    extractDeliveryDeclaration('{"delivery":{"committed":true,"pushed":false,"stage":"waiting_review","nextOwner":"claude-review"}}'),
+    { committed: true, pushed: false, stage: 'waiting_review', nextOwner: 'claude-review' },
+  );
+});
+
+test('structured delivery declarations preserve diffstat, changed files, and test conclusions', () => {
+  assert.deepEqual(
+    extractDeliveryDeclaration({
+      delivery: {
+        committed: true,
+        pushed: false,
+        diffstat: ' 3 files changed, 20 insertions(+), 2 deletions(-) ',
+        changedFiles: ['server/src/a.ts', 'server/src/b.ts'],
+        tests: [
+          { suite: 'server npm test', status: 'PASS' },
+          { suite: 'web npm test', pass: false, detail: 'one failure' },
+          { suite: '', status: 'pass' },
+        ],
+      },
+    }),
+    {
+      committed: true,
+      pushed: false,
+      diffstat: '3 files changed, 20 insertions(+), 2 deletions(-)',
+      changedFiles: {
+        files: ['server/src/a.ts', 'server/src/b.ts'],
+        total: 2,
+        truncated: false,
+      },
+      tests: [
+        { suite: 'server npm test', status: 'pass' },
+        { suite: 'web npm test', status: 'fail', detail: 'one failure' },
+      ],
+    },
+  );
+});
+
+test('worker computes the canonical structured receipt from git and transports declared tests', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-receipt-structured-'));
+  const git = (...args) => execFileSync('git', args, { cwd: root, stdio: 'ignore' });
+  try {
+    git('init', '--initial-branch=worker/test');
+    git('config', 'user.email', 'worker-test@example.invalid');
+    git('config', 'user.name', 'Worker Test');
+    fs.writeFileSync(path.join(root, 'one.txt'), 'one\n');
+    git('add', 'one.txt');
+    git('commit', '-m', 'baseline');
+    const before = await snapshotRepo(root);
+    fs.writeFileSync(path.join(root, 'one.txt'), 'one\ntwo\n');
+    fs.writeFileSync(path.join(root, 'two.txt'), 'new\n');
+    git('add', 'one.txt', 'two.txt');
+    git('commit', '-m', 'change');
+    const after = await snapshotRepo(root);
+    const receipt = await collectStructuredReceipt(root, before, after, {
+      committed: true,
+      pushed: false,
+      tests: [{ suite: 'worker npm test', status: 'pass' }],
+    });
+    assert.equal(receipt.branch, 'worker/test');
+    assert.equal(receipt.head, after.head);
+    assert.match(receipt.diffstat, /2 files changed/);
+    assert.deepEqual(receipt.changedFiles, {
+      files: ['one.txt', 'two.txt'],
+      total: 2,
+      truncated: false,
+    });
+    assert.deepEqual(receipt.tests, [{ suite: 'worker npm test', status: 'pass' }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('runner failure with no local changes is a clean failure', () => {

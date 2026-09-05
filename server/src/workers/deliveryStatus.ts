@@ -3,6 +3,7 @@ import type { JobRow } from '../db.js';
 export type HumanDeliveryState =
   | 'in_progress'
   | 'completed_not_delivered'
+  | 'waiting_review'
   | 'delivered_waiting_deploy'
   | 'online_waiting_validation'
   | 'closed_loop'
@@ -112,6 +113,17 @@ export function deriveDeliverySummary(row: Pick<
       '已上线，等待验收',
       '变更已经上线，正在等待或执行线上验收。',
       declaredOwner || '验收负责人',
+      false,
+      custom,
+    );
+  }
+
+  if (stage === 'waiting_review') {
+    return summary(
+      'waiting_review',
+      '等待独立 Review',
+      '实现与验证已经完成，当前停在独立 review 闸门。',
+      declaredOwner || 'claude-review',
       false,
       custom,
     );

@@ -61,6 +61,42 @@ contract. The Worker inserts that server-provided text into the runner prompt;
 contract wording can therefore change without a PC Worker restart. Runner
 permission flags are generated from the table in `runner.mjs`.
 
+### Heartbeat camera snapshots
+
+Camera access is a local Worker decision. It is advertised only when both
+`allowCamera` is exactly `true` and `cameraDevice` is non-empty; a gateway
+`snapRequest` cannot override that gate. `cameraDevice` must match the Windows
+DirectShow device name, and `ffmpegCommand` may point to an explicit ffmpeg
+executable. The Worker captures one MJPEG frame through stdout and never writes
+the image to the PC filesystem.
+
+```json
+{
+  "allowCamera": false,
+  "cameraDevice": "Logitech BRIO",
+  "ffmpegCommand": "ffmpeg"
+}
+```
+
+### Heartbeat Taobao bridge
+
+The Taobao desktop client (v2.5.0+, Settings → AI 设置 → MCP 配置) serves a
+local MCP endpoint at `http://localhost:3654/mcp`. The gateway on the VPS cannot
+reach it, so the Worker bridges it: a gateway `taobaoRequest` arrives through
+the same claim loop as camera snapshots and is forwarded as one MCP
+`tools/call` against the logged-in client. Like the camera, the bridge is a
+local Worker decision — it is advertised only when `allowTaobao` is exactly
+`true`, and a gateway request cannot override that gate. Which tools a contact
+may call (cart by default: browse + add_to_cart; no orders or Wangwang messages) is
+decided on the gateway per contact under `heartbeat.taobao.mode`.
+
+```json
+{
+  "allowTaobao": false,
+  "taobaoMcpUrl": "http://localhost:3654/mcp"
+}
+```
+
 ### Codex sandbox and `danger-full-access`
 
 `codexSandboxMode: "danger-full-access"` is a **worker-side, host-level trust
@@ -191,6 +227,71 @@ file with no mode is at least T2. An unreadable file falls back to the v1 title
 classifier. Maintenance mode or an unavailable Vault suppresses `would-auto`;
 an unavailable jobs API only adds one degraded reconcile line and does not block
 the task/inbox sections.
+
+### Route triage shadow（路由初筛）
+
+`routeTriage` 让 Agenda digest 之后多一步「无主任务谁来做」的初筛：每天上海墙钟
+`atHour:atMinute`（默认 09:10，即 Agenda 之后）扫一次 open 任务，凡是任务文件
+frontmatter 里既没有 `executor:` 也没有 `verifier:`、又不是 `worker-tail-*`/`deploy-*`
+尾巴的，room-host 发一条普通讨论轮次 nudge 点名 `reviewer`（默认 aye），请他按
+工作流协议逐条回复：
+
+```
+[ROUTE] tasks/xxx.md | stage=plan | to=claude | 需要先出 Plan 的复杂改造
+[ROUTE] tasks/yyy.md | stage=execute | to=codex | 单文件小修，直接执行
+[HOLD] tasks/zzz.md | 范围不清，等 User 拍板
+```
+
+默认是**影子模式**：解析后的建议只落 worker SQLite 的 `route_suggestions` 表和群消息，
+不写任务文件、不派单、不触发 coordination sweep。路径必须命中候选集、stage/to 必须
+在白名单内，不合法行只记日志。同一任务存在未决建议时不重复征集；
+`(item_path, suggest_date)` 唯一约束保证同日幂等。inbox 的待拆分需求不进这条链路——
+拆分提案继续走既有的 backlog sweep。
+
+`routeTriage.autoDispatch.enabled` 开启**阶段二闭环**：建议落账后进入否决窗口
+（`delayMinutes`，默认 60 分钟），nudge 尾部会声明窗口规则；`vetoSenders`
+（默认 User 与 claude）在群里单独一行回 `[VETO] tasks/<file>.md | 理由` 即记
+`vetoed` 拦下。窗口过后仍 pending 的建议按 stage 自动派单：`plan` → room-host
+向建议对象征集 Plan（Plan 写回、frontmatter 标 executor 后由既有 coordination
+sweep 接手执行派单）；`execute`/`review`/`maintenance` → 直接点名建议对象
+（PASS / 就地完成 / delegate_to_worker 三选一）。安全闸：标题/tags 命中 T3
+敏感词（删除/强推/生产部署/凭据/付款等）或 frontmatter `mode: ask` 的任务
+永不自动派；任务已被认领或关闭时让位给常规归宿解析；超过 `maxAgeHours`
+（默认 48h）未派的建议不再开火，按到期逻辑收场。每上海日最多
+`dailyLimit`（默认 3）单，派出即写 backlog claim 与 L1 通道互斥，
+idempotencyKey 保证同一建议永不重复派。
+
+route-auto 点名轮结束后，worker 会按 round meta 对账：`normal.spoke=0` 代表
+没有人真正承接，建议改记 `passed`，精确释放 `route-auto:<suggestionId>` claim，
+任务文件保持 open，隔天可重新进入 L1 backlog。worker 启动后的首轮对账会自动
+清理这类记录；也可在 VPS checkout 中手动跑一次存量清理（不改任务文件）：
+
+```bash
+cd /opt/ai-hub
+npm run cleanup:route-auto-claims --prefix worker -- /etc/ai-hub/triage.json
+```
+
+命令输出 `routeAutoCleanup` JSON。首次由该命令清理时，目标记录会出现在
+`settledPaths`，且 `passed: 1`、`released: 1`；如果启动对账已经清理，目标会在
+`passedPaths` 中，且 `remainingClaimPaths` 不再包含该任务。
+
+晚到补收（late harvest）：当日状态为 dispatched 但轮次内 0 条建议（reviewer 后端
+崩溃、慢回、轮次超时）时，对账节拍会在同一上海日内重拉 nudge 之后的消息重新解析，
+补插合法行并置 `lateHarvested`；只补当日、不重发 nudge，唯一约束保证幂等。
+
+改派率对账是确定性的，每 `resolveIntervalMinutes` 跑一轮：重读任务文件，
+`executor:` 出现 → 与建议一致记 `followed`、不一致记 `overridden`（`resolved_via:
+frontmatter`）；本 worker 的 backlog 派单记录命中同一路径时按实际收件人判定
+（`backlog-dispatch`）；任务关闭记 `closed`；超过 `resolveMaxAgeDays` 记 `expired`。
+每周 `statsWeekday`（默认周一）把窗口内（`statsWindowDays` 天）的
+采纳/改派/关闭/过期/待定与改派率贴回会议室一条免打扰消息。`/health` 的
+`metrics.routeSuggestions` 暴露同一份计数。
+
+手动跑一次扫描（入队后由本次 `--once` 队列消费完成整轮，包括等待 reviewer 回复）：
+
+```bash
+node triage-worker.mjs /etc/ai-hub/triage.json --once --route-triage
+```
 
 ### Backlog dispatch claims
 

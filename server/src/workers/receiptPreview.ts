@@ -1,5 +1,6 @@
 import type { JobRow } from '../db.js';
 import { deriveDeliverySummary } from './deliveryStatus.js';
+import { deliveryMeta, structuredReceiptFields, structuredReceiptLines } from './receiptFields.js';
 
 export const WORKER_RECEIPT_PREVIEW_MAX_CHARS = 2_000;
 
@@ -15,10 +16,6 @@ function record(value: unknown): JsonRecord {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as JsonRecord
     : {};
-}
-
-function deliveryMeta(job: JobRow): JsonRecord {
-  try { return job.delivery_meta ? record(JSON.parse(job.delivery_meta)) : {}; } catch { return {}; }
 }
 
 function jobOptions(job: JobRow): JsonRecord {
@@ -54,14 +51,14 @@ function deliveryEvidence(job: JobRow): string {
   const deployment = record(meta.deployment);
   const rawGit = record(meta.git);
   const git = Object.keys(rawGit).length > 0 ? rawGit : meta;
+  const receipt = structuredReceiptFields(job);
   const parts: string[] = [];
   if (typeof declared.committed === 'boolean') parts.push(`commit=${declared.committed ? '是' : '否'}`);
   if (typeof declared.pushed === 'boolean') parts.push(`push=${declared.pushed ? '是' : '否'}`);
   if (typeof declared.stage === 'string' && declared.stage.trim()) {
     parts.push(`stage=${compact(declared.stage, 80)}`);
   }
-  if (typeof git.branch === 'string' && git.branch.trim()) parts.push(`branch=${compact(git.branch, 100)}`);
-  if (typeof git.head === 'string' && git.head.trim()) parts.push(`HEAD=${compact(git.head, 64)}`);
+  if (receipt.head) parts.push(`HEAD=${compact(receipt.head, 64)}`);
   if (typeof git.ahead === 'number' && Number.isFinite(git.ahead)) parts.push(`ahead=${git.ahead}`);
   if (typeof git.behind === 'number' && Number.isFinite(git.behind)) parts.push(`behind=${git.behind}`);
   if (Array.isArray(git.dirtyFiles)) parts.push(`dirty=${git.dirtyFiles.length}`);
@@ -109,6 +106,7 @@ export function formatWorkerReceiptPreview(
   const omitUndeclaredReviewConclusion = jobOptions(job).routeClass === 'review'
     && Object.keys(declared).length === 0;
   const evidence = deliveryEvidence(job);
+  const structured = structuredReceiptFields(job);
   const recall = [
     `Recall 全文：调用 worker_job_status(job_id="${job.id}", result_offset=0, result_limit=4000)，`,
     '按返回的下一页 offset 继续，直到“已到全文末尾”。',
@@ -126,8 +124,9 @@ export function formatWorkerReceiptPreview(
     omitUndeclaredReviewConclusion ? '' : `结论：${compact(delivery.summary, 300)}`,
     `下一步负责人：${compact(delivery.nextOwner, 80)}`,
     evidence ? `commit/push/部署摘要：${compact(evidence, 320)}` : '',
+    ...structuredReceiptLines(job),
     ...deliveryCheckLines(job),
-    `验证要点：${evidenceSummary(job)}`,
+    structured.tests ? '' : `验证要点：${evidenceSummary(job)}`,
     compact(options.closing ?? '请按 preview 验收；需要逐项证据时先 recall 完整回执。', 180),
   ], recall);
 }

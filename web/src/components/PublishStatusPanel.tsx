@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, type PublishStatus, type RepoPublishStatus } from '../api';
 import { formatLocalTime } from '../time';
+import { Icon } from './icons';
 
 interface Props { onClose(): void }
 
@@ -33,10 +34,10 @@ export default function PublishStatusPanel({ onClose }: Props) {
       <div className="modal publish-panel">
         <header className="modal-header">
           <h2>发布状态</h2>
-          <button className="modal-close" onClick={onClose}>×</button>
+          <button className="modal-close" onClick={onClose} aria-label="关闭发布状态"><Icon name="close" /></button>
         </header>
         <div className="modal-body publish-body">
-          {error && <div className="modal-error">⚠ {error}</div>}
+          {error && <div className="modal-error"><Icon name="warning" /> {error}</div>}
           {!status && !error && <div className="publish-loading">正在核对 VPS 与远端…</div>}
           {status?.repos.map((repo) => {
             const state = repoState(repo);

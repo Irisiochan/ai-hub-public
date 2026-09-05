@@ -111,7 +111,7 @@ build_and_restart() {
     # 网关运行时会从检出里读 server/agents/<id>/ 下的人设与 overlay，也会在启动时
     # 读取 server/migrations/*.sql；triage 服务直接运行 worker/*.mjs。这里给这些运行时输入补回可读位。
     # 只放开跟踪源码，不碰 /opt/ai-hub/.env（未跟踪，保持 600）。
-    chmod -R a+rX server/agents server/migrations worker &&
+    chmod -R a+rX server/agents server/migrations worker shared/coordination-keys &&
     systemctl restart ai-hub &&
     systemctl restart ai-hub-triage-worker
 }

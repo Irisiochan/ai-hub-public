@@ -11,6 +11,7 @@ import { getMessageReadState, markMessagesRead } from '../src/readState.js';
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-read-state-'));
 const dbPath = path.join(tempDir, 'hub.db');
 const here = path.dirname(fileURLToPath(import.meta.url));
+const latestVersion = loadMigrationFiles(path.resolve(here, '../migrations')).at(-1)!.version;
 const legacy = new Database(dbPath);
 for (const migration of loadMigrationFiles(path.resolve(here, '../migrations')).slice(0, 18)) {
   legacy.exec(migration.sql);
@@ -29,7 +30,7 @@ legacy.close();
 
 const db = openDb(dbPath);
 try {
-  assert.equal(db.pragma('user_version', { simple: true }), 27);
+  assert.equal(db.pragma('user_version', { simple: true }), latestVersion);
   assert.equal(getMessageReadState(db, 'codex').unreadCount, 0, 'upgrade seeds old main history as read');
 
   const insert = db.prepare(
@@ -60,7 +61,7 @@ try {
 
 const reopened = openDb(dbPath);
 try {
-  assert.equal(reopened.pragma('user_version', { simple: true }), 27, 'migration remains idempotent on reopen');
+  assert.equal(reopened.pragma('user_version', { simple: true }), latestVersion, 'migration remains idempotent on reopen');
 } finally {
   reopened.close();
   fs.rmSync(tempDir, { recursive: true, force: true });

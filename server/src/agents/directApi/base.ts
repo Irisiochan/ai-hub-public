@@ -1,4 +1,5 @@
 import type { Db, MessageRow } from '../../db.js';
+import { gemHeartbeatHistory } from '../gemHeartbeatHistory.js';
 import { attachmentDataUrl, attachmentsForMessage } from '../../attachments.js';
 import type { VaultClient } from '../../memory/vaultClient.js';
 import { timestampedMessage } from '../../memory/inject.js';
@@ -419,7 +420,8 @@ export class DirectApiBackend implements AgentBackend {
   private history(
     currentText: string,
     currentMessageId?: number,
-    roomMessageIds: readonly number[] = []
+    roomMessageIds: readonly number[] = [],
+    heartbeat = false
   ): HistoryBuild {
     // 群聊共享摘要（方案 A）：一律写/读 member_id=''，不再按 agent 各存一份。
     // opts.memberId 仅作遗留 per-member 行的只读回落键。
@@ -571,7 +573,10 @@ export class DirectApiBackend implements AgentBackend {
       maxSeenId: rows.at(-1)?.id ?? maxSeenId,
     };
 
-    const msgs = kept.map((r) => {
+    const lean = heartbeat && this.opts.contactId === 'gem' && this.opts.provider === 'gemini' && !room
+      ? gemHeartbeatHistory(kept, serializedRowText) : null;
+    if (lean) this.opts.log(`gem heartbeat history estimate before=${lean.before} after=${lean.after} saved=${lean.before - lean.after} requestLocal=true`);
+    const msgs = (lean?.rows ?? kept).map((r) => {
       if (room) {
         const anchored = serializedRowText(r);
         return r.sender === room.selfId
@@ -596,18 +601,30 @@ export class DirectApiBackend implements AgentBackend {
       // 群聊：全部内容都在历史里（含最新消息），currentText 只是提示发言
       merged.push({ role: 'user', content: currentText });
     } else {
-      // DM：当前这条已落库，但注入检索块后的版本以参数为准
+      // DM：当前这条已落库，但注入检索块后的版本以参数为准；显式标成
+      // 本轮新消息，避免它与上面的历史原文共享同一种时间语义。
       if (merged.length > 0 && merged[merged.length - 1].role === 'user') merged.pop();
       const currentRow = currentMessageId
         ? rows.find((row) => row.id === currentMessageId)
         : undefined;
-      merged.push({ role: 'user', content: currentRow ? this.contentForRow(currentRow, currentText) : currentText });
+      const anchoredCurrentText = timestampedMessage(
+        currentText,
+        currentRow?.created_at,
+        '本轮新消息'
+      );
+      merged.push({
+        role: 'user',
+        content: currentRow
+          ? this.contentForRow(currentRow, anchoredCurrentText)
+          : anchoredCurrentText,
+      });
     }
 
     while (merged.length > 0 && merged[0].role === 'assistant') merged.shift();
-    const summarySystem = summary
+    let summarySystem = summary
       ? `# 对话滚动摘要（网关持久化，覆盖较早消息）\n${summary}`
       : '';
+    if (lean?.digest) summarySystem += `\n# 心跳本轮历史提要（仅本轮压缩，不改原始聊天）\n${lean.digest}`;
     return {
       messages: merged,
       summarySystem,
@@ -647,7 +664,7 @@ export class DirectApiBackend implements AgentBackend {
 
     const turn = (async () => {
       try {
-        const history = this.history(input.text, input.userMessageId, input.roomMessageIds);
+        const history = this.history(input.text, input.userMessageId, input.roomMessageIds, Boolean(input.emptyVisibleText));
         const historyHasImages = this.hasImages(history);
         const useVisionModel = historyHasImages && !!this.opts.visionModel;
         const requestModel = useVisionModel ? this.opts.visionModel! : this.opts.model;
@@ -668,7 +685,8 @@ export class DirectApiBackend implements AgentBackend {
           queue,
           abort.signal,
           estimate,
-          requestModel
+          requestModel,
+          input.emptyVisibleText
         );
       } catch (e: any) {
         queue.push({
@@ -706,9 +724,9 @@ export class DirectApiBackend implements AgentBackend {
     name: string,
     input: Record<string, unknown>,
     queue: AsyncQueue<TurnEvent>
-  ): Promise<{ ok: boolean; text: string }> {
+  ): Promise<{ ok: boolean; text: string; image?: { data: string; mimeType: string } }> {
     queue.push({ type: 'tool_use', name, inputSummary: JSON.stringify(input).slice(0, 200) });
-    let out: { ok: boolean; text: string };
+    let out: { ok: boolean; text: string; image?: { data: string; mimeType: string } };
     const extra = this.opts.extraTools?.find((t) => t.name === name);
     if (extra) {
       try {
@@ -760,7 +778,8 @@ export class DirectApiBackend implements AgentBackend {
     queue: AsyncQueue<TurnEvent>,
     signal: AbortSignal,
     estimate: TokenCostEstimate,
-    requestModel: string
+    requestModel: string,
+    emptyVisibleText?: string
   ): Promise<void> {
     const provider = this.createProvider(requestModel);
     const definitions = this.toolDefs();
@@ -800,7 +819,17 @@ export class DirectApiBackend implements AgentBackend {
         const results: ProviderToolResult[] = [];
         for (const call of round.calls) {
           const result = await this.execTool(call.name, call.input, queue);
-          results.push({ ...call, ...result });
+          const canSeeImage = this.baseSupportsImages() || !!this.opts.visionModel;
+          results.push({
+            ...call,
+            ...result,
+            ...(result.image && !canSeeImage
+              ? {
+                  image: undefined,
+                  text: `${result.text}\n（当前模型不支持看图，画面未发给模型。）`,
+                }
+              : {}),
+          });
         }
         provider.appendToolResults(conversation, round.response, results);
         toolRounds++;
@@ -817,8 +846,18 @@ export class DirectApiBackend implements AgentBackend {
     const usageLog = provider.usageLog?.(usage);
     if (usageLog) this.opts.log(usageLog);
     if (!finalRoundText.trim()) {
-      const suffix = usage.finishReason === 'length' ? '（输出预算已耗尽）' : '';
-      throw new Error(`上游只返回了思考/工具过程，没有可显示的正文${suffix}`);
+      const allowSilent = Boolean(emptyVisibleText?.trim()) && usage.finishReason !== 'length';
+      if (allowSilent) {
+        const silentText = emptyVisibleText!.trim();
+        this.opts.log(
+          `empty visible text treated as ${JSON.stringify(silentText)} finishReason=${usage.finishReason ?? 'none'}`
+        );
+        finalRoundText = silentText;
+        if (!finalText.trim()) finalText = silentText;
+      } else {
+        const suffix = usage.finishReason === 'length' ? '（输出预算已耗尽）' : '';
+        throw new Error(`上游只返回了思考/工具过程，没有可显示的正文${suffix}`);
+      }
     }
     queue.push({ type: 'done', finalText, usage: { ...usage, estimate } });
   }

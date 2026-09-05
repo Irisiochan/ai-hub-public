@@ -9,10 +9,14 @@ import {
   coordinationAuthorityHolderIds,
   resolveRoomOrchestratorId,
   type RoomCoordinationDispatch,
+  normalizeRoomCoordinationDispatch,
 } from './roomPrompt.js';
 import { AgentRuntime, type AgentDeps, type RoomTurnOutcome } from './runtime.js';
 import { SessionRepo } from './sessionRepo.js';
-import { parseRoomTargets } from './roomTargets.js';
+import { parseRoomTargets, roomDirectlyMentions } from './roomTargets.js';
+import type { CompanionHeartbeat } from './companionHeartbeat.js';
+import type { TurnInterruptionReason } from './turnInterruption.js';
+import { RoomDispatchDrain } from './roomDispatchDrain.js';
 
 export { AgentRuntime } from './runtime.js';
 export type { RoomTurnOutcome } from './runtime.js';
@@ -42,9 +46,15 @@ export interface RoomDispatchOptions {
   coordination?: RoomCoordinationDispatch;
 }
 
+interface ScheduledRoomDispatchOptions extends RoomDispatchOptions {
+  directMentionTargetIds?: string[];
+  roomHostTargetIds?: string[];
+}
+
 export interface TrackedRoomDispatch {
   targets: string[];
   completion: Promise<RoomRoundStats>;
+  deferred?: boolean;
 }
 
 export class AgentManager {
@@ -52,6 +62,10 @@ export class AgentManager {
 
   private readonly sessions: SessionRepo;
   private readonly invalidations: Debouncer<string, InvalidationPayload>;
+  private readonly roomDispatchDrain = new RoomDispatchDrain();
+  private roomRoundsInFlight = 0;
+  private activeRoomDispatchSourceIds = new Set<number>();
+  private deployResumeClaims = new Set<number>();
 
   constructor(private deps: AgentDeps) {
     this.sessions = new SessionRepo(deps.db);
@@ -68,6 +82,10 @@ export class AgentManager {
       }),
       async ({ contact, affectedFromId }) => this.invalidateNow(contact, affectedFromId)
     );
+  }
+
+  attachHeartbeat(heartbeat: CompanionHeartbeat): void {
+    this.deps.heartbeat = heartbeat;
   }
 
   /** DM runtime。 */
@@ -174,27 +192,393 @@ export class AgentManager {
       };
     }
 
-    // 同一个群的轮次串行：用户连发消息时排队，不交叉
-    const prev = this.roomChains.get(room.id) ?? Promise.resolve();
-    const completion = prev.then(() =>
-      this.runRoomRound(room, targets, {
+    const targetIds = targets.map((target) => target.id);
+    const source = typeof options.userMessageId === 'number'
+      ? this.deps.db.prepare('SELECT sender, content, meta FROM messages WHERE id = ?').get(options.userMessageId) as
+          | { sender: string; content: string; meta: string }
+          | undefined
+      : undefined;
+    const directMentionTargetIds = source?.sender === 'user'
+      ? targets.filter((target) => roomDirectlyMentions(target, source.content)).map((target) => target.id)
+      : [];
+    let roomHostTargetIds: string[] = [];
+    if (source?.sender === 'room-host') {
+      try {
+        const meta = JSON.parse(source.meta || '{}') as { roomHost?: { targets?: unknown } };
+        roomHostTargetIds = Array.isArray(meta.roomHost?.targets)
+          ? meta.roomHost.targets.map(String)
+          : [];
+      } catch {}
+    }
+    const scheduledOptions: ScheduledRoomDispatchOptions = {
+      ...options,
+      directMentionTargetIds,
+      roomHostTargetIds,
+    };
+    const dispatch = () => this.scheduleRoomRound(room, targets, scheduledOptions);
+    const durableHostDispatch = typeof options.userMessageId === 'number'
+      && this.isDeployReplayableRoomHostMessage(options.userMessageId);
+    try {
+      if (this.roomDispatchDrain.isActive()) {
+        if (typeof options.userMessageId !== 'number') {
+          throw new Error('drain deferral requires a persisted source message id');
+        }
+        this.writeRoomDispatchState(options.userMessageId, {
+          status: 'deferred',
+          targetIds,
+          reactionRounds: options.reactionRounds,
+          coordinationDomain: options.coordinationDomain === true,
+          coordination: options.coordination,
+          dispatchClass: 'drain',
+          deferredAt: new Date().toISOString(),
+        });
+        const completion = this.roomDispatchDrain.defer(async () => {
+          this.writeRoomDispatchState(options.userMessageId!, {
+            status: 'dispatching',
+            dispatchedAt: new Date().toISOString(),
+          });
+          return dispatch();
+        });
+        void completion.then(
+          () => this.writeRoomDispatchState(options.userMessageId!, {
+            status: 'done',
+            completedAt: new Date().toISOString(),
+          }),
+          (error) => this.writeRoomDispatchState(options.userMessageId!, {
+            status: 'error',
+            completedAt: new Date().toISOString(),
+            error: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+          }),
+        );
+        return { targets: targetIds, completion, deferred: true };
+      }
+    } catch (error) {
+      // Drain is safety reinforcement, never an event sink. Any guard/storage
+      // failure falls back to the pre-drain dispatch behavior.
+      this.deps.logger?.error(
+        { component: 'room-drain', roomId: room.id, err: error },
+        'room drain guard failed open',
+      );
+    }
+    if (durableHostDispatch) {
+      this.writeRoomDispatchState(options.userMessageId!, {
+        status: 'dispatching',
+        targetIds,
         reactionRounds: options.reactionRounds,
-        coordinationDomain: options.coordinationDomain,
+        coordinationDomain: options.coordinationDomain === true,
         coordination: options.coordination,
-      })
-    );
+        dispatchClass: 'live',
+        dispatchedAt: new Date().toISOString(),
+      });
+    }
+    const completion = dispatch();
+    if (durableHostDispatch) {
+      void completion.then(
+        (outcome) => this.finishLiveRoomDispatch(options.userMessageId!, outcome),
+        (error) => this.finishRecoveredRoomDispatch(options.userMessageId!, 'room-host', 'error', error),
+      );
+    }
+    return { targets: targetIds, completion };
+  }
+
+  private scheduleRoomRound(
+    room: ContactRow,
+    targets: ContactRow[],
+    options: ScheduledRoomDispatchOptions,
+  ): Promise<RoomRoundStats> {
+    // 同一个群的轮次串行：用户连发消息时排队，不交叉。计数覆盖正在跑和
+    // 已接纳但排在 roomChains 后面的轮次，部署 drain 才不会漏掉后者。
+    this.roomRoundsInFlight++;
+    const prev = this.roomChains.get(room.id) ?? Promise.resolve();
+    const round = prev.then(async () => {
+      const sourceId = options.userMessageId;
+      if (typeof sourceId === 'number') this.activeRoomDispatchSourceIds.add(sourceId);
+      try {
+        return await this.runRoomRound(room, targets, {
+          reactionRounds: options.reactionRounds,
+          coordinationDomain: options.coordinationDomain,
+          coordination: options.coordination,
+          userMessageId: options.userMessageId,
+          directMentionTargetIds: options.directMentionTargetIds,
+          roomHostTargetIds: options.roomHostTargetIds,
+        });
+      } finally {
+        if (typeof sourceId === 'number') this.activeRoomDispatchSourceIds.delete(sourceId);
+      }
+    });
+    const completion = round.finally(() => { this.roomRoundsInFlight--; });
     this.roomChains.set(
       room.id,
-      completion
-        .then(() => undefined)
-        .catch((error) =>
-          this.deps.logger?.error(
-            { component: 'room', roomId: room.id, err: error },
-            'room round failed'
-          )
+      completion.then(() => undefined).catch((error) =>
+        this.deps.logger?.error(
+          { component: 'room', roomId: room.id, err: error },
+          'room round failed',
         )
+      ),
     );
-    return { targets: targets.map((t) => t.id), completion };
+    return completion;
+  }
+
+  private writeRoomDispatchState(messageId: number, patch: Record<string, unknown>): void {
+    const row = this.deps.db.prepare('SELECT meta FROM messages WHERE id = ?').get(messageId) as
+      | { meta: string }
+      | undefined;
+    if (!row) throw new Error(`room dispatch source message ${messageId} not found`);
+    let meta: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(row.meta || '{}');
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) meta = parsed;
+    } catch {}
+    const prior = meta.roomDispatch && typeof meta.roomDispatch === 'object' && !Array.isArray(meta.roomDispatch)
+      ? meta.roomDispatch as Record<string, unknown>
+      : {};
+    this.deps.db.prepare('UPDATE messages SET meta = ? WHERE id = ?')
+      .run(JSON.stringify({ ...meta, roomDispatch: { ...prior, ...patch } }), messageId);
+  }
+
+  private isDeployReplayableRoomHostMessage(messageId: number): boolean {
+    const row = this.deps.db.prepare('SELECT sender, meta FROM messages WHERE id = ?').get(messageId) as
+      | { sender: string; meta: string }
+      | undefined;
+    if (!row || row.sender !== 'room-host') return false;
+    try {
+      const meta = JSON.parse(row.meta || '{}') as Record<string, any>;
+      const roomHost = meta.roomHost;
+      const coordination = roomHost?.coordination;
+      const receipt = roomHost?.receipt;
+      return !!roomHost && typeof roomHost === 'object' && !Array.isArray(roomHost)
+        && (
+          (!!coordination && typeof coordination === 'object' && !Array.isArray(coordination))
+          || (!!receipt && typeof receipt === 'object' && !Array.isArray(receipt))
+        );
+    } catch {
+      return false;
+    }
+  }
+
+  private markDeployInterruptedRoomDispatch(
+    messageId: number,
+    dispatchSnapshot?: Record<string, unknown>,
+  ): Record<string, unknown> | null {
+    if (!this.isDeployReplayableRoomHostMessage(messageId)) return null;
+    const row = this.deps.db.prepare('SELECT meta FROM messages WHERE id = ?').get(messageId) as
+      | { meta: string }
+      | undefined;
+    if (!row) return null;
+    let meta: Record<string, any> = {};
+    try { meta = JSON.parse(row.meta || '{}'); } catch {}
+    const priorDispatch = dispatchSnapshot ?? (
+      meta.roomDispatch && typeof meta.roomDispatch === 'object' && !Array.isArray(meta.roomDispatch)
+        ? meta.roomDispatch as Record<string, unknown>
+        : {}
+    );
+    if (priorDispatch.dispatchClass === 'drain') return null;
+    const interruptedAt = new Date().toISOString();
+    const interruptedDispatch = {
+      ...priorDispatch,
+      status: 'error',
+      interruptionReason: 'deploy-restart',
+      interruptedAt,
+    };
+    const next = {
+      ...meta,
+      roomDispatch: interruptedDispatch,
+      roomHost: {
+        ...(meta.roomHost ?? {}),
+        status: 'error',
+        interruptionReason: 'deploy-restart',
+        interruptedAt,
+      },
+    };
+    this.deps.db.prepare('UPDATE messages SET meta = ? WHERE id = ?').run(JSON.stringify(next), messageId);
+    return interruptedDispatch;
+  }
+
+  private finishLiveRoomDispatch(messageId: number, outcome: RoomRoundStats): void {
+    const row = this.deps.db.prepare('SELECT meta FROM messages WHERE id = ?').get(messageId) as
+      | { meta: string }
+      | undefined;
+    if (!row) return;
+    let meta: Record<string, any> = {};
+    try { meta = JSON.parse(row.meta || '{}'); } catch {}
+    if (
+      meta.roomDispatch?.status === 'error'
+      && meta.roomDispatch?.interruptionReason === 'deploy-restart'
+    ) return;
+    this.writeRoomDispatchState(messageId, {
+      status: 'done',
+      completedAt: new Date().toISOString(),
+      outcome,
+    });
+  }
+
+  beginRoomDispatchDrain(): boolean {
+    return this.roomDispatchDrain.begin();
+  }
+
+  endRoomDispatchDrain(): number {
+    return this.roomDispatchDrain.release();
+  }
+
+  roomDispatchDraining(): boolean {
+    return this.roomDispatchDrain.isActive();
+  }
+
+  roomDispatchDrainPendingCount(): number {
+    return this.roomDispatchDrain.pendingCount();
+  }
+
+  activeRoomRoundCount(): number {
+    return this.roomRoundsInFlight;
+  }
+
+  recoverDeferredRoomDispatches(): number {
+    const rows = this.deps.db.prepare(
+      `SELECT * FROM messages
+       WHERE (
+         json_extract(meta, '$.roomDispatch.status') IN ('deferred', 'dispatching')
+         AND COALESCE(json_extract(meta, '$.roomDispatch.dispatchClass'), 'drain') = 'drain'
+       ) OR (
+         sender = 'room-host'
+         AND json_extract(meta, '$.roomDispatch.status') IN ('error', 'resume-queued')
+         AND json_extract(meta, '$.roomDispatch.interruptionReason') = 'deploy-restart'
+         AND (
+           json_type(meta, '$.roomHost.coordination') = 'object'
+           OR json_type(meta, '$.roomHost.receipt') = 'object'
+         )
+       )
+       ORDER BY id`,
+    ).all() as Array<{ id: number; contact_id: string; sender: string; content: string; meta: string }>;
+    let recovered = 0;
+    for (const row of rows) {
+      try {
+        const room = this.deps.db.prepare(
+          `SELECT * FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'room'`,
+        ).get(row.contact_id) as ContactRow | undefined;
+        if (!room) throw new Error('room is unavailable');
+        const meta = JSON.parse(row.meta || '{}') as Record<string, any>;
+        const deferred = meta.roomDispatch ?? {};
+        const deployResume = deferred.interruptionReason === 'deploy-restart'
+          && ['error', 'resume-queued'].includes(String(deferred.status));
+        if (deployResume && this.deployResumeClaims.has(row.id)) continue;
+        const roomHostTargets = Array.isArray(meta.roomHost?.targets) ? meta.roomHost.targets : [];
+        const targetIds = Array.isArray(deferred.targetIds)
+          ? deferred.targetIds.map(String)
+          : roomHostTargets.map(String);
+        const targets = this.roomMembers(room).filter((member) => targetIds.includes(member.id));
+        if (targets.length === 0) throw new Error('deferred targets are unavailable');
+        const coordination = normalizeRoomCoordinationDispatch(deferred.coordination);
+        const options: ScheduledRoomDispatchOptions = {
+          targetOverride: targets,
+          capture: false,
+          userMessageId: row.id,
+          roomHostTargetIds: targetIds,
+          ...(Number.isFinite(Number(deferred.reactionRounds))
+            ? { reactionRounds: Number(deferred.reactionRounds) }
+            : {}),
+          ...(deferred.coordinationDomain === true ? { coordinationDomain: true } : {}),
+          ...(coordination ? { coordination } : {}),
+        };
+        if (deployResume) {
+          this.deployResumeClaims.add(row.id);
+          this.markDeployResumeQueued(row);
+        } else {
+          this.writeRoomDispatchState(row.id, {
+            status: 'dispatching',
+            recoveredAt: new Date().toISOString(),
+          });
+        }
+        const completion = this.scheduleRoomRound(room, targets, options);
+        void completion.then(
+          (outcome) => this.finishRecoveredRoomDispatch(row.id, row.sender, 'done', outcome),
+          (error) => this.finishRecoveredRoomDispatch(row.id, row.sender, 'error', error),
+        ).finally(() => this.deployResumeClaims.delete(row.id));
+        recovered++;
+      } catch (error) {
+        this.deployResumeClaims.delete(row.id);
+        this.deps.logger?.error(
+          { component: 'room-drain', messageId: row.id, err: error },
+          'deferred room dispatch recovery failed; keeping it durable for retry',
+        );
+      }
+    }
+    return recovered;
+  }
+
+  private markDeployResumeQueued(row: { id: number; meta: string }): void {
+    let meta: Record<string, any> = {};
+    try { meta = JSON.parse(row.meta || '{}'); } catch {}
+    const queuedAt = new Date().toISOString();
+    const next = {
+      ...meta,
+      roomDispatch: {
+        ...(meta.roomDispatch ?? {}),
+        status: 'resume-queued',
+        dispatchClass: 'resume',
+        resumeQueued: true,
+        resumeQueuedAt: queuedAt,
+      },
+      roomHost: {
+        ...(meta.roomHost ?? {}),
+        status: 'queued',
+        resumeQueued: true,
+        resumeQueuedAt: queuedAt,
+      },
+    };
+    this.deps.db.prepare('UPDATE messages SET meta = ? WHERE id = ?').run(JSON.stringify(next), row.id);
+    const source = this.deps.db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id);
+    this.deps.sse.broadcast('message', source);
+
+    const errors = this.deps.db.prepare(
+      `SELECT * FROM messages
+       WHERE json_extract(meta, '$.interruptionReason') = 'deploy-restart'
+         AND json_extract(meta, '$.replaySourceMessageId') = ?`,
+    ).all(row.id) as Array<{ id: number; meta: string }>;
+    for (const error of errors) {
+      let errorMeta: Record<string, unknown> = {};
+      try { errorMeta = JSON.parse(error.meta || '{}'); } catch {}
+      this.deps.db.prepare('UPDATE messages SET content = ?, meta = ? WHERE id = ?').run(
+        '部署重启中断，已排队续跑',
+        JSON.stringify({ ...errorMeta, resumeQueued: true, resumeQueuedAt: queuedAt }),
+        error.id,
+      );
+      const updated = this.deps.db.prepare('SELECT * FROM messages WHERE id = ?').get(error.id);
+      this.deps.sse.broadcast('message', updated);
+    }
+  }
+
+  private finishRecoveredRoomDispatch(
+    messageId: number,
+    sender: string,
+    status: 'done' | 'error',
+    detail: unknown,
+  ): void {
+    const row = this.deps.db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId) as
+      | { meta: string }
+      | undefined;
+    if (!row) return;
+    let meta: Record<string, any> = {};
+    try { meta = JSON.parse(row.meta || '{}'); } catch {}
+    const roomDispatch = {
+      ...(meta.roomDispatch ?? {}),
+      status,
+      completedAt: new Date().toISOString(),
+      ...(status === 'error'
+        ? { error: detail instanceof Error ? detail.message.slice(0, 500) : String(detail).slice(0, 500) }
+        : {}),
+    };
+    const roomHost = sender === 'room-host'
+      ? {
+          ...(meta.roomHost ?? {}),
+          status,
+          completedAt: new Date().toISOString(),
+          ...(status === 'done' ? { outcome: detail } : { error: roomDispatch.error }),
+        }
+      : meta.roomHost;
+    const next = { ...meta, roomDispatch, ...(roomHost ? { roomHost } : {}) };
+    this.deps.db.prepare('UPDATE messages SET meta = ? WHERE id = ?').run(JSON.stringify(next), messageId);
+    const updated = this.deps.db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId);
+    this.deps.sse.broadcast('message', updated);
   }
 
   private shuffle<T>(arr: T[]): T[] {
@@ -222,11 +606,30 @@ export class AgentManager {
   private async runRoomRound(
     room: ContactRow,
     targets: ContactRow[],
-    options: Pick<RoomDispatchOptions, 'reactionRounds' | 'coordinationDomain' | 'coordination'> = {}
+    options: Pick<ScheduledRoomDispatchOptions, 'reactionRounds' | 'coordinationDomain' | 'coordination' | 'userMessageId' | 'directMentionTargetIds' | 'roomHostTargetIds'> = {}
   ): Promise<RoomRoundStats> {
-    const { reactionRounds, coordinationDomain, coordination } = options;
+    const {
+      reactionRounds,
+      coordinationDomain,
+      coordination,
+      userMessageId,
+      directMentionTargetIds,
+      roomHostTargetIds,
+    } = options;
+    const replaySourceMessageId = typeof userMessageId === 'number'
+      && this.isDeployReplayableRoomHostMessage(userMessageId)
+      ? userMessageId
+      : undefined;
     const normal = await Promise.all(
-      this.shuffle(targets).map((member) => this.getRoomMember(room, member).runRoomTurn('normal'))
+      this.shuffle(targets).map((member) => (
+        this.getRoomMember(room, member).runRoomTurn(
+          'normal',
+          replaySourceMessageId,
+          userMessageId,
+          directMentionTargetIds?.includes(member.id) === true,
+          roomHostTargetIds?.includes(member.id) === true
+        )
+      ))
     );
 
     const stats: RoomRoundStats = {
@@ -260,7 +663,7 @@ export class AgentManager {
           outcomes.push('passed');
           continue;
         }
-        const outcome = await this.getRoomMember(room, member).runRoomTurn('reaction');
+        const outcome = await this.getRoomMember(room, member).runRoomTurn('reaction', replaySourceMessageId);
         outcomes.push(outcome);
         if (outcome === 'spoke') anySpoke = true;
       }
@@ -413,7 +816,21 @@ export class AgentManager {
     }
   }
 
-  async stopAll(): Promise<void> {
-    await Promise.all([...this.runtimes.values()].map((rt) => rt.stop()));
+  async stopAll(reason: TurnInterruptionReason = 'claude-error'): Promise<void> {
+    const interruptedSources = reason === 'deploy-restart'
+      ? [...this.activeRoomDispatchSourceIds]
+      : [];
+    const interruptedDispatches = new Map<number, Record<string, unknown>>();
+    for (const messageId of interruptedSources) {
+      const snapshot = this.markDeployInterruptedRoomDispatch(messageId);
+      if (snapshot) interruptedDispatches.set(messageId, snapshot);
+    }
+    await Promise.all([...this.runtimes.values()].map((rt) => rt.stop(reason)));
+    // Runtime completion callbacks can settle while stop() is awaiting. Reapply
+    // the durable interruption marker after they finish so startup recovery sees
+    // the source event in error state instead of a misleading done state.
+    for (const [messageId, snapshot] of interruptedDispatches) {
+      this.markDeployInterruptedRoomDispatch(messageId, snapshot);
+    }
   }
 }

@@ -1,9 +1,13 @@
+import { z } from 'zod';
+import { defineGatewayTool, type GatewayTool } from './gatewayTool.js';
+export type { GatewayTool } from './gatewayTool.js';
 import type { Db, JobRow } from '../db.js';
 import type { HubLogger } from '../logger.js';
 import { canonicalWorkspacePath } from '../workers/coordinationKeys.js';
 import { coordinationMarkerDispatchKey, parseCoordinationMarker } from '../workers/coordinationReceipt.js';
 import { normalizeRoomCoordinationDispatch } from './roomPrompt.js';
 import { coordinationTaskPath, JobStore, workspaceAllowed } from '../workers/jobStore.js';
+import { structuredReceiptFields, structuredReceiptLines } from '../workers/receiptFields.js';
 import {
   problemFingerprint,
   stageForRouteClass,
@@ -17,13 +21,6 @@ import {
  * both the DirectApi backend (native tool loop) and the hub MCP endpoint
  * (claude-cli contacts).
  */
-
-export interface GatewayTool {
-  name: string;
-  description: string;
-  schema: Record<string, unknown>;
-  exec: (input: Record<string, unknown>) => Promise<{ ok: boolean; text: string }>;
-}
 
 export interface DelegationCfg {
   enabled?: boolean;
@@ -43,12 +40,31 @@ type DelegatedRunner = 'claude' | 'codex' | 'grok';
 type RouteClass = 'implement' | 'fix' | 'review' | 'recon' | 'mechanical';
 type RunnerSource = 'policy' | 'override';
 
-const ROUTE_CLASS_VALUES: RouteClass[] = ['implement', 'fix', 'review', 'recon', 'mechanical'];
-const RUNNER_VALUES: DelegatedRunner[] = ['claude', 'codex', 'grok'];
+const ROUTE_CLASS_VALUES = ['implement', 'fix', 'review', 'recon', 'mechanical'] as const;
 const ROUTE_POLICY_TEXT =
   '默认 runner/model/effort 由当前 Workflow Profile 和 route_class 决定；偏离必须显式传非空 runner_override_reason。';
 const ROUTE_CLASS_REQUIRED_ERROR =
   `route_class 必填，且必须是 ${ROUTE_CLASS_VALUES.join(' | ')}。${ROUTE_POLICY_TEXT}`;
+const PAGINATION_REPEAT_WINDOW_MS = 20 * 60_000;
+const PAGINATION_SEEN_MAX = 2_048;
+const paginationReads = new Map<string, number>();
+
+function recordPaginationRead(contactId: string, jobId: string, offset: number): boolean {
+  const now = Date.now();
+  for (const [key, seenAt] of paginationReads) {
+    if (now - seenAt > PAGINATION_REPEAT_WINDOW_MS) paginationReads.delete(key);
+  }
+  while (paginationReads.size >= PAGINATION_SEEN_MAX) {
+    const oldest = paginationReads.keys().next().value as string | undefined;
+    if (!oldest) break;
+    paginationReads.delete(oldest);
+  }
+  const key = `${contactId}:${jobId}:${offset}`;
+  const repeated = paginationReads.has(key);
+  paginationReads.delete(key);
+  paginationReads.set(key, now);
+  return repeated;
+}
 
 /** 调用方没显式传 model/effort 时补上的派单默认。 */
 const RUNNER_DEFAULTS: Partial<Record<DelegatedRunner, { model: string; effort: string }>> = {
@@ -70,7 +86,7 @@ export function normalizeDelegatedModel(
   if (!raw) return undefined;
   if (runner === 'claude') {
     const lower = raw.toLowerCase();
-    const versioned = lower.match(/^(?:claude[-_\s]*)?(opus|sonnet|haiku)[-_\s]*(\d+)[._-](\d+)$/);
+    const versioned = lower.match(/^(?:claude[-_\s]*)?(opus|sonnet|haiku|fable)[-_\s]*(\d+)[._-](\d+)$/);
     if (versioned) return `claude-${versioned[1]}-${versioned[2]}-${versioned[3]}`;
     if (['opus', 'sonnet', 'haiku', 'fable'].includes(lower)) return lower;
     if (/^\d+[._-]\d+$/.test(lower)) return undefined;
@@ -135,7 +151,9 @@ function jobBrief(job: JobRow): string {
   const permissions = parseRecord(job.permissions);
   const meta = parseRecord(job.delivery_meta);
   const declared = record(meta.declared);
-  const git = record(meta.git);
+  const rawGit = record(meta.git);
+  const git = Object.keys(rawGit).length > 0 ? rawGit : meta;
+  const receipt = structuredReceiptFields(job);
   const checks = Array.isArray(meta.checks) ? meta.checks.map(record) : [];
   const extra = [opts.model, opts.reasoning].filter(Boolean).join('/');
   const routeClass = typeof opts.routeClass === 'string' ? opts.routeClass : '未知';
@@ -151,12 +169,12 @@ function jobBrief(job: JobRow): string {
   const dirtyCount = Array.isArray(git.dirtyFiles)
     ? git.dirtyFiles.length
     : git.dirty === true ? 'unknown' : 0;
-  const shortHead = typeof git.head === 'string' ? git.head.trim().slice(0, 8) : '';
-  const gitParts = Object.keys(git).length > 0 ? [
+  const shortHead = receipt.head?.slice(0, 8) ?? '';
+  const gitParts = receipt.head || receipt.branch || Object.keys(rawGit).length > 0 ? [
     `HEAD=${shortHead || 'unknown'}`,
     `ahead=${typeof git.ahead === 'number' && Number.isFinite(git.ahead) ? git.ahead : 'unknown'}`,
     `behind=${typeof git.behind === 'number' && Number.isFinite(git.behind) ? git.behind : 'unknown'}`,
-    `branch=${briefValue(git.branch, 80) || 'detached/unknown'}`,
+    `branch=${receipt.branch ?? '未报告'}`,
     `dirty=${dirtyCount}`,
   ] : ['未上送（旧 runner）'];
   const failedChecks = checks.filter((item) => item.pass === false);
@@ -168,6 +186,7 @@ function jobBrief(job: JobRow): string {
     `permissions：write=${boolBrief(permissions.write)}，shell=${boolBrief(permissions.shell)}，ssh=${boolBrief(permissions.ssh)}`,
     `declared：${declaredParts.join('，')}`,
     `git：${gitParts.join('，')}`,
+    ...structuredReceiptLines(job),
     ...failedChecks.map((item) => (
       `机检未通过：${briefValue(item.id, 80)} — ${briefValue(item.detail)}`
     )),
@@ -290,7 +309,7 @@ export function buildDelegateTools(
   };
 
   return [
-    {
+    defineGatewayTool({
       name: 'delegate_to_worker',
       description:
         `把一个编码/文件任务派给 User 本机的 PC Worker 执行（那边有正式 git 仓库和 CLI agent）。` +
@@ -300,64 +319,40 @@ export function buildDelegateTools(
         (cfg.allowSsh === true
           ? ' 需要访问 VPS 时显式传 ssh=true，并在 prompt 写清主机、checkout、服务和验收。'
           : ' 当前未开放 SSH；需要远程部署时只能留下 deploy-tail。'),
-      schema: {
-        type: 'object',
-        properties: {
-          route_class: {
-            type: 'string',
-            enum: ROUTE_CLASS_VALUES,
-            description: ROUTE_POLICY_TEXT,
-          },
-          runner: { type: 'string', enum: runners, description: '可选；不填时按 route_class 默认路由表推出' },
-          runner_override_reason: {
-            type: 'string',
-            description: '偏离 route_class 默认 runner 时必填的非空理由；会写入 job 元数据',
-          },
-          workspace: { type: 'string', description: 'PC 上的项目路径，必须在白名单内' },
-          prompt: { type: 'string', description: '自包含的任务描述（目标/约束/验收标准）' },
-          write: {
-            type: 'boolean',
-            description: '是否允许修改文件；默认 true。诊断、盘点、验收等只读任务必须显式传 false',
-          },
-          shell: {
-            type: 'boolean',
-            description:
-              '是否允许执行 shell 命令。codex 自动为 true；claude 不填就完全拿不到 Bash，只要 prompt 里含构建、测试、git 或部署任何一项就必须显式传 true',
-          },
-          ssh: {
-            type: 'boolean',
-            description: cfg.allowSsh === true
-              ? '是否允许 SSH/VPS 操作；远程部署必须显式 true'
-              : '当前联系人未开放 SSH；传 true 会被拒绝',
-          },
-          priority: { type: 'number', description: '-10~10，默认 0' },
-          model: {
-            type: 'string',
-            description:
-              '覆盖当前 Workflow Profile 的模型。Claude 固定版本必须写清系列和版本，例如 Opus 4.7 或 claude-opus-4-7；用户指定版本时禁止用会漂移的 opus/sonnet 别名代替。Codex 例如 gpt-5.6-sol。',
-          },
-          effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], description: '推理强度（claude: effort，codex/grok: reasoning_effort）；不填时按当前 Workflow Profile' },
-          problem_fingerprint: {
-            type: 'string',
-            description: '可选的同一问题稳定指纹（64 位 sha256）；coordination 任务默认从 planHash 推出',
-          },
-        },
-        required: ['route_class', 'workspace', 'prompt'],
+      inputSchema: {
+        route_class: z.enum(ROUTE_CLASS_VALUES, {
+          errorMap: () => ({ message: ROUTE_CLASS_REQUIRED_ERROR }),
+        }).describe(ROUTE_POLICY_TEXT),
+        runner: z.enum(runners as [string, ...string[]]).optional()
+          .describe('可选；不填时按 route_class 默认路由表推出'),
+        runner_override_reason: z.string().optional()
+          .describe('偏离 route_class 默认 runner 时必填的非空理由；会写入 job 元数据'),
+        workspace: z.string().describe('PC 上的项目路径，必须在白名单内'),
+        prompt: z.string().describe('自包含的任务描述（目标/约束/验收标准）'),
+        write: z.boolean().optional()
+          .describe('是否允许修改文件；默认 true。诊断、盘点、验收等只读任务必须显式传 false'),
+        shell: z.boolean().optional().describe(
+          '是否允许执行 shell 命令。codex 自动为 true；claude 不填就完全拿不到 Bash，只要 prompt 里含构建、测试、git 或部署任何一项就必须显式传 true',
+        ),
+        ssh: z.boolean().optional().describe(cfg.allowSsh === true
+          ? '是否允许 SSH/VPS 操作；远程部署必须显式 true'
+          : '当前联系人未开放 SSH；传 true 会被拒绝'),
+        priority: z.number().optional().describe('-10~10，默认 0'),
+        model: z.string().optional().describe(
+          '覆盖当前 Workflow Profile 的模型。Claude 固定版本必须写清系列和版本，例如 Opus 4.7 或 claude-opus-4-7；用户指定版本时禁止用会漂移的 opus/sonnet 别名代替。Codex 例如 gpt-5.6-sol。',
+        ),
+        effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional()
+          .describe('推理强度（claude: effort，codex/grok: reasoning_effort）；不填时按当前 Workflow Profile'),
+        problem_fingerprint: z.string().regex(/^[a-fA-F0-9]{64}$/, 'problem_fingerprint 必须是 64 位 sha256。').optional()
+          .describe('可选的同一问题稳定指纹（64 位 sha256）；coordination 任务默认从 planHash 推出'),
       },
       exec: async (input) => {
-        const routeClass = ROUTE_CLASS_VALUES.includes(input.route_class as RouteClass)
-          ? input.route_class as RouteClass : null;
-        if (!routeClass) return { ok: false, text: ROUTE_CLASS_REQUIRED_ERROR };
+        const routeClass = input.route_class as RouteClass;
         if (workspaces.length === 0)
           return { ok: false, text: '你的委派白名单是空的——让 User 在联系人配置 delegation.workspaces 里加上允许的路径。' };
         const taskPath = coordinationTaskPath(String(input.prompt ?? '')) ?? '';
         const suppliedProblemFingerprint = typeof input.problem_fingerprint === 'string'
-          && /^[a-f0-9]{64}$/i.test(input.problem_fingerprint.trim())
-          ? input.problem_fingerprint.trim().toLowerCase()
-          : undefined;
-        if (input.problem_fingerprint !== undefined && !suppliedProblemFingerprint) {
-          return { ok: false, text: 'problem_fingerprint 必须是 64 位 sha256。' };
-        }
+          ? input.problem_fingerprint.toLowerCase() : undefined;
         const fingerprint = suppliedProblemFingerprint
           ?? problemFingerprint(String(input.prompt ?? ''), taskPath);
         const workflow = pinnedCoordinationWorkflow(
@@ -372,13 +367,7 @@ export function buildDelegateTools(
           problemFingerprint: fingerprint,
         });
         const expectedRunner = workflow.selected.runner;
-        const explicitRunner = input.runner === undefined
-          ? undefined
-          : RUNNER_VALUES.includes(input.runner as DelegatedRunner)
-            ? input.runner as DelegatedRunner
-            : null;
-        if (explicitRunner === null)
-          return { ok: false, text: `runner 必须是 ${RUNNER_VALUES.join('/')}` };
+        const explicitRunner = input.runner as DelegatedRunner | undefined;
         const overrideProvided = input.runner_override_reason !== undefined;
         const overrideReason = typeof input.runner_override_reason === 'string'
           ? input.runner_override_reason.trim() : '';
@@ -424,8 +413,7 @@ export function buildDelegateTools(
             text: 'model 无效。Claude 固定版本请同时写系列和版本，例如 Opus 4.7 或 claude-opus-4-7；不能只写 4.7。',
           };
         }
-        const effort = typeof input.effort === 'string' && ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(input.effort)
-          ? input.effort : undefined;
+        const effort = typeof input.effort === 'string' ? input.effort : undefined;
         if (effort === 'ultra' && runner !== 'codex') {
           return { ok: false, text: 'ultra 当前只对 Codex runner 开放。' };
         }
@@ -474,18 +462,14 @@ export function buildDelegateTools(
             (created.queueWarning ? `\n⚠ ${created.queueWarning}` : ''),
         };
       },
-    },
-    {
+    }),
+    defineGatewayTool({
       name: 'worker_job_status',
-      description: '查询你派出的 Worker 任务状态、最近日志，并用 result_offset/result_limit 分页 recall 完整回执。',
-      schema: {
-        type: 'object',
-        properties: {
-          job_id: { type: 'string', description: 'delegate_to_worker 返回的任务 id' },
-          result_offset: { type: 'integer', minimum: 0, description: '完整回执起始字符 offset；默认 0' },
-          result_limit: { type: 'integer', minimum: 1, maximum: 12000, description: '本页字符数；默认 4000，最大 12000' },
-        },
-        required: ['job_id'],
+      description: '查询你派出的 Worker 任务状态、最近日志，并用 result_offset/result_limit 分页 recall 完整回执；结果尾部给出 nextOffset/atEnd，同 offset 重复拉取会幂等标注。',
+      inputSchema: {
+        job_id: z.string().describe('delegate_to_worker 返回的任务 id'),
+        result_offset: z.number().int().min(0).optional().describe('完整回执起始字符 offset；默认 0'),
+        result_limit: z.number().int().min(1).max(12000).optional().describe('本页字符数；默认 4000，最大 12000'),
       },
       exec: async (input) => {
         store.reap();
@@ -496,34 +480,41 @@ export function buildDelegateTools(
           .join('\n');
         const payload = job.result ?? job.error ?? '';
         const payloadLabel = job.result ? 'result' : job.error ? 'error' : 'empty';
-        const requestedOffset = Number(input.result_offset);
-        const requestedLimit = Number(input.result_limit);
-        const offset = Number.isFinite(requestedOffset) ? Math.max(Math.floor(requestedOffset), 0) : 0;
-        const limit = Number.isFinite(requestedLimit)
-          ? Math.min(Math.max(Math.floor(requestedLimit), 1), 12_000)
-          : 4_000;
+        const offset = typeof input.result_offset === 'number' ? input.result_offset : 0;
+        const limit = typeof input.result_limit === 'number' ? input.result_limit : 4_000;
         const start = Math.min(offset, payload.length);
         const end = Math.min(start + limit, payload.length);
         const page = payload.slice(start, end);
+        const atEnd = end >= payload.length;
+        const repeatedOffset = recordPaginationRead(contactId, job.id, offset);
         const outcome = payload
           ? [
               `\n完整回执片段（${payloadLabel} ${start}-${end}/${payload.length}）：`,
               page,
-              end < payload.length
+              !atEnd
                 ? `下一页：worker_job_status(job_id="${job.id}", result_offset=${end}, result_limit=${limit})`
                 : '已到全文末尾。',
             ].join('\n')
           : '\n完整回执：（无输出）';
-        return { ok: true, text: `${jobBrief(job)}${outcome}\n最近事件：\n${tail || '（还没有事件）'}` };
+        const repeatNotice = repeatedOffset
+          ? `\n重复分页请求：job=${job.id} offset=${offset}；本页幂等返回，请继续使用 nextOffset=${end}。`
+          : '';
+        const cursor = [
+          `nextOffset=${end}`,
+          `atEnd=${atEnd}`,
+          `repeatedOffset=${repeatedOffset}`,
+        ].join('\n');
+        return {
+          ok: true,
+          text: `${jobBrief(job)}${outcome}\n最近事件：\n${tail || '（还没有事件）'}${repeatNotice}\n${cursor}`,
+        };
       },
-    },
-    {
+    }),
+    defineGatewayTool({
       name: 'worker_job_cancel',
       description: '取消你自己派出的、还没完成的 Worker 任务。',
-      schema: {
-        type: 'object',
-        properties: { job_id: { type: 'string', description: '要取消的任务 id' } },
-        required: ['job_id'],
+      inputSchema: {
+        job_id: z.string().describe('要取消的任务 id'),
       },
       exec: async (input) => {
         const { job, reason } = ownJob(input.job_id);
@@ -532,23 +523,19 @@ export function buildDelegateTools(
         if ('error' in outcome) return { ok: false, text: outcome.error };
         return { ok: true, text: `任务 ${job.id} → ${outcome.status}` };
       },
-    },
-    {
+    }),
+    defineGatewayTool({
       name: 'worker_job_update_delivery',
       description: '事后修正你派出的 Worker 任务交付结论，例如已上线、已闭环、等待决定或需要返工。',
-      schema: {
-        type: 'object',
-        properties: {
-          job_id: { type: 'string', description: 'delegate_to_worker 返回的任务 id' },
-          stage: {
-            type: 'string',
-            enum: ['delivered_waiting_deploy', 'online_waiting_validation', 'closed_loop', 'user_decision', 'rework_required'],
-          },
-          summary: { type: 'string', description: '给人看的交付结论' },
-          next_owner: { type: 'string', description: '下一步唯一负责人' },
-          blocker: { type: 'string', description: '可选阻塞原因' },
-        },
-        required: ['job_id', 'stage'],
+      inputSchema: {
+        job_id: z.string().describe('delegate_to_worker 返回的任务 id'),
+        stage: z.enum([
+          'waiting_review', 'delivered_waiting_deploy', 'online_waiting_validation',
+          'closed_loop', 'user_decision', 'rework_required',
+        ]).describe('新的交付结论'),
+        summary: z.string().optional().describe('给人看的交付结论'),
+        next_owner: z.string().optional().describe('下一步唯一负责人'),
+        blocker: z.string().optional().describe('可选阻塞原因'),
       },
       exec: async (input) => {
         const { job, reason } = ownJob(input.job_id);
@@ -562,7 +549,7 @@ export function buildDelegateTools(
         if ('error' in outcome) return { ok: false, text: outcome.error };
         return { ok: true, text: `任务 ${job.id} 的交付结论已更新为 ${input.stage}` };
       },
-    },
+    }),
   ];
 }
 

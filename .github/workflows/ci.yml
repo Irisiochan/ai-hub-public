@@ -1,0 +1,35 @@
+name: core-checks
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        area: [server, web, worker]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install locked dependencies
+        if: matrix.area != 'worker'
+        run: npm ci --prefix "${{ matrix.area }}" --no-audit --no-fund
+      - name: Build
+        if: matrix.area != 'worker'
+        run: npm run build --prefix "${{ matrix.area }}"
+      - name: Test
+        run: npm test --prefix "${{ matrix.area }}"
+      - name: Worker state events
+        if: matrix.area == 'server'
+        working-directory: server
+        run: node --import tsx scripts/smoke-worker-control.ts

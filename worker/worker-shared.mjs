@@ -10,12 +10,15 @@ import { verificationDispatchKey, legacyVerificationDispatchKey } from './triage
 
 export const reminderShadow = process.argv.includes('--reminder-shadow');
 export const reminderOnce = process.argv.includes('--task-reminders');
-export const once = process.argv.includes('--once') || reminderShadow;
+export const routeAutoCleanupOnce = process.argv.includes('--route-auto-cleanup');
+export const once = process.argv.includes('--once') || reminderShadow || routeAutoCleanupOnce;
 export const metricsOnly = process.argv.includes('--metrics');
 /** 手动扫一次待拆分需求：`node triage-worker.mjs --once --sweep` */
 export const sweepOnce = process.argv.includes('--sweep');
 /** 手动跑一次 Agenda shadow：`node triage-worker.mjs --once --agenda` */
 export const agendaOnce = process.argv.includes('--agenda');
+/** 手动扫一次路由初筛：`node triage-worker.mjs --once --route-triage` */
+export const routeTriageOnce = process.argv.includes('--route-triage');
 
 export function log(level, message, fields = {}) {
   process.stdout.write(`${JSON.stringify({
@@ -53,6 +56,7 @@ export const DATE_EVENT_CLAIMS_KEY = 'date-event-claims:v1';
 // caps runaway churn via safetyEvents.maxPerEventPerDay.
 export const SAFETY_EVENT_CLAIMS_KEY = 'safety-event-claims:v1';
 export const COORDINATION_SOURCE = 'coordination-sweep';
+export const ROUTE_TRIAGE_SOURCE = 'route-triage';
 export const COORDINATION_STATE_KEY = 'coordination:v1';
 export const VERIFICATION_MODE = 'coordination-verification';
 export const HUB_AUTO_HYGIENE_MODE = 'hub-auto-hygiene';

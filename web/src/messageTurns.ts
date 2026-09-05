@@ -5,17 +5,12 @@ export type MessageTimelineEntry =
       type: 'message';
       key: string;
       message: Message;
-      turnId: string | null;
-      isFinalTurnBlock: boolean;
-      compactWithPrevious: boolean;
-    }
+      }
   | {
-      type: 'tools';
+      type: 'turn';
       key: string;
       messages: Message[];
-      turnId: string | null;
-      isFinalTurnBlock: boolean;
-      compactWithPrevious: boolean;
+      turnId: string;
     };
 
 export interface MessageSelectionUnit {
@@ -24,10 +19,6 @@ export interface MessageSelectionUnit {
   messageIds: number[];
   deleteScope?: 'turn';
 }
-
-type RawMessageTimelineEntry =
-  | { type: 'message'; key: string; message: Message; turnId: string | null }
-  | { type: 'tools'; key: string; messages: Message[]; turnId: string | null };
 
 export function assistantTurnId(message: Message): string | null {
   return message.role !== 'user' && message.turn_id ? message.turn_id : null;
@@ -68,41 +59,36 @@ export function buildMessageSelectionUnits(messages: Message[]): MessageSelectio
   return [...units.values()];
 }
 
-/**
- * Preserve timeline order while collapsing every turn's tool rows into one block.
- * `turn_id` is the runtime's durable assistant-turn boundary; no timing heuristic is used.
- */
+/** Preserve order while turning each contiguous durable assistant turn into one cluster. */
 export function buildMessageTimeline(messages: Message[]): MessageTimelineEntry[] {
-  const toolGroups = new Map<string, Message[]>();
-  for (const message of messages) {
-    if (message.kind !== 'tool_use') continue;
-    const key = message.turn_id ?? `message-${message.id}`;
-    toolGroups.set(key, [...(toolGroups.get(key) ?? []), message]);
-  }
-
-  const raw: RawMessageTimelineEntry[] = [];
+  const timeline: MessageTimelineEntry[] = [];
+  let clusterSequence = 0;
   for (const message of messages) {
     if (!isRenderable(message)) continue;
     const turnId = assistantTurnId(message);
-    if (message.kind !== 'tool_use') {
-      raw.push({ type: 'message', key: `message-${message.id}`, message, turnId });
+    // Errors keep their standalone semantic card even when the runtime attached
+    // a turn id. User and legacy rows also retain single-message semantics.
+    if (!turnId || message.kind === 'error') {
+      timeline.push({ type: 'message', key: `message-${message.id}`, message });
       continue;
     }
-
-    const toolKey = message.turn_id ?? `message-${message.id}`;
-    const group = toolGroups.get(toolKey) ?? [message];
-    if (group[0].id !== message.id) continue;
-    raw.push({ type: 'tools', key: `tools-${toolKey}`, messages: group, turnId });
+    const previous = timeline[timeline.length - 1];
+    if (previous?.type === 'turn' && previous.turnId === turnId) {
+      previous.messages.push(message);
+      continue;
+    }
+    clusterSequence += 1;
+    timeline.push({
+      type: 'turn',
+      key: `turn-${turnId}-${clusterSequence}`,
+      messages: [message],
+      turnId,
+    });
   }
+  return timeline;
+}
 
-  const finalBlockByTurn = new Map<string, string>();
-  for (const entry of raw) {
-    if (entry.turnId) finalBlockByTurn.set(entry.turnId, entry.key);
-  }
-
-  return raw.map((entry, index) => ({
-    ...entry,
-    isFinalTurnBlock: Boolean(entry.turnId && finalBlockByTurn.get(entry.turnId) === entry.key),
-    compactWithPrevious: Boolean(entry.turnId && raw[index - 1]?.turnId === entry.turnId),
-  }));
+/** Shared by the memoized turn component and regression tests. */
+export function sameMessageReferences(previous: Message[], next: Message[]): boolean {
+  return previous.length === next.length && previous.every((message, index) => message === next[index]);
 }

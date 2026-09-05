@@ -7,6 +7,7 @@ import {
   type FollowupJobInput,
 } from '../../sideJobActions';
 import { useConfirm } from '../ConfirmDialog';
+import { Icon } from '../icons';
 
 interface Props {
   message: Message;
@@ -88,13 +89,16 @@ export default function SideJobActions({ message, job, onHandled, onRework, onFo
     <div className="side-job-action-wrap">
       <div className="side-job-actions" aria-label="Worker 回执操作">
         <button type="button" onClick={() => void rework()} disabled={busy !== null}>
-          {busy === 'rework' ? '派单中…' : '↩ 打回重做'}
+          <Icon name="regenerate" />
+          <span>{busy === 'rework' ? '派单中…' : '打回重做'}</span>
         </button>
         <button type="button" onClick={() => setPanel(panel === 'followup' ? null : 'followup')} disabled={busy !== null}>
-          ＋ 再派一单
+          <Icon name="plus" />
+          <span>再派一单</span>
         </button>
         <button type="button" onClick={() => setPanel(panel === 'done' ? null : 'done')} disabled={busy !== null || donePath !== null}>
-          {donePath ? '✓ 已置 done' : '✓ 置 done'}
+          <Icon name="check" />
+          <span>{donePath ? '已置 done' : '置 done'}</span>
         </button>
         {createdId && <span title={createdId}>已派出新任务</span>}
       </div>

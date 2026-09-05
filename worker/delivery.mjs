@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const DEFAULT_RECONCILE_GRACE_MS = 10 * 60_000;
+export const MAX_RECEIPT_CHANGED_FILES = 50;
 
 function runGit(cwd, args) {
   return new Promise((resolve) => {
@@ -39,6 +40,40 @@ function statusFiles(raw) {
     .filter(Boolean)
     .map((entry) => entry.length > 3 ? entry.slice(3) : entry)
     .filter(Boolean);
+}
+
+function normalizeChangedFiles(value) {
+  const rawFiles = Array.isArray(value)
+    ? value
+    : value && typeof value === 'object' && Array.isArray(value.files) ? value.files : [];
+  const files = [...new Set(rawFiles
+    .filter((item) => typeof item === 'string')
+    .map((item) => item.trim().replaceAll('\\', '/'))
+    .filter(Boolean))];
+  const declaredTotal = value && typeof value === 'object' && Number.isSafeInteger(value.total)
+    ? Math.max(Number(value.total), files.length)
+    : files.length;
+  const total = Math.max(declaredTotal, files.length);
+  return {
+    files: files.slice(0, MAX_RECEIPT_CHANGED_FILES),
+    total,
+    truncated: total > MAX_RECEIPT_CHANGED_FILES || files.length > MAX_RECEIPT_CHANGED_FILES
+      || (value && typeof value === 'object' && value.truncated === true),
+  };
+}
+
+function normalizeTestConclusions(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const suite = typeof item.suite === 'string' ? item.suite.replace(/\s+/g, ' ').trim().slice(0, 160) : '';
+    const rawStatus = typeof item.status === 'string'
+      ? item.status.trim().toLowerCase()
+      : typeof item.pass === 'boolean' ? (item.pass ? 'pass' : 'fail') : '';
+    if (!suite || !['pass', 'fail'].includes(rawStatus)) return [];
+    const detail = typeof item.detail === 'string' ? item.detail.replace(/\s+/g, ' ').trim().slice(0, 300) : '';
+    return [{ suite, status: rawStatus, ...(detail ? { detail } : {}) }];
+  }).slice(0, 100);
 }
 
 function untrackedFingerprint(cwd, rawStatus) {
@@ -110,6 +145,7 @@ function normalizeDeliveryDeclaration(value) {
   if (typeof committed !== 'boolean' || typeof pushed !== 'boolean') return null;
   if (pushed && !committed) return null;
   const allowedStages = new Set([
+    'waiting_review',
     'delivered_waiting_deploy',
     'online_waiting_validation',
     'closed_loop',
@@ -124,6 +160,11 @@ function normalizeDeliveryDeclaration(value) {
     ? value.nextOwner.trim().slice(0, 100)
     : typeof value.next_owner === 'string' ? value.next_owner.trim().slice(0, 100) : '';
   const blocker = typeof value.blocker === 'string' ? value.blocker.trim().slice(0, 100) : '';
+  const diffstat = typeof value.diffstat === 'string'
+    ? value.diffstat.replace(/\s+/g, ' ').trim().slice(0, 1000)
+    : '';
+  const changedFiles = normalizeChangedFiles(value.changedFiles ?? value.changed_files);
+  const tests = normalizeTestConclusions(value.tests ?? value.testResults ?? value.test_results);
   return {
     committed,
     pushed,
@@ -134,6 +175,44 @@ function normalizeDeliveryDeclaration(value) {
       ? { needsUserDecision: true }
       : {}),
     ...(blocker ? { blocker } : {}),
+    ...(diffstat ? { diffstat } : {}),
+    ...(changedFiles.total > 0 ? { changedFiles } : {}),
+    ...(tests.length > 0 ? { tests } : {}),
+  };
+}
+
+/**
+ * Build the one structured receipt source. Git facts are collected by the thin
+ * harness; test conclusions are transported from the runner declaration
+ * without model summarization.
+ */
+export async function collectStructuredReceipt(cwd, before, after, declaration) {
+  const normalized = normalizeDeliveryDeclaration(declaration) ?? {};
+  let diffstat = '';
+  let changedFiles = [];
+  if (before?.head && after?.head && before.head !== after.head) {
+    const [rawDiffstat, rawFiles] = await Promise.all([
+      runGit(cwd, ['diff', '--shortstat', before.head, after.head]),
+      runGit(cwd, ['diff', '--name-only', '-z', before.head, after.head]),
+    ]);
+    diffstat = rawDiffstat?.replace(/\s+/g, ' ').trim() ?? '';
+    changedFiles = rawFiles ? rawFiles.split('\0').filter(Boolean) : [];
+  } else if (after?.dirty) {
+    const rawDiffstat = await runGit(cwd, ['diff', '--shortstat', 'HEAD']);
+    diffstat = rawDiffstat?.replace(/\s+/g, ' ').trim() ?? '';
+    changedFiles = after.dirtyFiles ?? [];
+  }
+
+  const declaredFiles = normalized.changedFiles ?? null;
+  const files = changedFiles.length > 0
+    ? normalizeChangedFiles(changedFiles)
+    : declaredFiles;
+  return {
+    branch: after?.branch ?? null,
+    head: after?.head ?? null,
+    diffstat: diffstat || normalized.diffstat || null,
+    changedFiles: files?.total > 0 ? files : null,
+    tests: normalized.tests ?? [],
   };
 }
 

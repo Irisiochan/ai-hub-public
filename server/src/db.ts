@@ -89,6 +89,18 @@ export interface WorkerRow {
   created_at: string;
 }
 
+export interface HeartbeatSessionRow {
+  id: string;
+  contact_id: string;
+  started_at: string;
+  expires_at: string | null;
+  interval_minutes: number;
+  tick_count: number;
+  last_tick_at: string | null;
+  stopped_at: string | null;
+  stop_reason: 'manual' | 'expired' | null;
+}
+
 export interface JobRow {
   id: string;
   requested_by: string | null;

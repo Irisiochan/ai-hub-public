@@ -1,0 +1,156 @@
+:root {
+  /* The only non-zero motion durations in web/src. */
+  --motion-press: 150ms;
+  --motion-micro: 190ms;
+  --motion-enter: 300ms;
+  --motion-exit: 250ms;
+  --motion-pulse: 800ms;
+  --motion-status-pulse: 1200ms;
+  --motion-job-pulse: 1400ms;
+  --motion-breathe: 1600ms;
+  --motion-ease: cubic-bezier(.4, 0, .2, 1);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .2; }
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .45; transform: scale(.86); }
+}
+
+@keyframes contact-enter {
+  from { opacity: 0; transform: translateX(18px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes contact-exit {
+  from { opacity: 1; transform: translateX(0); visibility: visible; }
+  to { opacity: 0; transform: translateX(-10px); visibility: hidden; }
+}
+
+@keyframes drawer-enter {
+  from { opacity: 0; transform: translateX(18px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes drawer-exit {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(18px); }
+}
+
+@keyframes sheet-enter {
+  from { opacity: 0; transform: translateY(100%); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes sheet-exit {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(100%); }
+}
+
+@keyframes cluster-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes badge-enter {
+  from { opacity: 0; transform: scale(.78); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes badge-exit {
+  from { opacity: 1; transform: scale(1); }
+  to { opacity: 0; transform: scale(.78); }
+}
+
+@keyframes control-swap {
+  0% { opacity: .25; transform: scale(.82); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes fade-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fade-exit {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+/* Each interaction has exactly two states: enter and exit. */
+.chat-pane[data-motion-state='enter'] { animation: contact-enter var(--motion-enter) var(--motion-ease) both; }
+.chat-pane[data-motion-state='exit'] { animation: contact-exit var(--motion-exit) var(--motion-ease) both; pointer-events: none; }
+.runtime[data-motion-state='enter'] { animation: drawer-enter var(--motion-enter) var(--motion-ease) both; }
+.runtime[data-motion-state='exit'] { animation: drawer-exit var(--motion-exit) var(--motion-ease) both; pointer-events: none; }
+.sheet[data-motion-state='enter'] { animation: sheet-enter var(--motion-enter) var(--motion-ease) both; }
+.sheet[data-motion-state='exit'] { animation: sheet-exit var(--motion-exit) var(--motion-ease) both; pointer-events: none; }
+.message-timeline-item[data-motion-state='enter'],
+.assistant-turn-cluster[data-motion-state='enter'] { animation: cluster-enter var(--motion-micro) var(--motion-ease) both; }
+.unread-badge[data-motion-state='enter'] { animation: badge-enter var(--motion-micro) var(--motion-ease) both; }
+.unread-badge[data-motion-state='exit'] { animation: badge-exit var(--motion-micro) var(--motion-ease) both; }
+.send-btn[data-control-state] .icon { animation: control-swap var(--motion-press) var(--motion-ease) both; }
+.proc-body[data-motion-state='enter'] { animation: cluster-enter var(--motion-micro) var(--motion-ease) both; }
+
+/* Reduced keeps opacity feedback only; spatial motion and scale are removed. */
+html[data-motion-level='reduced'] * {
+  transition-property: opacity !important;
+}
+html[data-motion-level='reduced'] .chat-pane[data-motion-state='enter'],
+html[data-motion-level='reduced'] .contact-list[data-motion-state='enter'],
+html[data-motion-level='reduced'] .runtime[data-motion-state='enter'],
+html[data-motion-level='reduced'] .sheet[data-motion-state='enter'],
+html[data-motion-level='reduced'] .message-timeline-item[data-motion-state='enter'],
+html[data-motion-level='reduced'] .assistant-turn-cluster[data-motion-state='enter'],
+html[data-motion-level='reduced'] .unread-badge[data-motion-state='enter'],
+html[data-motion-level='reduced'] .send-btn[data-control-state] .icon,
+html[data-motion-level='reduced'] .proc-body[data-motion-state='enter'] {
+  animation-name: fade-enter !important;
+}
+html[data-motion-level='reduced'] .runtime[data-motion-state='exit'],
+html[data-motion-level='reduced'] .contact-list[data-motion-state='exit'],
+html[data-motion-level='reduced'] .chat-pane[data-motion-state='exit'],
+html[data-motion-level='reduced'] .sheet[data-motion-state='exit'],
+html[data-motion-level='reduced'] .unread-badge[data-motion-state='exit'] {
+  animation-name: fade-exit !important;
+}
+html[data-motion-level='reduced'] .state-dot,
+html[data-motion-level='reduced'] .chat-state-dot,
+html[data-motion-level='reduced'] .cursor,
+html[data-motion-level='reduced'] .job-dot.running,
+html[data-motion-level='reduced'] .job-dot.claimed,
+html[data-motion-level='reduced'] .job-dot.recovering {
+  animation-name: pulse !important;
+}
+html[data-motion-level='reduced'] button:hover {
+  transform: none !important;
+}
+html[data-motion-level='reduced'] .sheet:not([data-motion-state]) {
+  animation-name: fade-enter !important;
+}
+
+html[data-motion-level='off'] *,
+html[data-motion-level='off'] *::before,
+html[data-motion-level='off'] *::after {
+  animation-duration: 0ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  scroll-behavior: auto !important;
+  transition-duration: 0ms !important;
+  transition-delay: 0ms !important;
+}
+
+/* Synchronous fallback before initializeUiPreferences applies the data value. */
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-motion-level]) * {
+    transition-property: opacity !important;
+  }
+}
+
+@media (max-width: 1023px) {
+  .runtime[data-motion-state='enter'] { animation-name: sheet-enter; }
+  .runtime[data-motion-state='exit'] { animation-name: sheet-exit; }
+}

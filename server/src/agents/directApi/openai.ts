@@ -188,6 +188,15 @@ export class OpenAiProvider implements DirectApiProvider<OpenAiConversation> {
     });
     for (const result of results) {
       conversation.messages.push({ role: 'tool', tool_call_id: result.id, content: result.text });
+      if (result.image) {
+        conversation.messages.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: `工具 ${result.name} 返回的画面：` },
+            { type: 'image_url', image_url: { url: `data:${result.image.mimeType};base64,${result.image.data}` } },
+          ],
+        });
+      }
     }
     conversation.toolRound++;
   }

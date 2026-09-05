@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="0 0 320 320">
+  <title>AI Hub quiet grid low-contrast wallpaper</title>
+  <g fill="none" stroke="#65c9ad" stroke-width="1" opacity="0.05">
+    <path d="M0 80h320M0 160h320M0 240h320M80 0v320M160 0v320M240 0v320"/>
+    <circle cx="80" cy="80" r="4"/><circle cx="240" cy="160" r="4"/><circle cx="160" cy="240" r="4"/>
+  </g>
+</svg>

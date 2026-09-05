@@ -45,6 +45,7 @@ export interface ProviderToolCall {
 export interface ProviderToolResult extends ProviderToolCall {
   ok: boolean;
   text: string;
+  image?: { data: string; mimeType: string };
 }
 
 export interface ProviderRoundUsage {

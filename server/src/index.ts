@@ -12,7 +12,7 @@ import { SoftDeletePurge } from './purge.js';
 import { ClaudeQuotaPoller } from './quota/claudeQuota.js';
 import { CodexQuotaPoller } from './quota/codexQuota.js';
 import { GrokQuotaPoller } from './quota/grokQuota.js';
-import { ensureCodexContact, ensureGrokContact, seedIfEmpty } from './seed.js';
+import { ensureCodexContact, ensureGrokContact, ensureMuseContact, seedIfEmpty } from './seed.js';
 import { createServer } from './server.js';
 import { SseHub } from './sse.js';
 import { VaultTaskProjection } from './tasks/vaultProjection.js';
@@ -20,6 +20,10 @@ import { JobStore } from './workers/jobStore.js';
 import { DeployReceiptPoller } from './workers/deployReceipt.js';
 import { loadWechatChannelConfig } from './wechat/config.js';
 import { WechatChannel } from './wechat/channel.js';
+import { CameraSnapBroker } from './workers/cameraSnap.js';
+import { TaobaoBridge } from './workers/taobaoBridge.js';
+import { CompanionHeartbeat } from './agents/companionHeartbeat.js';
+import { LedgerSummaryService } from './ledger/summary.js';
 
 const logger = createLogger();
 const config = loadConfig();
@@ -27,6 +31,7 @@ const db = openDb(config.dbPath);
 seedIfEmpty(db, config, logger);
 ensureCodexContact(db, config, logger);
 ensureGrokContact(db, config, logger);
+ensureMuseContact(db, config, logger);
 const orphanUploads = cleanupOrphanUploads(db, config.uploadsDir);
 if (orphanUploads > 0) logger.info({ component: 'uploads', count: orphanUploads }, 'orphan uploads cleaned');
 for (const issue of auditRoomOrchestratorConfigs(db)) {
@@ -45,7 +50,11 @@ const deployReceipts = new DeployReceiptPoller(
   jobStore,
   (message, meta) => logger.info({ component: 'deploy-receipt', ...meta }, message),
 );
-const manager = new AgentManager({ db, sse, config, vault, jobStore, logger });
+const broker = new CameraSnapBroker(logger);
+const taobao = new TaobaoBridge(logger);
+const manager = new AgentManager({ db, sse, config, vault, jobStore, broker, taobao, logger });
+const heartbeat = new CompanionHeartbeat({ db, sse, manager, broker, taobao, config, logger });
+manager.attachHeartbeat(heartbeat);
 const wechatChannel = new WechatChannel({
   config: loadWechatChannelConfig(path.dirname(config.dbPath)),
   db,
@@ -66,6 +75,7 @@ const grokQuotaPoller = new GrokQuotaPoller(
   (message, fields) => logger.warn({ component: 'quota.grok', ...fields }, message),
 );
 
+const ledgerSummary = new LedgerSummaryService(db, logMessage(logger, 'ledger'));
 const app = createServer({
   config,
   db,
@@ -73,6 +83,9 @@ const app = createServer({
   vault,
   jobStore,
   manager,
+  heartbeat,
+  broker,
+  taobao,
   dbBackup,
   softPurge,
   quotaPoller,
@@ -82,14 +95,24 @@ const app = createServer({
   wechatChannel,
   hubToken: process.env.HUB_TOKEN,
   corsOrigins: process.env.HUB_CORS_ORIGINS,
+  ledgerSummary,
 });
+const recoveredRoomDispatches = manager.recoverDeferredRoomDispatches();
+if (recoveredRoomDispatches > 0) {
+  logger.info(
+    { component: 'room-drain', recovered: recoveredRoomDispatches },
+    'durable room dispatches recovered after gateway restart',
+  );
+}
 
 dbBackup.start();
 softPurge.start();
+ledgerSummary.start();
 quotaPoller.start();
 codexQuotaPoller.start();
 grokQuotaPoller.start();
 deployReceipts.start();
+heartbeat.start();
 taskProjection?.start();
 jobStore.startOutOfBandResolver();
 const outboxBackfilled = jobStore.startOutboxProcessor();
@@ -115,11 +138,13 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ component: 'gateway', signal }, 'graceful shutdown started');
   server.close();
   const wechatStop = wechatChannel.stop();
-  await manager.stopAll();
+  heartbeat.stop();
+  await manager.stopAll(signal === 'SIGTERM' ? 'deploy-restart' : 'claude-error');
   await wechatStop;
   sse.close();
   dbBackup.stop();
   softPurge.stop();
+  ledgerSummary.stop();
   codexQuotaPoller.stop();
   grokQuotaPoller.stop();
   deployReceipts.stop();

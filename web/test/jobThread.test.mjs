@@ -5,6 +5,8 @@ import path from 'node:path';
 const root = path.resolve(import.meta.dirname, '..');
 const source = fs.readFileSync(path.join(root, 'src/components/JobThread.tsx'), 'utf8');
 const workerPanel = fs.readFileSync(path.join(root, 'src/components/WorkerPanel.tsx'), 'utf8');
+const list = fs.readFileSync(path.join(root, 'src/components/chat/MessageList.tsx'), 'utf8');
+const pane = fs.readFileSync(path.join(root, 'src/components/ChatPane.tsx'), 'utf8');
 const styles = fs.readFileSync(path.join(root, 'src/styles.css'), 'utf8');
 
 assert.match(source, /useState\(false\)/, 'execution process must be hidden by default');
@@ -31,5 +33,12 @@ assert.match(workerPanel, /className="job-detail-scroll"/, 'WorkerPanel logs mus
 assert.match(workerPanel, /setSelectedId\(null\)/, 'WorkerPanel must be able to clear the selected job');
 assert.match(workerPanel, /resolveSelectedOutOfBand/, 'WorkerPanel must expose manual out-of-band completion');
 assert.match(workerPanel, /selected\.status === 'blocked'/, 'WorkerPanel action must only be offered for blocked jobs');
+assert.match(list, /isRoom && \(jobsByMessage\.get\(message\.id\)/, 'anchored JobThread cards mount only in rooms');
+assert.match(list, /isRoom && looseJobs\.map/, 'loose JobThread cards mount only in rooms');
+assert.match(pane, /useWorkerState\(\(state\) => state\.jobs\)/, 'room task cards must derive from the shared job source');
+for (const component of [pane, source, workerPanel]) {
+  assert.doesNotMatch(component, /setInterval\(/, 'task components must not own polling loops');
+}
+assert.match(pane, /visibleJobsForContact\(\s*contact\.id,[\s\S]*JOB_ACTIVE,\s*contact\.kind,?\s*\)/);
 
 console.log('job thread execution viewer checks passed');

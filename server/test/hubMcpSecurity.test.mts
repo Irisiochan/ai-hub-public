@@ -54,7 +54,7 @@ db.prepare(
 ).run(JSON.stringify({ delegation: { enabled: true, workspaces: ['C:/ai-hub-codex'], allowShell: true } }));
 db.prepare(
   `INSERT INTO contacts (id, name, backend, kind, config) VALUES ('aye', 'Aye', 'grok-cli', 'dm', ?)`
-).run(JSON.stringify({ delegation: { enabled: false } }));
+).run(JSON.stringify({ delegation: { enabled: false }, heartbeat: { enabled: false } }));
 
 async function post(base: string, contactId: string, authorization?: string): Promise<number> {
   const response = await fetch(`${base}/hub-mcp/${contactId}`, {
@@ -85,6 +85,51 @@ try {
   assert.equal(await post(enforceBase, 'ghost', `Bearer ${hubMcpBearerToken(HUB_TOKEN, 'codex')}`), 401, '伪造不存在的 contactId 也过不了对应 token 校验');
   assert.equal(await post(enforceBase, 'aye', `Bearer ${hubMcpBearerToken(HUB_TOKEN, 'aye')}`), 403, '凭证正确但 delegation 未开启 → 403（撤销通道）');
   assert.equal(await post(enforceBase, 'codex', `Bearer ${coveToken}`), 200, '正确 per-contact token 放行');
+
+  // OpenCode 1.18.x 使用旧 HTTP+SSE：GET 建流，再 POST 到 endpoint 事件给出的地址。
+  const rejectedSse = await fetch(`${enforceBase}/hub-mcp/codex`, {
+    headers: { accept: 'text/event-stream' },
+  });
+  assert.equal(rejectedSse.status, 401, 'SSE 建流同样必须携带 per-contact token');
+  await rejectedSse.text();
+
+  const sseAbort = new AbortController();
+  const sseResponse = await fetch(`${enforceBase}/hub-mcp/codex`, {
+    headers: { accept: 'text/event-stream', authorization: `Bearer ${coveToken}` },
+    signal: sseAbort.signal,
+  });
+  assert.equal(sseResponse.status, 200, '正确 token 应建立 SSE');
+  assert.match(sseResponse.headers.get('content-type') ?? '', /^text\/event-stream/);
+  const sseReader = sseResponse.body!.getReader();
+  const firstEvent = await sseReader.read();
+  const firstEventText = new TextDecoder().decode(firstEvent.value);
+  const endpointMatch = firstEventText.match(/event: endpoint\r?\ndata: ([^\r\n]+)/);
+  assert.ok(endpointMatch, 'SSE 必须发布带 sessionId 的消息 endpoint');
+  const messageUrl = new URL(endpointMatch[1], new URL(enforceBase).origin);
+
+  const rejectedMessage = await fetch(messageUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'initialize', params: {}, id: 1 }),
+  });
+  assert.equal(rejectedMessage.status, 401, 'SSE 消息 POST 也必须重新鉴权');
+
+  const acceptedMessage = await fetch(messageUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${coveToken}` },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1' } },
+      id: 1,
+    }),
+  });
+  assert.equal(acceptedMessage.status, 202, '正确 token + sessionId 的 SSE 消息应被接收');
+  const responseEvent = await sseReader.read();
+  assert.match(new TextDecoder().decode(responseEvent.value), /event: message/, 'MCP 响应应回到同一 SSE 流');
+  sseAbort.abort();
+  await sseReader.cancel().catch(() => undefined);
+
   assert.ok(
     auditRecords.filter((entry) => entry.component === 'hub-mcp').length >= 3,
     '每次拒绝都必须留审计记录'

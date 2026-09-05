@@ -7,6 +7,7 @@ import {
   type TurnHandle,
   type TurnInput,
 } from './types.js';
+import { TurnTimeoutController, resolveTurnTimeouts, timeoutTurnEvent } from './turnTimeouts.js';
 
 export interface ClaudeCliBackendOpts {
   cliPath: string;
@@ -18,7 +19,9 @@ export interface ClaudeCliBackendOpts {
   appendSystemPrompt?: string;
   permissionMode?: string;
   mcpConfig?: string;
-  turnTimeoutMs: number;
+  turnTimeoutMs?: number;
+  turnIdleTimeoutMs?: number;
+  turnHardTimeoutMs?: number;
   log: (msg: string) => void;
 }
 
@@ -70,7 +73,7 @@ export class ClaudeCliBackend implements AgentBackend {
   private sessionId: string | null = null;
   private sessionAnnounced = false;
   private turn: AsyncQueue<TurnEvent> | null = null;
-  private turnTimer: NodeJS.Timeout | null = null;
+  private turnTimeouts: TurnTimeoutController | null = null;
   private sawStreamText = false;
   private sawStreamThinking = false;
   private accText = '';
@@ -140,7 +143,7 @@ export class ClaudeCliBackend implements AgentBackend {
     proc.on('exit', ({ code, signal }: { code: number | null; signal: string | null }) => {
       this.opts.log(`claude exited code=${code} signal=${signal}`);
       if (this.turn) {
-        this.turn.push({
+        this.emit({
           type: 'error',
           message: `claude 进程退出了 (code=${code})${this.stderrSnippet(' — ')}`,
           fatal: true,
@@ -207,12 +210,15 @@ export class ClaudeCliBackend implements AgentBackend {
       queue.push({ type: 'error', message: 'claude 进程不在线，发送失败', fatal: true });
       this.finishTurn();
     } else {
-      this.turnTimer = setTimeout(() => {
-        this.opts.log('turn timeout, interrupting');
+      const timeouts = resolveTurnTimeouts(this.opts);
+      this.turnTimeouts = new TurnTimeoutController(timeouts, (kind) => {
+        if (this.turn !== queue) return;
+        this.opts.log(`${kind} turn timeout, interrupting`);
         void this.interrupt();
-        queue.push({ type: 'error', message: '这轮超时了，已打断', fatal: false });
+        queue.push(timeoutTurnEvent(kind));
         this.finishTurn();
-      }, this.opts.turnTimeoutMs);
+      });
+      this.turnTimeouts.start();
     }
 
     return {
@@ -230,13 +236,16 @@ export class ClaudeCliBackend implements AgentBackend {
   }
 
   private finishTurn(): void {
-    if (this.turnTimer) {
-      clearTimeout(this.turnTimer);
-      this.turnTimer = null;
-    }
+    this.turnTimeouts?.finish();
+    this.turnTimeouts = null;
     this.turn?.end();
     this.turn = null;
     this.allowedImagePaths.clear();
+  }
+
+  private emit(event: TurnEvent): void {
+    this.turnTimeouts?.activity(event);
+    this.turn?.push(event);
   }
 
   // ── line routing ───────────────────────────────────────
@@ -271,7 +280,7 @@ export class ClaudeCliBackend implements AgentBackend {
     this.sessionId = sessionId;
     if (this.turn) {
       this.sessionAnnounced = true;
-      this.turn.push({ type: 'session', sessionId });
+      this.emit({ type: 'session', sessionId });
     } else {
       this.sessionAnnounced = false;
     }
@@ -283,10 +292,10 @@ export class ClaudeCliBackend implements AgentBackend {
     if (delta?.type === 'text_delta' && delta.text) {
       this.sawStreamText = true;
       this.accText += delta.text;
-      this.turn.push({ type: 'delta', text: delta.text });
+      this.emit({ type: 'delta', text: delta.text });
     } else if (delta?.type === 'thinking_delta' && delta.thinking) {
       this.sawStreamThinking = true;
-      this.turn.push({ type: 'thinking', text: delta.thinking });
+      this.emit({ type: 'thinking', text: delta.thinking });
     }
   }
 
@@ -299,13 +308,13 @@ export class ClaudeCliBackend implements AgentBackend {
         try {
           summary = JSON.stringify(block.input).slice(0, 200);
         } catch {}
-        this.turn.push({ type: 'tool_use', name: block.name, inputSummary: summary });
+        this.emit({ type: 'tool_use', name: block.name, inputSummary: summary });
       } else if (block.type === 'text' && block.text && !this.sawStreamText) {
         // fallback when --include-partial-messages produced no deltas
         this.accText += block.text;
-        this.turn.push({ type: 'delta', text: block.text });
+        this.emit({ type: 'delta', text: block.text });
       } else if (block.type === 'thinking' && block.thinking && !this.sawStreamThinking) {
-        this.turn.push({ type: 'thinking', text: block.thinking });
+        this.emit({ type: 'thinking', text: block.thinking });
       }
     }
   }
@@ -322,7 +331,7 @@ export class ClaudeCliBackend implements AgentBackend {
           .filter((c: any) => c.type === 'text')
           .map((c: any) => c.text)
           .join(' ');
-      this.turn.push({
+      this.emit({
         type: 'tool_result',
         name,
         ok: !block.is_error,
@@ -343,7 +352,7 @@ export class ClaudeCliBackend implements AgentBackend {
         }
       : undefined;
     if (line.is_error) {
-      this.turn.push({
+      this.emit({
         type: 'error',
         message: typeof line.result === 'string' && line.result ? line.result : 'claude 返回了错误',
         fatal: false,
@@ -351,7 +360,7 @@ export class ClaudeCliBackend implements AgentBackend {
     } else {
       const finalText =
         typeof line.result === 'string' && line.result.length > 0 ? line.result : this.accText;
-      this.turn.push({ type: 'done', finalText, usage });
+      this.emit({ type: 'done', finalText, usage });
     }
     this.finishTurn();
   }
@@ -371,7 +380,7 @@ export class ClaudeCliBackend implements AgentBackend {
       },
     });
     if (decision.behavior === 'deny') {
-      this.turn?.push({
+      this.emit({
         type: 'tool_result',
         name: req.tool_name ?? 'tool',
         ok: false,

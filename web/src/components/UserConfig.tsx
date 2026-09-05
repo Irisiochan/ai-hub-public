@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react';
 import { api, type UserProfile } from '../api';
+import { Icon } from './icons';
+import ThemeSettings from './ThemeSettings';
+import MotionSoundSettings from './MotionSoundSettings';
 import {
   checkForAppUpdate,
   decideAppUpdate,
@@ -76,9 +79,9 @@ export default function UserConfig({ user, onClose }: Props) {
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal user-config-modal" onClick={(e) => e.stopPropagation()}>
         <header className="modal-header">
-          <h2>我的资料与更新</h2>
+          <h2>我的资料与设置</h2>
           <button className="modal-close" onClick={onClose}>
-            ✕
+            <Icon name="close" />
           </button>
         </header>
         <div className="modal-body">
@@ -96,6 +99,8 @@ export default function UserConfig({ user, onClose }: Props) {
               <input type="color" value={color} onChange={(e) => setColor(e.target.value)} />
             </label>
           </div>
+          <ThemeSettings />
+          <MotionSoundSettings />
           <section className="app-update-card">
             <div className="app-update-head">
               <strong>应用更新</strong>
@@ -125,7 +130,7 @@ export default function UserConfig({ user, onClose }: Props) {
             )}
             {decision && <div className={`app-update-status ${decision.kind}`}>{decision.reason}</div>}
             {latest?.releaseNotes && <p className="app-release-notes">{latest.releaseNotes}</p>}
-            {updateError && <div className="modal-error">⚠ {updateError}</div>}
+            {updateError && <div className="modal-error"><Icon name="warning" /> {updateError}</div>}
             <div className="app-update-actions">
               {decision && decision.kind !== 'current' && (
                 <button
@@ -157,7 +162,7 @@ export default function UserConfig({ user, onClose }: Props) {
               <div className="field-hint">浏览器版随服务器部署自动更新，无需下载安装。</div>
             )}
           </section>
-          {error && <div className="modal-error">⚠ {error}</div>}
+          {error && <div className="modal-error"><Icon name="warning" /> {error}</div>}
         </div>
         <footer className="modal-footer">
           <span style={{ flex: 1 }} />

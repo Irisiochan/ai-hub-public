@@ -1,14 +1,14 @@
 # 图片上传与识图边界
 
-四种后端（`api`、`codex`、`claude-cli`、`grok-cli`）都能收图，但四条管线各走各的协议：API 直连自己把图编成 base64 content part，三个 CLI 只拿到网关本机的图片路径，由 CLI 自己读盘、自己发给它背后的供应商。
+五种后端（`api`、`codex`、`claude-cli`、`grok-cli`、`opencode-cli`）都能收图，但五条管线各走各的协议：API 直连自己把图编成 base64 content part，四个 CLI 只拿到网关本机的图片路径，由 CLI 自己读盘、自己发给它背后的供应商。
 
 ## 使用范围
 
 - 上传口径全后端一致：JPEG、PNG、WebP、GIF；每条最多 4 张，单张最多 10 MB。前端 `web/src/components/ImageComposer.tsx` 与网关的 multer 限流 + `persistImage()`（`server/src/attachments.ts`）各校验一遍，网关那遍还查文件签名。
-- 私聊：`api`、`codex`、`claude-cli`、`grok-cli` 联系人都可以选图、粘贴截图、预览、移除和发送（`web/src/components/ChatPane.tsx:181`）。
+- 私聊：`api`、`codex`、`claude-cli`、`grok-cli`、`opencode-cli` 联系人都可以选图、粘贴截图、预览、移除和发送（`web/src/components/ChatPane.tsx` 的 `canSendImages`）。
 - 群聊：有文字时沿用 `@名字` / `@all` 目标解析；无文字时投递给群内全部启用成员（`AgentManager.imageRoomMembers()` 现在就是 `roomMembers()`，不再按后端筛选），正文落库为「请看这张图片。」。群回合把本轮批到的未读消息的附件一起带上。
-- 三条 CLI 管线的共同前提：传的都是绝对路径。`attachmentPathsForMessages()` 只认 `uploadsDir` 直属且仍存在的文件，所以 CLI 必须与网关同机运行并能读 `server/data/uploads`；跨机部署时 CLI 联系人拿不到图。
-- 历史行为不同：API 直连每轮都会把历史消息里的图重新编进 content（`contentForRow()`）；三个 CLI 只拿本轮消息的附件路径，之前发过的图不会重复投喂。
+- 四条 CLI 管线的共同前提：传的都是绝对路径。`attachmentPathsForMessages()` 只认 `uploadsDir` 直属且仍存在的文件，所以 CLI 必须与网关同机运行并能读 `server/data/uploads`；跨机部署时 CLI 联系人拿不到图。
+- 历史行为不同：API 直连每轮都会把历史消息里的图重新编进 content（`contentForRow()`）；四个 CLI 只拿本轮消息的附件路径，之前发过的图不会重复投喂。
 
 ### API 直连（`api`）
 
@@ -32,6 +32,13 @@
 - 含图回合改用 `--prompt-json`，payload 是 `{ type: 'acp', content: [text, resource_link…] }`，每个 link 带 `file://` URI、basename 和 mimeType（`server/src/agents/grokCli.ts:63`）；纯文字回合仍走 `-p`。
 - 刻意不用 base64 argv：一张普通截图就能超出 Windows 命令行长度上限和 Linux 的 `MAX_ARG_STRLEN`。
 - `imageMimeType()`（同文件 49 行）按扩展名白名单取 MIME，只认 `.jpg`/`.jpeg`/`.png`/`.webp`/`.gif`，其余直接抛错——这轮不会 spawn 进程，聊天里出现「grok 图片读取失败：…」的非致命错误。白名单与上传白名单同宽，且落盘文件名的扩展名是按校验过的 MIME 生成的，所以正常上传的图不会撞上这条；它只兜住 uploads 目录里来路不明的文件。
+
+### OpenCode CLI（`opencode-cli`）——`run --file`
+
+- `OpencodeCliBackend` 把本轮附件编成可重复的 `--file <绝对路径>`，插在 `--dir` / `--` 之前（`server/src/agents/opencodeCli.ts` 的 `opencodeFileArgs()`）。纯文字回合不带 `--file`，prompt 仍走 `--` 之后的位置参数。
+- 刻意不用 base64 argv：一张普通截图就能超出 Windows 命令行长度上限和 Linux 的 `MAX_ARG_STRLEN`。OpenCode 自己按路径读盘，按字节嗅探 PNG/JPEG/GIF/WebP。
+- `opencodeImageMimeType()` 按扩展名白名单闸门，只认 `.jpg`/`.jpeg`/`.png`/`.webp`/`.gif`，其余直接抛错——这轮不会 spawn 进程，聊天里出现「opencode 图片读取失败：…」的非致命错误。白名单与上传白名单同宽。
+- 联系人 `muse`（Sora / 缪斯，模型 `opencode-go/muse-spark-1.2-contributor`）走这条管线。Muse Spark 1.2 本身接受 image 输入；没接 `--file` 时前端仍能发图，但模型只拿到文字。
 
 ## 存储与访问
 

@@ -9,8 +9,8 @@ const updateScript = fs.readFileSync(
 
 assert.match(
   updateScript,
-  /chmod -R a\+rX server\/agents server\/migrations worker/,
-  'runtime-read agents, migrations and worker sources must be readable after the deploy unit pulls them with UMask=0077'
+  /chmod -R a\+rX server\/agents server\/migrations worker shared\/coordination-keys/,
+  'runtime-read agents, migrations, worker and shared coordination keys must be readable after deploy with UMask=0077'
 );
 
 assert.match(

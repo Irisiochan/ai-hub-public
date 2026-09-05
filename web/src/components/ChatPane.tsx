@@ -3,6 +3,7 @@ import {
   api,
   type Contact,
   type ContactStatus,
+  type HeartbeatStatus,
   type Message,
   type UserProfile,
   type MessageReadState,
@@ -26,28 +27,34 @@ import {
   type FollowupJobInput,
   vaultTaskAlreadySettled,
   visibleJobsForContact,
-  workerReceiptJobId,
 } from '../sideJobActions';
 import {
   prepareMessageSendAttempt,
   type MessageSendAttempt,
 } from '../sendIdempotency';
 import { buildMessageSelectionUnits, messageSelectionKey } from '../messageTurns';
+import { playSoundEvent } from '../sound';
+import { useMotionPresence } from '../motionPresence';
+import type { MotionState } from '../motionPresence';
+import { refreshWorkerJobs, useWorkerState } from '../useWorkerState';
 
 interface Props {
+  motionState: MotionState;
   contact: Contact;
   contacts: Contact[];
   messages: Message[];
   status: ContactStatus;
+  heartbeat: HeartbeatStatus;
+  onHeartbeat(status: HeartbeatStatus): void;
   user: UserProfile;
   onBack(): void;
   readState: MessageReadState;
   onMarkRead(throughMessageId: number): void;
-  onLoadEarlier(): void;
+  onLoadEarlier(): Promise<number>;
   onSettings(): void;
 }
 
-export default function ChatPane({ contact, contacts, messages, status, user, onBack, readState, onMarkRead, onLoadEarlier, onSettings }: Props) {
+export default function ChatPane({ motionState, contact, contacts, messages, status, heartbeat, onHeartbeat, user, onBack, readState, onMarkRead, onLoadEarlier, onSettings }: Props) {
   const confirm = useConfirm();
   const isRoom = contact.kind === 'room';
   const channelMessages = messages;
@@ -63,23 +70,23 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
   const [bulkMessageKeys, setBulkMessageKeys] = useState<Set<string>>(() => new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [editing, setEditing] = useState<MessageEdit | null>(null);
-  const [jobs, setJobs] = useState<WorkerJob[]>([]);
+  const allJobs = useWorkerState((state) => state.jobs);
+  const jobs = useMemo(() => visibleJobsForContact(
+    contact.id, channelMessages, allJobs, JOB_ACTIVE, contact.kind,
+  ), [contact.id, contact.kind, channelMessages, allJobs]);
   const composerFocus = 0;
   const [externalLink, setExternalLink] = useState<ExternalLinkView | null>(null);
   // 方案 1b：运行时抽屉。桌面默认常驻，窄屏默认收起（是标题下的下拉卡）
   const [runtimeOpen, setRuntimeOpen] = useState(
     () => typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches
   );
+  const runtimePresence = useMotionPresence(runtimeOpen);
   const scrollRef = useRef<HTMLDivElement>(null);
   const positionedContactsRef = useRef(new Set<string>());
   const boundaryContactRef = useRef(contact.id);
   const unreadBoundaryRef = useRef<number | null>(readState.firstUnreadId);
   const stickToBottom = useRef(true);
-  const jobsRef = useRef<WorkerJob[]>([]);
-  const channelMessagesRef = useRef(channelMessages);
   const sendAttemptRef = useRef<MessageSendAttempt | null>(null);
-  jobsRef.current = jobs;
-  channelMessagesRef.current = channelMessages;
 
   if (boundaryContactRef.current !== contact.id) {
     boundaryContactRef.current = contact.id;
@@ -87,15 +94,11 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
     unreadBoundaryRef.current = readState.firstUnreadId;
   }
   const firstUnreadId = unreadBoundaryRef.current;
-  const delegationEnabled = !!(contact.config.delegation as { enabled?: boolean } | undefined)?.enabled;
-  const receiptJobIdsVersion = useMemo(() => {
-    const ids = new Set<string>();
-    for (const message of channelMessages) {
-      const jobId = workerReceiptJobId(message);
-      if (jobId) ids.add(jobId);
-    }
-    return [...ids].sort().join('\0');
-  }, [channelMessages]);
+  const firstLoadedMessageId = channelMessages[0]?.id ?? null;
+  const unreadDividerId = firstUnreadId !== null && firstLoadedMessageId !== null
+    && firstUnreadId < firstLoadedMessageId
+    ? firstLoadedMessageId
+    : firstUnreadId;
   const closeExternalView = useCallback(() => {
     setExternalLink(closeExternalLink());
     if (window.history.state?.aiHubExternalLink) window.history.back();
@@ -122,27 +125,6 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
 
   const { usage, quota, codexQuota, grokQuota } = useUsagePoll(contact, status);
   const { modelCatalog, switchingModel, switchModel, switchEffort } = useModelCatalog(contact, isRoom, setSendError);
-
-  // 这个聊天里委派出去的任务（挂回原消息下）；旧的无锚点任务只在还活跃时显示
-  const loadJobs = useCallback(() => {
-    void api
-      .jobs()
-      .then(({ jobs: rows }) =>
-        setJobs(
-          visibleJobsForContact(contact.id, channelMessagesRef.current, rows, JOB_ACTIVE)
-        )
-      )
-      .catch(() => {});
-  }, [contact.id]);
-
-  useEffect(() => {
-    setJobs([]);
-    loadJobs();
-    const timer = setInterval(() => {
-      if (delegationEnabled || jobsRef.current.some((j) => JOB_ACTIVE.has(j.status))) loadJobs();
-    }, 5000);
-    return () => clearInterval(timer);
-  }, [contact.id, delegationEnabled, loadJobs, receiptJobIdsVersion]);
 
   // 任务 thread 挂到已加载消息中 id ≤ 锚点的最后一条；锚点缺失/太老的活跃任务落到底部
   const jobAnchors = useMemo(() => {
@@ -175,7 +157,7 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
   const allMessagesSelected =
     bulkMessageUnits.length > 0 && bulkSelectedUnits.length === bulkMessageUnits.length;
 
-  const canSendImages = isRoom || ['api', 'codex', 'claude-cli', 'grok-cli'].includes(contact.backend);
+  const canSendImages = isRoom || ['api', 'codex', 'claude-cli', 'grok-cli', 'opencode-cli'].includes(contact.backend);
 
   const addComposerImages = (files: File[]) => {
     setSendError(null);
@@ -196,22 +178,22 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
     if (!el) return;
     const positionKey = contact.id;
     if (!positionedContactsRef.current.has(positionKey)) {
-      if (firstUnreadId !== null && !channelMessages.some((message) => message.id === firstUnreadId)) {
+      if (unreadDividerId !== null && !channelMessages.some((message) => message.id === unreadDividerId)) {
         return;
       }
       const frame = requestAnimationFrame(() => {
-        const divider = firstUnreadId === null
+        const divider = unreadDividerId === null
           ? null
-          : el.querySelector<HTMLElement>(`[data-unread-divider="${firstUnreadId}"]`);
+          : el.querySelector<HTMLElement>(`[data-unread-divider="${unreadDividerId}"]`);
         if (divider) divider.scrollIntoView({ block: 'start' });
         else el.scrollTop = el.scrollHeight;
-        stickToBottom.current = firstUnreadId === null;
+        stickToBottom.current = unreadDividerId === null;
         positionedContactsRef.current.add(positionKey);
       });
       return () => cancelAnimationFrame(frame);
     }
     if (stickToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [channelMessages, contact.id, firstUnreadId]);
+  }, [channelMessages, contact.id, unreadDividerId]);
 
   useEffect(() => {
     setSelectedMsg(null);
@@ -253,11 +235,24 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
       clearImages();
       if (result.queued === false) {
         setSendError(`${result.error ?? '当前排队已满'}；消息已保存，不会重复发送。`);
+        void playSoundEvent('error', `send:${attempt.idempotencyKey}:rejected`, {
+          currentConversation: true,
+          pageVisible: document.visibilityState === 'visible',
+        });
       } else if (result.duplicate) {
         setSendError('消息已保存；这次重试已去重。');
+      } else {
+        void playSoundEvent('send', `send:${attempt.idempotencyKey}:accepted`, {
+          currentConversation: true,
+          pageVisible: document.visibilityState === 'visible',
+        });
       }
     } catch (e) {
       setSendError((e as Error).message);
+      void playSoundEvent('error', `send:${attempt.idempotencyKey}:failed`, {
+        currentConversation: true,
+        pageVisible: document.visibilityState === 'visible',
+      });
     } finally {
       setSending(false);
     }
@@ -365,7 +360,7 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
         originAnchorId: job.origin_anchor_id || undefined,
         idempotencyKey: reworkIdempotencyKey(job.id, message.id),
       });
-      loadJobs();
+      refreshWorkerJobs();
       return created;
     } catch (error) {
       setSendError((error as Error).message);
@@ -392,7 +387,7 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
         originAnchorId: job.origin_anchor_id || undefined,
         idempotencyKey: followupIdempotencyKey(job.id, message.id, input),
       });
-      loadJobs();
+      refreshWorkerJobs();
       return created;
     } catch (error) {
       setSendError((error as Error).message);
@@ -432,7 +427,7 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
       } catch {
         // Vault 已关账；交付态写失败时仍靠本机 handled 持久化把卡从置顶条拿掉。
       }
-      loadJobs();
+      refreshWorkerJobs();
     } catch (error) {
       setSendError((error as Error).message);
       throw error;
@@ -445,7 +440,7 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
     channelStatus.state.startsWith('tool:');
 
   return (
-    <main className={'chat-pane' + (runtimeOpen ? ' runtime-open' : '')}>
+    <main className={'chat-pane' + (runtimePresence.rendered ? ' runtime-open' : '')} data-motion-state={motionState}>
       <ChatHeader
         contact={contact}
         status={channelStatus}
@@ -454,10 +449,13 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
         onToggleRuntime={() => setRuntimeOpen((open) => !open)}
       />
 
-      {runtimeOpen && (
+      {runtimePresence.rendered && (
         <RuntimeDrawer
+          motionState={runtimePresence.state}
           contact={contact}
           status={channelStatus}
+          heartbeat={heartbeat}
+          onHeartbeat={onHeartbeat}
           usage={usage}
           quota={quota}
           codexQuota={codexQuota}
@@ -500,7 +498,7 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
         selectedMessage={selectedMsg}
         editing={editing}
         bulkMode={bulkMessageMode}
-        firstUnreadId={firstUnreadId}
+        firstUnreadId={unreadDividerId}
         bulkKeys={bulkMessageKeys}
         jobsByMessage={jobAnchors.byMessage}
         looseJobs={jobAnchors.loose}
@@ -514,7 +512,6 @@ export default function ChatPane({ contact, contacts, messages, status, user, on
         onBulkToggle={toggleBulkMessage}
         onResend={(message) => void resend(message)}
         onDelete={(message, scope) => void remove(message, scope)}
-        onJobsChanged={loadJobs}
         onOpenExternalLink={openExternalView}
         onRework={reworkJob}
         onFollowup={followupJob}

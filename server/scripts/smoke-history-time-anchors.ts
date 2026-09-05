@@ -201,8 +201,8 @@ try {
   );
   assert.equal(
     dmTexts.at(-1),
-    currentDmText,
-    'API 私聊当前用户消息必须保留注入后的当前时间版本，不能误标为历史'
+    `[2026-07-26 周日 18:54 CST｜本轮新消息] ${currentDmText}`,
+    'API 私聊当前用户消息必须保留注入后的版本并明确标为本轮新消息'
   );
 
   const summaryRow = db.prepare(

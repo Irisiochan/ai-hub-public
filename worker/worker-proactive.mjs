@@ -5,6 +5,7 @@ import {
   isDailyMode,
   messageTimestampMs,
   normalizeProactiveConfig,
+  parseHubTimestampMs,
   shanghaiClock,
   summarizeTaskContext,
 } from './triage-core.mjs';
@@ -154,8 +155,8 @@ export const proactiveMethods = {
     const freshMs = config.freshnessHours * 60 * 60_000;
     return events.filter((event) => {
       if (event?.severity !== 'safety' || event?.status !== 'active') return false;
-      const updatedMs = Date.parse(String(event.updatedAt ?? ''));
-      if (!Number.isFinite(updatedMs) || now - updatedMs > freshMs) return false;
+      const updatedMs = parseHubTimestampMs(event.updatedAt);
+      if (updatedMs === null || now - updatedMs > freshMs) return false;
       if (claims[`${event.id}:${event.updatedAt}`]) return false;
       const todayDispatches = Object.values(claims).filter((claim) => claim
         && claim.lifeEventId === event.id
@@ -188,7 +189,7 @@ export const proactiveMethods = {
       .filter((contact) => contact?.kind === 'dm' || contact?.kind === 'api')
       .filter((contact) => contact?.config?.routing?.enabled !== false)
       .map((contact) => {
-        const lastAt = Date.parse(String(contact?.last_at ?? '')) || 0;
+        const lastAt = parseHubTimestampMs(contact?.last_at) ?? 0;
         return { contact, lastAt };
       })
       .sort((a, b) => b.lastAt - a.lastAt);
@@ -227,7 +228,9 @@ export const proactiveMethods = {
     const usage = this.store.poolUsage(DELIVERY_POOL_DAILY, now);
     const recentConversations = contacts
       .filter((contact) => contact?.last_at)
-      .sort((a, b) => Date.parse(b.last_at) - Date.parse(a.last_at))
+      .sort((a, b) => (
+        (parseHubTimestampMs(b.last_at) ?? 0) - (parseHubTimestampMs(a.last_at) ?? 0)
+      ))
       .slice(0, 3)
       .map((contact) => ({
         recipient: contact.config?.routing?.recipientKey ?? contact.id,

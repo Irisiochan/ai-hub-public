@@ -21,6 +21,11 @@
   "claudeCommand": "claude.cmd",
   "allowShell": false,
   "allowSsh": false,
+  "allowCamera": false,
+  "cameraDevice": "Logitech BRIO",
+  "ffmpegCommand": "ffmpeg",
+  "allowTaobao": false,
+  "taobaoMcpUrl": "http://localhost:3654/mcp",
   "grokCommand": "C:/Users/YOUR-USER/.grok/bin/grok.exe",
   "grokModel": ""
 }

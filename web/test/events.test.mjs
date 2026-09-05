@@ -31,10 +31,15 @@ assert.equal(
   2,
   'both contact snapshots and live terminal status events must check for streaming rows'
 );
-assert.match(app, /onStatus: handleStatus/, 'live status events must use the guarded reconcile handler');
 assert.match(
   app,
-  /\}, \[handleStatus, resync, upsertMessage\]\);/,
+  /onStatus: \(status\) => \{\s*deltaBatcher\.flushNow\(\);\s*handleStatus\(status\);/,
+  'live status events must flush pending deltas before using the guarded reconcile handler'
+);
+assert.match(app, /onDelta: \(delta\) => deltaBatcher\.add\(delta\)/, 'streaming deltas must use the bounded batcher');
+assert.match(
+  app,
+  /\}, \[applyHeartbeat, handleStatus, resync, upsertMessage\]\);/,
   'the EventSource effect must depend only on stable callbacks'
 );
 assert.match(
@@ -42,5 +47,11 @@ assert.match(
   /lastSubscriptionRef\.current === selectedId/,
   'the initial render must not immediately reopen an equivalent subscription'
 );
+assert.match(app, /onWorker: workerState\.applyWorker/, 'the existing global stream must feed worker state');
+assert.match(app, /onJobMessage: workerState\.applyJobMessage/, 'execution logs must use that same stream');
+assert.match(app, /onJob: \(job: WorkerJob\) => \{\s*workerState\.applyJob\(job\);/,
+  'job state must update before optional sound handling');
+assert.match(app, /onReconnect: \(\) => \{[\s\S]*?workerState\.reconcile\(\)/,
+  'reconnect and visibility recovery must reconcile the shared worker state');
 
 console.log('event connection reconciliation checks passed');

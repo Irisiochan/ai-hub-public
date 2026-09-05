@@ -1,4 +1,5 @@
 import { type Contact } from '../../api';
+import { Icon } from '../icons';
 
 interface Props {
   contacts: Contact[];
@@ -38,7 +39,7 @@ export default function RoomFields(props: Props) {
                   <small>{contact.backend}</small>
                 </span>
                 <span className="member-check" aria-hidden="true">
-                  ✓
+                  <Icon name="check" />
                 </span>
               </button>
             );

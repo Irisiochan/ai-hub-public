@@ -74,8 +74,8 @@ try {
 
   const fallback = store.snapshot({ stage: 'execute', taskPath: 'tasks/demo.md', problemFingerprint: fingerprint });
   assert.equal(fallback.selected.runner, 'codex');
-  assert.equal(fallback.selected.model, 'gpt-5.6-sol');
-  assert.equal(fallback.selected.reasoning, 'medium');
+  assert.equal(fallback.selected.model, 'gpt-6-astra');
+  assert.equal(fallback.selected.reasoning, 'high');
   assert.notEqual(fallback.workflowFingerprint, primary.workflowFingerprint);
 
   const changedProblem = store.snapshot({
@@ -136,8 +136,8 @@ try {
   const secondDelegated = db.prepare('SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT 1').get() as JobRow;
   const secondOptions = JSON.parse(secondDelegated.options);
   assert.equal(secondDelegated.runner, 'codex');
-  assert.equal(secondOptions.model, 'gpt-5.6-sol');
-  assert.equal(secondOptions.reasoning, 'medium');
+  assert.equal(secondOptions.model, 'gpt-6-astra');
+  assert.equal(secondOptions.reasoning, 'high');
   assert.equal(secondOptions.workflow.fallbackActive, true);
 
   const { workflowFingerprint: _originalFingerprint, ...primaryInput } = primary;

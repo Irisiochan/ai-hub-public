@@ -6,7 +6,7 @@ import type { SseHub } from '../sse.js';
 import { contactConfig } from './configSchemas.js';
 import { resolveRoomOrchestratorId } from './roomPrompt.js';
 
-export type CoordinationRoomMessageKind = 'receipt';
+export type CoordinationRoomMessageKind = 'receipt' | 'review-batch';
 
 export interface CoordinationRoomDispatchInput {
   /** Explicit recipient; defaults to the room's configured coordination.orchestrator. */
@@ -15,6 +15,8 @@ export interface CoordinationRoomDispatchInput {
   kind: CoordinationRoomMessageKind;
   idempotencyKey?: string;
   exactDispatchKey?: string;
+  /** Persist the room-host message without waking a model; caller must provide a durable flush fallback. */
+  skipWake?: boolean;
   meta: Record<string, unknown>;
 }
 
@@ -45,8 +47,14 @@ interface CoordinationRoomManager {
   dispatchRoomMessageTracked(
     room: ContactRow,
     content: string,
-    options: { targetOverride: ContactRow[]; capture: false; reactionRounds: 0 }
-  ): { completion: Promise<unknown> };
+    options: {
+      targetOverride: ContactRow[];
+      capture: false;
+      reactionRounds: 0;
+      coordinationDomain: true;
+      userMessageId: number;
+    }
+  ): { completion: Promise<unknown>; deferred?: boolean };
 }
 
 function record(value: unknown): Record<string, any> {
@@ -165,7 +173,7 @@ export function dispatchCoordinationRoomHost(
        WHERE contact_id = ? AND sender = 'room-host' AND idempotency_key = ?
        ORDER BY id DESC LIMIT 1`
     ).get(room.id, input.idempotencyKey);
-    if (duplicate) return { status: 'duplicate', roomId: room.id };
+    if (duplicate) return { status: 'duplicate', roomId: room.id, messageId: Number((duplicate as { id: number }).id) };
   }
 
   const meta = {
@@ -173,11 +181,15 @@ export function dispatchCoordinationRoomHost(
       name: 'DS 主持',
       roundId: `coordination-${crypto.randomUUID()}`,
       idempotencyKey: input.idempotencyKey || undefined,
-      status: 'running',
+      status: input.skipWake ? 'done' : 'running',
       targets: [target.id],
       reactionRounds: 0,
       coordinationPool: { kind: input.kind },
       ...input.meta,
+      ...(input.skipWake ? {
+        wakeSkipped: true,
+        completedAt: new Date().toISOString(),
+      } : {}),
     },
   };
   const result = deps.db.prepare(
@@ -188,14 +200,35 @@ export function dispatchCoordinationRoomHost(
   const row = deps.db.prepare('SELECT * FROM messages WHERE id = ?')
     .get(Number(result.lastInsertRowid)) as MessageRow;
   deps.sse.broadcast('message', row);
+  if (input.skipWake) {
+    return { status: 'posted', roomId: room.id, messageId: row.id };
+  }
   const tracked = deps.manager.dispatchRoomMessageTracked(room, input.content, {
     targetOverride: [target],
     capture: false,
     reactionRounds: 0,
+    coordinationDomain: true,
+    userMessageId: row.id,
   });
+  if (tracked.deferred) {
+    const current = deps.db.prepare('SELECT meta FROM messages WHERE id = ?').get(row.id) as { meta: string };
+    const currentMeta = messageMeta(current.meta);
+    const deferredMeta = {
+      ...currentMeta,
+      roomHost: {
+        ...record(currentMeta.roomHost),
+        status: 'deferred',
+      },
+    };
+    deps.db.prepare('UPDATE messages SET meta = ? WHERE id = ?').run(JSON.stringify(deferredMeta), row.id);
+    const deferredRow = deps.db.prepare('SELECT * FROM messages WHERE id = ?').get(row.id) as MessageRow;
+    deps.sse.broadcast('message', deferredRow);
+  }
   void tracked.completion.then((outcome) => {
     const current = deps.db.prepare('SELECT meta FROM messages WHERE id = ?').get(row.id) as { meta: string } | undefined;
     const currentMeta = messageMeta(current?.meta ?? row.meta);
+    if (currentMeta.roomDispatch?.status === 'error'
+        && currentMeta.roomDispatch?.interruptionReason === 'deploy-restart') return;
     const currentRoomHost = record(currentMeta.roomHost);
     const doneMeta = {
       ...currentMeta,
@@ -212,6 +245,8 @@ export function dispatchCoordinationRoomHost(
   }).catch((error: Error) => {
     const current = deps.db.prepare('SELECT meta FROM messages WHERE id = ?').get(row.id) as { meta: string } | undefined;
     const currentMeta = messageMeta(current?.meta ?? row.meta);
+    if (currentMeta.roomDispatch?.status === 'error'
+        && currentMeta.roomDispatch?.interruptionReason === 'deploy-restart') return;
     const currentRoomHost = record(currentMeta.roomHost);
     const failedMeta = {
       ...currentMeta,

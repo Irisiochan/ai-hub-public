@@ -1,5 +1,6 @@
 import { useEffect, useState, type CSSProperties, type FormEvent, type ReactNode } from 'react';
 import { api } from '../api';
+import { Icon } from './icons';
 
 type Phase = 'checking' | 'login' | 'ready';
 
@@ -40,7 +41,7 @@ export default function SessionGate({ children }: { children: ReactNode }) {
   }, []);
 
   if (phase === 'ready') return <>{children}</>;
-  if (phase === 'checking') return <div style={wrap}>🔐 检查登录状态…</div>;
+  if (phase === 'checking') return <div style={wrap}><Icon name="lock" size={24} /> 检查登录状态…</div>;
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -63,7 +64,7 @@ export default function SessionGate({ children }: { children: ReactNode }) {
   return (
     <div style={wrap}>
       <form className="login-card" onSubmit={(event) => void submit(event)}>
-        <div className="login-logo">🔐</div>
+        <div className="login-logo"><Icon name="lock" size={24} /></div>
         <h1>ai-hub</h1>
         <p>输入访问密码</p>
         <input

@@ -4,6 +4,7 @@ import {
   type ContactStatus,
 } from '../../api';
 import { statusText } from '../../statusText';
+import { Icon } from '../icons';
 
 interface Props {
   contact: Contact;
@@ -37,8 +38,11 @@ export default function ChatHeader(props: Props) {
   return (
     <header className="chat-header">
       <button className="back-btn" onClick={props.onBack} aria-label="返回联系人列表">
-        ←
+        <Icon name="arrow-left" size={24} />
       </button>
+      <span className="avatar chat-avatar" style={{ boxShadow: `inset 0 0 0 1.5px ${contact.color}55` }}>
+        {contact.avatar}
+      </span>
       <div className="chat-title">
         <span className="chat-title-name">
           <span>{contact.name}</span>
@@ -51,9 +55,11 @@ export default function ChatHeader(props: Props) {
           type="button"
           className={'runtime-btn' + (props.runtimeOpen ? ' open' : '')}
           aria-expanded={props.runtimeOpen}
+          aria-label={props.runtimeOpen ? '收起运行时' : '打开运行时'}
+          title={props.runtimeOpen ? '收起运行时' : '运行时与更多'}
           onClick={props.onToggleRuntime}
         >
-          ⌸ 运行时
+          <Icon name="runtime" size={24} />
         </button>
       </div>
     </header>

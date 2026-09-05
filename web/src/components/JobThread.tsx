@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { api, type JobMessage, type WorkerJob } from '../api';
+import { api, type WorkerJob } from '../api';
 import { formatLocalTime, parseUtcTimestamp } from '../time';
 import { useConfirm, type ConfirmFn } from './ConfirmDialog';
+import { Icon } from './icons';
+import { refreshWorkerJobs, useJobMessages } from '../useWorkerState';
 
 /**
  * 委派任务子会话：挂在原聊天消息下的紧凑状态条。
@@ -144,29 +146,18 @@ function metaUsage(meta: string): string | null {
 
 interface Props {
   job: WorkerJob;
-  onChanged(): void; // 操作后让父级刷新任务列表
 }
 
-export default function JobThread({ job, onChanged }: Props) {
+export default function JobThread({ job }: Props) {
   const confirm = useConfirm();
   const [showExecution, setShowExecution] = useState(false);
-  const [messages, setMessages] = useState<JobMessage[]>([]);
+  const { messages, error: detailError } = useJobMessages(showExecution ? job.id : null);
   const [error, setError] = useState('');
   const [hiding, setHiding] = useState(false);
   const [resolving, setResolving] = useState(false);
   const active = JOB_ACTIVE.has(job.status);
   const canResolveOutOfBand = job.status === 'blocked'
     && job.delivery_state?.startsWith('blocked_') === true;
-
-  useEffect(() => {
-    if (!showExecution) return;
-    const load = () =>
-      void api.job(job.id).then(({ messages: rows }) => setMessages(rows)).catch(() => {});
-    load();
-    if (!active) return;
-    const timer = setInterval(load, 2500);
-    return () => clearInterval(timer);
-  }, [showExecution, job.id, job.status, active]);
 
   useEffect(() => {
     if (!showExecution) return;
@@ -186,7 +177,7 @@ export default function JobThread({ job, onChanged }: Props) {
     setError('');
     try {
       await api.jobAction(job.id, value);
-      onChanged();
+      refreshWorkerJobs();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -212,7 +203,7 @@ export default function JobThread({ job, onChanged }: Props) {
     } as const;
     try {
       await api.updateJobDelivery(job.id, { stage, ...presets[stage] });
-      onChanged();
+      refreshWorkerJobs();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -224,7 +215,7 @@ export default function JobThread({ job, onChanged }: Props) {
     setHiding(true);
     try {
       const done = await hideJobWindow(job, confirm);
-      if (done) onChanged();
+      if (done) refreshWorkerJobs();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -238,7 +229,7 @@ export default function JobThread({ job, onChanged }: Props) {
     setResolving(true);
     try {
       const done = await resolveJobOutOfBand(job, confirm);
-      if (done) onChanged();
+      if (done) refreshWorkerJobs();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -251,7 +242,7 @@ export default function JobThread({ job, onChanged }: Props) {
       <div className="job-thread-head-row">
         <button type="button" className="job-thread-head" onClick={() => setShowExecution(true)}>
           <span className={`job-dot ${job.status}`} />
-          <b>🖥 {humanJobLabel(job)}</b>
+          <b className="icon-label"><Icon name="worker" /> {humanJobLabel(job)}</b>
           <span className="job-thread-brief">{job.runner} · {job.prompt.slice(0, 60)}</span>
           <small>{elapsedText(job)}</small>
           <span className="job-thread-open">查看执行过程</span>
@@ -267,7 +258,7 @@ export default function JobThread({ job, onChanged }: Props) {
             void hideWindow();
           }}
         >
-          ×
+          <Icon name="close" />
         </button>
       </div>
       {showExecution && createPortal(
@@ -290,7 +281,7 @@ export default function JobThread({ job, onChanged }: Props) {
                 aria-label="关闭执行过程"
                 onClick={() => setShowExecution(false)}
               >
-                ×
+                <Icon name="close" size={24} />
               </button>
             </header>
             <div className="job-execution-scroll">
@@ -332,7 +323,7 @@ export default function JobThread({ job, onChanged }: Props) {
                   <pre>{job.error}</pre>
                 </div>
               )}
-              {error && <div className="modal-error">⚠ {error}</div>}
+              {(error || detailError) && <div className="modal-error"><Icon name="warning" /> {error || detailError}</div>}
               <div className="job-thread-actions">
                 {active && job.status !== 'pending' && (
                   <button type="button" onClick={() => void action('pause')}>暂停</button>

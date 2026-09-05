@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { openDb, type ContactRow, type JobRow } from '../src/db.js';
 import { attachWorkerCompletion } from '../src/server.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { JobStore, OUTBOX_MAX_ATTEMPTS } from '../src/workers/jobStore.js';
 import {
   formatCoordinationReceipt,
   parseCoordinationMarker,
@@ -112,7 +112,10 @@ assert.equal(roomDispatches[0].options.capture, false);
 assert.equal(roomDispatches[0].options.reactionRounds, 0);
 assert.match(roomDispatches[0].text, /@claude 工作对接回执/);
 assert.match(roomDispatches[0].text, /tasks\/demo\.md/);
-assert.match(roomDispatches[0].text, /branch=coordination-demo/);
+assert.match(roomDispatches[0].text, /^branch：coordination-demo$/m);
+assert.match(roomDispatches[0].text, /^diffstat：未报告$/m);
+assert.match(roomDispatches[0].text, /^changedFiles：未报告$/m);
+assert.match(roomDispatches[0].text, /^测试结论：未报告$/m);
 assert.match(roomDispatches[0].text, /101\/101 PASS/);
 assert.match(roomDispatches[0].text, /Recall 全文：调用 worker_job_status/);
 
@@ -269,7 +272,13 @@ const fallbackCreated = store.create({
 if ('error' in fallbackCreated) throw new Error(fallbackCreated.error);
 db.prepare("UPDATE jobs SET status = 'running' WHERE id = ?").run(fallbackCreated.job.id);
 store.complete(store.get(fallbackCreated.job.id) as JobRow, 'done', 'fallback PASS', null, 'delivered', '{}');
-await new Promise<void>((resolve) => setImmediate(resolve));
+for (let attempt = 0; attempt <= OUTBOX_MAX_ATTEMPTS; attempt += 1) {
+  const outbox = db.prepare(
+    "SELECT status, next_attempt_at FROM job_outbox WHERE job_id = ? AND kind = 'finished'"
+  ).get(fallbackCreated.job.id) as { status: string; next_attempt_at: number } | undefined;
+  if (!outbox || outbox.status !== 'pending') break;
+  await store.drainOutboxOnce(Math.max(Date.now(), outbox.next_attempt_at + 1));
+}
 assert.equal(roomDispatches.length, 3, 'disabled room must not add another room dispatch');
 assert.equal(fallbackEnqueues.length, 1);
 assert.equal(fallbackEnqueues[0].contactId, 'codex');
@@ -279,6 +288,10 @@ const fallbackMessage = db.prepare(
 assert.equal(JSON.parse(fallbackMessage.meta).event, 'worker-receipt');
 assert.match(fallbackMessage.content, /^【降级投递：会议室不可用】/);
 assert.match(fallbackMessage.content, /⚙ Worker 任务回执/);
+assert.match(fallbackMessage.content, /^branch：未报告$/m);
+assert.match(fallbackMessage.content, /^diffstat：未报告$/m);
+assert.match(fallbackMessage.content, /^changedFiles：未报告$/m);
+assert.match(fallbackMessage.content, /^测试结论：未报告$/m);
 assert.doesNotMatch(fallbackMessage.content, /网关自动通知|User 也看得到这条|请直接给出验收结论/);
 
 db.close();

@@ -8,6 +8,7 @@ import { claudePermissionDecision, claudeTurnText } from '../src/agents/claudeCl
 import { codexTurnInput } from '../src/agents/codexAppServer.js';
 import { DirectApiBackend } from '../src/agents/directApi.js';
 import { grokPromptJson } from '../src/agents/grokCli.js';
+import { opencodeFileArgs } from '../src/agents/opencodeCli.js';
 import { attachmentPathsForMessages } from '../src/attachments.js';
 import { openDb } from '../src/db.js';
 import { attachmentsRouter } from '../src/routes/attachments.js';
@@ -101,6 +102,7 @@ try {
   assert.equal(grokInput.content[1].name, 'dm.png');
   assert.equal(grokInput.content[1].mimeType, 'image/png');
   assert.equal(grokInput.content[1].data, undefined, 'Grok 图片不得再把 base64 塞进命令行参数');
+  assert.deepEqual(opencodeFileArgs(dmImagePaths), ['--file', path.resolve(uploadsDir, 'dm.png')]);
   assert.equal(
     claudePermissionDecision(
       { tool_name: 'Bash', input: { command: 'cat image.png' } },
@@ -207,6 +209,7 @@ try {
       ['codex-dm', 'codex'],
       ['claude-dm', 'claude-cli'],
       ['grok-dm', 'grok-cli'],
+      ['opencode-dm', 'opencode-cli'],
     ] as const) {
       db.prepare(`INSERT INTO contacts (id, name, backend, kind, config) VALUES (?, ?, ?, 'dm', '{}')`)
         .run(id, id, backend);

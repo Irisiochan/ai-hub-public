@@ -1,18 +1,26 @@
 {
   "name": "server",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "test:affect": "tsx test/affect.test.mts",
     "test:receipt": "tsx test/workerReceiptPreview.test.mts",
+    "test:heartbeat": "tsx test/heartbeatReliability.test.mts && tsx scripts/smoke-heartbeat-session.ts && tsx test/directApiOutputReliability.test.mts",
     "check:memory-version": "node scripts/check-memory-vault-version.mjs",
     "smoke:memory-contract": "node scripts/smoke-memory-vault-contract.mjs",
-    "pretest": "npm run test:affect && npm run test:receipt && tsx test/workflowProfiles.test.mts && tsx test/runnerAvailability.test.mts",
-    "test": "tsx test/taskController.test.mts && tsx test/dshHarness.test.mts && tsx test/wechatChannel.test.mts && tsx test/wechatRuntime.test.mts && tsx test/caption.test.mts && tsx test/lifeEvents.test.mts && tsx test/lifeEventsInjection.test.mts && tsx test/capture.test.mts && tsx test/codexNativeCompact.test.mts && tsx test/deliveryChecks.test.mts && tsx test/taskWriteback.test.mts && tsx test/deployPermissions.test.mts && tsx test/deployStatus.test.mts && tsx test/deployReceipt.test.mts && tsx test/blockedJobResolution.test.mts && tsx test/sideJobRework.test.mts && tsx test/deliveryStatus.test.mts && tsx test/coordinationJobMutex.test.mts && tsx test/coordinationKeys.test.mts && tsx test/jobOutbox.test.mts && tsx test/hubMcpSecurity.test.mts &&tsx test/memorySearchInjection.test.mts && tsx test/vaultTasks.test.mts && tsx test/backendReliability.test.mts && tsx test/directApiOutputReliability.test.mts && tsx test/messageIdempotency.test.mts && tsx test/messageDelete.test.mts && tsx test/paginationLimit.test.mts && tsx test/readState.test.mts && tsx test/vaultOutbox.test.mts && tsx test/publishStatus.test.mts && tsx scripts/smoke-grok-quota.ts && tsx scripts/smoke-session-preamble-budget.ts && tsx scripts/smoke-gateway-injection-budget.ts && tsx scripts/smoke-prompt-cache-summary-rollover.ts && tsx scripts/smoke-conversation-replay.ts",
+    "smoke:review-auto-batch": "tsx scripts/smoke-review-auto-batch.ts",
+    "smoke:deploy-drain": "tsx scripts/smoke-deploy-drain.ts",
+    "smoke:deploy-resume": "tsx scripts/smoke-deploy-resume.ts",
+    "smoke:worker-status-pagination": "tsx scripts/smoke-worker-status-pagination.ts",
+    "smoke:turn-timeouts": "tsx scripts/smoke-turn-timeouts.ts",
+    "smoke:receipt-deploy-closure": "tsx scripts/smoke-receipt-deploy-closure.ts",
+    "pretest": "npm run test:affect && npm run test:receipt && tsx test/workflowProfiles.test.mts && tsx test/runnerAvailability.test.mts && tsx test/config.test.mts && tsx test/roomDelivery.test.mts && tsx test/apiModels.test.mts && tsx scripts/smoke-opencode-cli.ts && tsx scripts/smoke-cli-heartbeat-defaults.ts",
+    "test": "tsx test/taskController.test.mts && tsx test/dshHarness.test.mts && tsx test/wechatChannel.test.mts && tsx test/wechatRuntime.test.mts && tsx test/caption.test.mts && tsx test/ledger.test.mts && tsx test/lifeEvents.test.mts && tsx test/lifeEventsInjection.test.mts && tsx test/capture.test.mts && tsx test/codexNativeCompact.test.mts && tsx test/deliveryChecks.test.mts && tsx test/taskWriteback.test.mts && tsx test/deployPermissions.test.mts && tsx test/architectureDoc.test.mts && tsx test/deployStatus.test.mts && tsx test/deployReceipt.test.mts && tsx test/blockedJobResolution.test.mts && tsx test/sideJobRework.test.mts && tsx test/deliveryStatus.test.mts && tsx test/coordinationJobMutex.test.mts && tsx test/coordinationKeys.test.mts && tsx test/jobOutbox.test.mts && tsx test/hubMcpSecurity.test.mts && tsx test/gatewayToolContract.test.mts &&tsx test/memorySearchInjection.test.mts && tsx test/vaultTasks.test.mts && tsx test/backendReliability.test.mts && tsx test/directApiOutputReliability.test.mts && tsx test/geminiSchema.test.mts && tsx test/messageIdempotency.test.mts && tsx test/messageDelete.test.mts && tsx test/paginationLimit.test.mts && tsx test/readState.test.mts && tsx test/vaultOutbox.test.mts && tsx test/publishStatus.test.mts && tsx scripts/smoke-grok-quota.ts && tsx scripts/smoke-session-preamble-budget.ts && tsx scripts/smoke-gateway-injection-budget.ts && tsx scripts/smoke-prompt-cache-summary-rollover.ts && tsx scripts/smoke-conversation-replay.ts && tsx scripts/smoke-heartbeat-session.ts && tsx scripts/smoke-taobao-bridge.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "smoke:taobao-bridge": "tsx scripts/smoke-taobao-bridge.ts"
   },
   "dependencies": {
     "@ai-hub/contact-config": "file:../shared/contact-config",

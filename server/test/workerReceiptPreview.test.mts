@@ -58,6 +58,20 @@ function job(overrides: Partial<JobRow> = {}): JobRow {
         dirty: false,
         dirtyFiles: [],
       },
+      receipt: {
+        branch: 'preview-review',
+        head: 'abcdef1234567890',
+        diffstat: '3 files changed, 20 insertions(+), 2 deletions(-)',
+        changedFiles: {
+          files: ['server/src/a.ts', 'web/src/b.ts', 'worker/c.mjs'],
+          total: 3,
+          truncated: false,
+        },
+        tests: [
+          { suite: 'server npm test', status: 'pass' },
+          { suite: 'web npm test', status: 'pass' },
+        ],
+      },
       checks: [{
         id: 'pushed-but-ahead',
         pass: false,
@@ -80,12 +94,15 @@ try {
   assert.match(dmPreview, /Worker job：job-preview-123/);
   assert.match(dmPreview, /状态：blocked \/ blocked_unpushed/);
   assert.match(dmPreview, /runner：codex/);
-  assert.match(dmPreview, /验证：server tests 101\/101 PASS/);
+  assert.doesNotMatch(dmPreview, /FULL-TAIL-SENTINEL/);
   assert.match(dmPreview, /commit=是 · push=否 · stage=delivered_waiting_deploy/);
-  assert.match(dmPreview, /branch=preview-review · HEAD=abcdef1234567890 · ahead=1 · behind=0 · dirty=0/);
+  assert.match(dmPreview, /HEAD=abcdef1234567890 · ahead=1 · behind=0 · dirty=0/);
+  assert.match(dmPreview, /^branch：preview-review$/m);
+  assert.match(dmPreview, /^diffstat：3 files changed, 20 insertions\(\+\), 2 deletions\(-\)$/m);
+  assert.match(dmPreview, /^changedFiles：3 个：server\/src\/a\.ts, web\/src\/b\.ts, worker\/c\.mjs$/m);
+  assert.match(dmPreview, /^测试结论：server npm test=PASS；web npm test=PASS$/m);
   assert.match(dmPreview, /机检未通过：pushed-but-ahead — declared pushed=true but git ahead=1/);
   assert.match(dmPreview, /result_offset=0, result_limit=4000/);
-  assert.doesNotMatch(dmPreview, /FULL-TAIL-SENTINEL/);
 
   const undeclaredReviewPreview = formatWorkerReceiptPreview(job({
     status: 'done',
@@ -100,6 +117,10 @@ try {
     'review receipts without a machine delivery declaration omit the synthetic conclusion line'
   );
   assert.match(undeclaredReviewPreview, /^验证要点：/m);
+  assert.match(undeclaredReviewPreview, /^branch：未报告$/m);
+  assert.match(undeclaredReviewPreview, /^diffstat：未报告$/m);
+  assert.match(undeclaredReviewPreview, /^changedFiles：未报告$/m);
+  assert.match(undeclaredReviewPreview, /^测试结论：未报告$/m);
 
   const passingChecksPreview = formatWorkerReceiptPreview(job({
     delivery_meta: JSON.stringify({
@@ -275,6 +296,7 @@ try {
   assert.match(page1.text, /permissions：write=true，shell=true，ssh=false/);
   assert.match(page1.text, /declared：committed=true，pushed=true，stage=closed_loop，nextOwner=claude/);
   assert.match(page1.text, /git：HEAD=12345678，ahead=2，behind=1，branch=delivery-checks，dirty=2/);
+  assert.match(page1.text, /^diffstat：未报告$/m);
   assert.match(page1.text, /机检未通过：pushed-but-ahead — declared pushed=true but git ahead=2/);
   assert.match(page1.text, /result_offset=5000/);
   assert.ok(page2.ok && page2.text.includes(fullResult.slice(5_000, 10_000)));
@@ -284,8 +306,8 @@ try {
   assert.match(exactLength.text, new RegExp(`result 345-${fullResult.length}/${fullResult.length}`));
   assert.match(exactEndOffset.text, new RegExp(`result ${fullResult.length}-${fullResult.length}/${fullResult.length}`));
   assert.match(pastEndOffset.text, new RegExp(`result ${fullResult.length}-${fullResult.length}/${fullResult.length}`));
-  assert.match(zeroLimit.text, /result 0-1\/12345/);
-  assert.match(zeroLimit.text, /result_offset=1, result_limit=1/);
+  assert.equal(zeroLimit.ok, false, 'API and MCP enforce the declared minimum page size');
+  assert.match(zeroLimit.text, /result_limit/);
 
   console.log('[PASS] worker receipt preview, history folding, bounded updates, and paged recall');
 } finally {

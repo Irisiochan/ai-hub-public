@@ -12,14 +12,14 @@ function identifyCompactTurn(instance: any, turnId: string): void {
 
 function backend(
   options: { enabled?: boolean; inputTokens?: number } | undefined = { enabled: true, inputTokens: 100 },
-  turnTimeoutMs = 5_000,
+  turnHardTimeoutMs = 5_000,
 ) {
   const logs: string[] = [];
   const instance = new CodexAppServerBackend({
     cliPath: 'codex',
     cwd: process.cwd(),
     nativeCompact: options,
-    turnTimeoutMs,
+    turnHardTimeoutMs,
     log: (message) => logs.push(message),
   }) as any;
   instance.threadId = 'thread-native-compact';

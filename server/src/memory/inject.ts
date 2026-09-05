@@ -174,14 +174,15 @@ export const WORKFLOW_PRELOADED = [
 
 /**
  * 静态时间解释规则：不依赖记忆库。
- * C2：仅在有对话回放 / 历史摘要 / 既有消息上下文时注入；纯新会话无历史可省。
- * 红线：回放或历史摘要在场时必须同场。
+ * API 每个请求都复用这段静态前缀；CLI 仅在有回放 / 历史摘要 / 既有消息时注入。
+ * 红线：API 无条件在场；CLI 回放或历史摘要在场时必须同场。
  */
 export const TEMPORAL_CONTEXT_RULES = [
   '# 时间语义（网关强制）',
   '- TURN_TIME_PRELOADED 只表示本轮当前时间，不会自动给历史消息补发生时间。',
   '- `[时间｜本轮新消息]` 才是本轮刚送达的输入；`[时间｜历史消息]` 与 `[时间｜历史摘要]` 都是过去记录。',
   '- 历史正文里的“今晚、今天、昨天、刚才、最近”等相对时间，只能相对该条消息开头的绝对时间解释，禁止顺延成当前 TURN_TIME。',
+  '- 生成回复时引用“昨天、刚才、今晚、最近”等相对指示语，只能相对所引消息的绝对时间锚点使用，禁止把它顺延到当前轮时间。',
   '- 只有本轮新消息明确重新提起旧事，才能把旧话题当作当前话题；不能仅因历史记录排在上下文末尾就声称它刚发生。',
 ].join('\n');
 
@@ -350,12 +351,141 @@ export const PREAMBLE_UNAVAILABLE = [
 ].join('\n');
 
 /**
- * search_vault 只返回标题/路径/片段，没有 updated/created 字段（见 vault `_meta/mcp_server.py`），
- * 唯一不改 vault 接口就能拿到的日期是 diary/inbox 的日期文件名。拿得到就补锚点，拿不到就不补。
+ * search_vault 只返回标题/路径/片段，没有 updated/created 字段（见 vault `_meta/mcp_server.py`）。
+ * 文件名日期只作为记录日锚点；正文事件日另行解析，二者语义不可混用。
  */
 function dateAnchor(path: string): string {
   const m = /(\d{4})-(\d{2})-(\d{2})/.exec(path.split('/').pop() ?? '');
   return m ? `（记于 ${m[0]}）` : '';
+}
+
+interface CalendarDay {
+  year: number;
+  month: number;
+  day: number;
+}
+
+interface EventDateCandidate {
+  sortValue: number;
+  label: string;
+}
+
+function calendarDay(year: number, month: number, day: number): CalendarDay | null {
+  const value = new Date(Date.UTC(year, month - 1, day));
+  if (
+    value.getUTCFullYear() !== year ||
+    value.getUTCMonth() !== month - 1 ||
+    value.getUTCDate() !== day
+  ) return null;
+  return { year, month, day };
+}
+
+function dayValue(value: CalendarDay): number {
+  return Date.UTC(value.year, value.month - 1, value.day);
+}
+
+function isoDay(value: CalendarDay): string {
+  return `${String(value.year).padStart(4, '0')}-${String(value.month).padStart(2, '0')}-${String(value.day).padStart(2, '0')}`;
+}
+
+function addCalendarDays(value: CalendarDay, days: number): CalendarDay {
+  const date = new Date(dayValue(value) + days * 86_400_000);
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
+}
+
+function classifyEventDay(value: CalendarDay, today: CalendarDay): string {
+  const delta = Math.round((dayValue(value) - dayValue(today)) / 86_400_000);
+  if (delta < 0) return `【已发生 · ${isoDay(value)}】`;
+  if (delta === 0) return '【当天】';
+  if (delta <= 14) return `【即将到来 · ${delta}天后】`;
+  return `【未来 · ${isoDay(value)}】`;
+}
+
+function currentShanghaiDay(now = new Date()): CalendarDay {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now);
+  const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
+  return calendarDay(get('year'), get('month'), get('day'))!;
+}
+
+function parseTurnDay(value?: string): CalendarDay {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value ?? '');
+  return match
+    ? calendarDay(Number(match[1]), Number(match[2]), Number(match[3])) ?? currentShanghaiDay()
+    : currentShanghaiDay();
+}
+
+function recordDay(path: string): CalendarDay | null {
+  const match = /(\d{4})-(\d{2})-(\d{2})/.exec(path.split('/').pop() ?? '');
+  return match ? calendarDay(Number(match[1]), Number(match[2]), Number(match[3])) : null;
+}
+
+function explicitEventDates(text: string, defaultYear: number, today: CalendarDay): EventDateCandidate[] {
+  const candidates: EventDateCandidate[] = [];
+  const occupied: Array<[number, number]> = [];
+  const intervals = /(?<![\d/])(\d{1,2})[\/-](\d{1,2})\s*[-–—~～至]\s*(\d{1,2})[\/-](\d{1,2})(?!\d)/g;
+  for (const match of text.matchAll(intervals)) {
+    const start = calendarDay(defaultYear, Number(match[1]), Number(match[2]));
+    let end = calendarDay(defaultYear, Number(match[3]), Number(match[4]));
+    if (start && end && dayValue(end) < dayValue(start)) {
+      end = calendarDay(defaultYear + 1, Number(match[3]), Number(match[4]));
+    }
+    if (!start || !end) continue;
+    const label = dayValue(end) < dayValue(today)
+      ? classifyEventDay(end, today)
+      : dayValue(start) > dayValue(today)
+        ? classifyEventDay(start, today)
+        : '【进行中】';
+    candidates.push({ sortValue: dayValue(end), label });
+    occupied.push([match.index!, match.index! + match[0].length]);
+  }
+  const masked = text.split('').map((char, index) =>
+    occupied.some(([start, end]) => index >= start && index < end) ? ' ' : char
+  ).join('');
+  const add = (year: number, month: number, day: number) => {
+    const value = calendarDay(year, month, day);
+    if (value) candidates.push({ sortValue: dayValue(value), label: classifyEventDay(value, today) });
+  };
+  for (const match of masked.matchAll(/(?<!\d)(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?!\d)/g)) {
+    add(Number(match[1]), Number(match[3]), Number(match[4]));
+  }
+  for (const match of masked.matchAll(/(?<![\d/])(\d{1,2})\/(\d{1,2})(?!\d)/g)) {
+    add(defaultYear, Number(match[1]), Number(match[2]));
+  }
+  for (const match of masked.matchAll(/(?<!\d)(\d{1,2})月(\d{1,2})日?/g)) {
+    add(defaultYear, Number(match[1]), Number(match[2]));
+  }
+  return candidates;
+}
+
+/** Derive one event-tense label from visible title/snippet text, never from path text. */
+function eventTenseLabel(hit: VaultSearchHit, turnDay?: string): string {
+  const today = parseTurnDay(turnDay);
+  const factPath = /^memories\/facts\//i.test(hit.path.replace(/\\/g, '/'));
+  const text = `${hit.title}\n${hit.snippet}`;
+  const recurring = /recurring\s*[:=]\s*["']?yearly/i.test(text);
+  if (factPath) return recurring ? '【每年重复，勿当一次性已过期】' : '';
+
+  const anchor = recordDay(hit.path);
+  const defaultYear = anchor?.year ?? today.year;
+  const snippetDates = explicitEventDates(hit.snippet, defaultYear, today);
+  const titleDates = explicitEventDates(hit.title, defaultYear, today);
+  const hasRecurringWords = /生日|周年|纪念日|每年/.test(text);
+  if ((recurring || hasRecurringWords) && [...snippetDates, ...titleDates].length > 0) {
+    return '【每年重复，勿当一次性已过期】';
+  }
+
+  const relativeTerms = [...hit.snippet.matchAll(/今天|明天|昨天|今晚/g)];
+  if (relativeTerms.length > 0 && !anchor) return '【相对时间，勿当成本轮】';
+  const relativeDates = anchor ? relativeTerms.map((match): EventDateCandidate => {
+    const value = addCalendarDays(anchor, match[0] === '明天' ? 1 : match[0] === '昨天' ? -1 : 0);
+    return { sortValue: dayValue(value), label: classifyEventDay(value, today) };
+  }) : [];
+  const candidates = snippetDates.length > 0
+    ? [...snippetDates, ...relativeDates]
+    : [...titleDates, ...relativeDates];
+  return candidates.sort((a, b) => b.sortValue - a.sortValue)[0]?.label ?? '';
 }
 
 export interface VaultSearchHit {
@@ -386,7 +516,8 @@ export async function buildTurnBlock(
   vault: VaultClient,
   userText: string,
   seen: Set<string>,
-  maxChars: number
+  maxChars: number,
+  turnDay?: string
 ): Promise<string | null> {
   const keywordPlan = extractKeywordPlan(userText);
   const keywords = keywordPlan.all;
@@ -394,14 +525,18 @@ export async function buildTurnBlock(
 
   const lines: string[] = [];
   const maxEntries = 3;
+  const effectiveTurnDay = turnDay ?? isoDay(currentShanghaiDay());
   let budget = maxChars;
 
   const append = (hit: VaultSearchHit): boolean => {
     if (seen.has(hit.path) || lines.length >= maxEntries) return false;
     const titleLine = `- **${hit.title}** (\`${hit.path}\`)`.slice(0, 200) + dateAnchor(hit.path);
     const snippetLine = hit.snippet ? `\n  > ${hit.snippet}` : '';
+    const tenseLabel = eventTenseLabel(hit, effectiveTurnDay);
+    const labelSuffix = tenseLabel ? ` ${tenseLabel}` : '';
     const separator = lines.length > 0 ? 1 : 0;
-    let entry = titleLine + snippetLine;
+    let entry = titleLine + snippetLine + labelSuffix;
+    if (entry.length + separator > budget) entry = titleLine + labelSuffix;
     if (entry.length + separator > budget) entry = titleLine;
     if (entry.length + separator > budget) return false;
     seen.add(hit.path);
@@ -458,6 +593,7 @@ export function wrapTurnText(userText: string, block: string | null): string {
     userText,
     '',
     '<记忆库检索|网关自动注入，User 看不到这段。相关就用，不相关忽略；细节用 read_file 深挖>',
+    '带【已发生】标记的内容不要当作待办；引用记忆中的日期事件前先对 TURN_TIME 核对时态。',
     block,
     '</记忆库检索>',
   ].join('\n');

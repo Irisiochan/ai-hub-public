@@ -1,4 +1,4 @@
-import { isValidElement, useRef, useState, type MouseEvent, type ReactNode } from 'react';
+import { isValidElement, memo, useRef, useState, type MouseEvent, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Contact, Message, UserProfile } from '../api';
@@ -7,6 +7,8 @@ import { withBase } from '../mobileShell';
 import { isManualUserMessage } from '../messageSource.ts';
 import { outputLimitWarning } from '../messageWarnings';
 import { formatMessageTimestamp } from '../time';
+import { displayedErrorContent } from '../interruptionReason';
+import { Icon } from './icons';
 
 /** 方案 1b：代码块带工具栏（语言 · 复制 · 折叠），样式见 styles.css §2 .code-card */
 function CodeCard({ children }: { children?: ReactNode }) {
@@ -46,7 +48,8 @@ function CodeCard({ children }: { children?: ReactNode }) {
             copy();
           }}
         >
-          {copied ? '已复制' : '⧉ 复制'}
+          <Icon name={copied ? 'check' : 'copy'} />
+          <span>{copied ? '已复制' : '复制'}</span>
         </button>
         <button
           type="button"
@@ -56,7 +59,8 @@ function CodeCard({ children }: { children?: ReactNode }) {
             setCollapsed((value) => !value);
           }}
         >
-          {collapsed ? '展开' : '折叠'}
+          <Icon name={collapsed ? 'chevron-down' : 'chevron-up'} />
+          <span>{collapsed ? '展开' : '折叠'}</span>
         </button>
       </div>
       <pre ref={preRef}>{children}</pre>
@@ -76,6 +80,7 @@ interface Props {
   showBulkMark?: boolean;
   showActions?: boolean;
   deleteScope?: 'turn';
+  clustered?: boolean;
   onSelect(id: number | null): void;
   onBulkMessageToggle?(message: Message): void;
   onEdit(m: Message): void;
@@ -84,7 +89,7 @@ interface Props {
   onOpenExternalLink(url: string): void;
 }
 
-export default function MessageBubble({
+function MessageBubble({
   message,
   contact,
   showName,
@@ -96,6 +101,7 @@ export default function MessageBubble({
   showBulkMark = true,
   showActions = true,
   deleteScope,
+  clustered = false,
   onSelect,
   onBulkMessageToggle,
   onEdit,
@@ -114,7 +120,7 @@ export default function MessageBubble({
   const bulkClass = bulkMessageMode ? ` bulk-selectable${bulkSelected ? ' bulk-selected' : ''}` : '';
   const bulkMark = bulkMessageMode && showBulkMark && (
     <span className="tool-select-mark" aria-hidden="true">
-      {bulkSelected ? '✓' : ''}
+      {bulkSelected ? <Icon name="check" /> : null}
     </span>
   );
 
@@ -137,15 +143,18 @@ export default function MessageBubble({
       {mine && message.kind === 'text' && allowRegen && (
         <>
           <button type="button" onClick={(event) => stopAction(event, () => onEdit(message))}>
-            ✎ 编辑
+            <Icon name="edit" />
+            <span>编辑</span>
           </button>
           <button type="button" onClick={(event) => stopAction(event, () => onResend(message))}>
-            🔄 重新生成
+            <Icon name="regenerate" />
+            <span>重新生成</span>
           </button>
         </>
       )}
       <button type="button" className="del" onClick={(event) => stopAction(event, () => onDelete(message, deleteScope))}>
-        🗑 删除
+        <Icon name="trash" />
+        <span>删除</span>
       </button>
     </div>
   ) : null;
@@ -161,7 +170,7 @@ export default function MessageBubble({
           onClick={selectMessage}
         >
           {bulkMark}
-          <span>🔧 {message.content}</span>
+          <span><Icon name="tool" /> {message.content}</span>
         </button>
         {actions}
       </div>
@@ -178,7 +187,7 @@ export default function MessageBubble({
           onClick={selectMessage}
         >
           {bulkMark}
-          <span>⚠ {message.content}</span>
+          <span><Icon name="warning" /> {displayedErrorContent(message)}</span>
         </button>
         {actions}
       </div>
@@ -204,8 +213,8 @@ export default function MessageBubble({
             }}
           >
             {bulkMark}
-            <span>💭 {thinkingOpen ? '收起想法' : '想法'}</span>
-            {message.status === 'streaming' && <span className="cursor">▍</span>}
+            <span><Icon name="thinking" /> {thinkingOpen ? '收起想法' : '想法'}</span>
+            {message.status === 'streaming' && <span className="cursor" aria-hidden="true" />}
           </button>
           {thinkingOpen && <div className="thinking-content">{message.content}</div>}
         </div>
@@ -217,8 +226,8 @@ export default function MessageBubble({
   return (
     <div className={groupClass}>
       {showName && <span className="sender-name">{showName}</span>}
-      <div className={`bubble-row ${mine ? 'mine' : 'theirs'}`}>
-        {!mine && (
+      <div className={`bubble-row ${mine ? 'mine' : 'theirs'}${clustered ? ' clustered' : ''}`}>
+        {!mine && !clustered && (
           <span className="avatar bubble-avatar" style={{ boxShadow: `inset 0 0 0 1.5px ${contact.color}55` }}>
             {contact.avatar}
           </span>
@@ -272,13 +281,13 @@ export default function MessageBubble({
               {message.content}
             </ReactMarkdown>
           </div>
-          {message.status === 'streaming' && <span className="cursor">▍</span>}
+          {message.status === 'streaming' && <span className="cursor" aria-hidden="true" />}
           {message.status === 'interrupted' && <span className="interrupted-tag">（被打断）</span>}
-          {outputWarning && <span className="length-limit-tag">⚠ {outputWarning}</span>}
+          {outputWarning && <span className="length-limit-tag"><Icon name="warning" /> {outputWarning}</span>}
           {edited && <span className="edited-tag">（已编辑）</span>}
         </div>
 
-        {mine && (
+        {mine && !clustered && (
           <span className="avatar bubble-avatar" style={{ boxShadow: `inset 0 0 0 1.5px ${user.color}55` }}>
             {user.avatar}
           </span>
@@ -288,6 +297,21 @@ export default function MessageBubble({
     </div>
   );
 }
+
+export default memo(MessageBubble, (previous, next) =>
+  previous.message === next.message &&
+  previous.contact === next.contact &&
+  previous.user === next.user &&
+  previous.showName === next.showName &&
+  previous.allowRegen === next.allowRegen &&
+  previous.selected === next.selected &&
+  previous.bulkMessageMode === next.bulkMessageMode &&
+  previous.bulkSelected === next.bulkSelected &&
+  previous.showBulkMark === next.showBulkMark &&
+  previous.showActions === next.showActions &&
+  previous.deleteScope === next.deleteScope
+  && previous.clustered === next.clustered
+);
 
 export function AssistantTurnActions({
   message,
@@ -315,7 +339,8 @@ export function AssistantTurnActions({
           onDelete(message, 'turn');
         }}
       >
-        🗑 删除
+        <Icon name="trash" />
+        <span>删除</span>
       </button>
     </div>
   );

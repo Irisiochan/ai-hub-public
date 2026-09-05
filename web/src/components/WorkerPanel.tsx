@@ -1,9 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   api,
-  type JobMessage,
   type Worker,
-  type WorkerJob,
   type WorkflowProfile,
   type WorkflowStage,
 } from '../api';
@@ -16,6 +14,8 @@ import {
 } from './JobThread';
 import { formatLocalTime } from '../time';
 import { useConfirm } from './ConfirmDialog';
+import { Icon } from './icons';
+import { useJobMessages, useWorkerState, workerState } from '../useWorkerState';
 
 interface Props {
   onClose(): void;
@@ -29,15 +29,17 @@ const RUNNERS: ['codex' | 'claude' | 'grok', string][] = [
 
 export default function WorkerPanel({ onClose }: Props) {
   const confirm = useConfirm();
-  const [workers, setWorkers] = useState<Worker[]>([]);
-  const [jobs, setJobs] = useState<WorkerJob[]>([]);
+  const workers = useWorkerState((state) => state.workers);
+  const jobs = useWorkerState((state) => state.jobs);
+  const workflow = useWorkerState((state) => state.workflow);
+  const syncError = useWorkerState((state) => state.errors.workers || state.errors.jobs || state.errors.profiles || '');
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<JobMessage[]>([]);
+  const { messages, error: detailError } = useJobMessages(selectedId);
   const [error, setError] = useState('');
   const [drawer, setDrawer] = useState<'none' | 'compose' | 'pair' | 'profile'>('none');
-  const [profiles, setProfiles] = useState<WorkflowProfile[]>([]);
-  const [activeProfile, setActiveProfile] = useState<WorkflowProfile | null>(null);
-  const [previousProfile, setPreviousProfile] = useState<WorkflowProfile | null>(null);
+  const profiles = workflow?.profiles ?? [];
+  const activeProfile = workflow?.active ?? null;
+  const previousProfile = workflow?.previous ?? null;
   const [pairToken, setPairToken] = useState('');
   const [pairName, setPairName] = useState('my-pc');
   const [form, setForm] = useState({
@@ -51,43 +53,12 @@ export default function WorkerPanel({ onClose }: Props) {
     ssh: false,
   });
 
-  const refresh = async () => {
-    const [w, j, p] = await Promise.all([api.workers(), api.jobs(), api.workflowProfiles()]);
-    setWorkers(w.workers);
-    setJobs(j.jobs);
-    setProfiles(p.profiles);
-    setActiveProfile(p.active);
-    setPreviousProfile(p.previous);
-    if (!form.workspace) {
-      const first = w.workers.flatMap((x) => x.capabilities.workspaces ?? [])[0];
-      if (first) setForm((f) => ({ ...f, workspace: f.workspace || first }));
-    }
-  };
+  const refresh = workerState.reconcile;
 
   useEffect(() => {
-    void refresh().catch((e) => setError(e.message));
-    const timer = setInterval(() => void refresh().catch(() => {}), 4000);
-    return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    if (!selectedId) {
-      setMessages([]);
-      return;
-    }
-    const load = () =>
-      void api
-        .job(selectedId)
-        .then(({ job, messages }) => {
-          setJobs((list) => list.map((j) => (j.id === job.id ? job : j)));
-          setMessages(messages);
-        })
-        .catch(() => {});
-    load();
-    const timer = setInterval(load, 2500);
-    return () => clearInterval(timer);
-  }, [selectedId]);
+    const first = workers.flatMap((worker) => worker.capabilities.workspaces ?? [])[0];
+    if (first) setForm((form) => form.workspace ? form : { ...form, workspace: first });
+  }, [workers]);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -123,10 +94,10 @@ export default function WorkerPanel({ onClose }: Props) {
         workerId: form.workerId || undefined,
         permissions: { write: form.write, shell: form.shell, ssh: form.ssh },
       });
-      setJobs((list) => [job, ...list]);
       setSelectedId(job.id);
       setForm((f) => ({ ...f, prompt: '' }));
       setDrawer('none');
+      await refresh();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -160,7 +131,6 @@ export default function WorkerPanel({ onClose }: Props) {
       const done = await hideJobWindow(selected, confirm);
       if (!done) return;
       setSelectedId(null);
-      setMessages([]);
       await refresh();
     } catch (e) {
       setError((e as Error).message);
@@ -181,8 +151,8 @@ export default function WorkerPanel({ onClose }: Props) {
   const setWorkerEnabled = async (worker: Worker, enabled: boolean) => {
     setError('');
     try {
-      const updated = await api.setWorkerEnabled(worker.id, enabled);
-      setWorkers((list) => list.map((item) => (item.id === updated.id ? updated : item)));
+      await api.setWorkerEnabled(worker.id, enabled);
+      await refresh();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -225,14 +195,13 @@ export default function WorkerPanel({ onClose }: Props) {
     setError('');
     try {
       await api.recordJobQuality(selected.id, quality);
-      const detail = await api.job(selected.id);
-      setJobs((list) => list.map((job) => job.id === selected.id ? detail.job : job));
-      setMessages(detail.messages);
+      await refresh();
     } catch (e) {
       setError((e as Error).message);
     }
   };
 
+  const visibleError = error || detailError || syncError;
   const profileRunner = activeProfile?.routes[form.stage]?.primary.runner;
   const effectiveRunner = form.runner || profileRunner;
   const permWarn = effectiveRunner === 'codex' && !form.shell;
@@ -285,7 +254,7 @@ export default function WorkerPanel({ onClose }: Props) {
                       await api.deleteWorker(w.id).then(refresh).catch((e) => setError((e as Error).message));
                     })()}
                   >
-                    ✕
+                    <Icon name="close" />
                   </button>
                 )}
               </span>
@@ -303,14 +272,15 @@ export default function WorkerPanel({ onClose }: Props) {
             className={drawer === 'compose' ? 'chip-pill selected' : 'primary-btn'}
             onClick={() => setDrawer(drawer === 'compose' ? 'none' : 'compose')}
           >
-            ＋ 派单
+            <Icon name="plus" />
+            <span>派单</span>
           </button>
-          <button type="button" className="modal-close" onClick={onClose}>
-            ✕
+          <button type="button" className="modal-close" onClick={onClose} aria-label="关闭 Worker 面板">
+            <Icon name="close" />
           </button>
         </header>
 
-        {error && <div className="modal-error worker-error">⚠ {error}</div>}
+        {visibleError && <div className="modal-error worker-error"><Icon name="warning" /> {visibleError}</div>}
 
         {drawer === 'pair' && (
           <section className="worker-drawer">
@@ -327,7 +297,8 @@ export default function WorkerPanel({ onClose }: Props) {
               <span className="pair-token">
                 <code>{pairToken}</code>
                 <button type="button" onClick={() => void navigator.clipboard.writeText(pairToken)}>
-                  ⧉ 复制
+                  <Icon name="copy" />
+                  <span>复制</span>
                 </button>
               </span>
             )}
@@ -358,7 +329,8 @@ export default function WorkerPanel({ onClose }: Props) {
             <small>切换只影响新任务；在途任务固定原 Profile 版本。</small>
             {previousProfile && (
               <button type="button" onClick={() => void rollbackProfile()}>
-                ↶ 回滚到 {previousProfile.label}
+                <Icon name="regenerate" />
+                <span>回滚到 {previousProfile.label}</span>
               </button>
             )}
           </section>
@@ -434,7 +406,7 @@ export default function WorkerPanel({ onClose }: Props) {
                   {label}
                 </button>
               ))}
-              {permWarn && <small className="compose-warn">⚠ Codex 读写 workspace 必须开 Shell</small>}
+              {permWarn && <small className="compose-warn"><Icon name="warning" /> Codex 读写 workspace 必须开 Shell</small>}
               <span className="spacer" />
               <button
                 type="button"
@@ -467,7 +439,7 @@ export default function WorkerPanel({ onClose }: Props) {
                 <em className="job-list-open">查看执行过程</em>
               </button>
             ))}
-            {jobs.length === 0 && <p className="empty-note">还没有任务。点右上角「＋ 派单」。</p>}
+            {jobs.length === 0 && <p className="empty-note">还没有任务。点右上角“派单”。</p>}
           </aside>
 
           <main className="job-detail" aria-label="PC Worker 任务执行过程">
@@ -482,7 +454,8 @@ export default function WorkerPanel({ onClose }: Props) {
                     onClick={() => setSelectedId(null)}
                     aria-label="返回任务列表"
                   >
-                    ← 列表
+                    <Icon name="arrow-left" />
+                    <span>列表</span>
                   </button>
                   <span className={`job-dot ${selected.status}`} />
                   <b>{humanJobLabel(selected)}</b>

@@ -1,14 +1,18 @@
 import crypto from 'node:crypto';
+import { executionFingerprint } from '../shared/coordination-keys/index.mjs';
 import {
   OUTCOME_LABEL_ENGAGED,
   OUTCOME_LABEL_REJECTED,
   stableJson,
 } from './triage-shared.mjs';
+import { parseHubTimestampMs } from './hub-time.mjs';
 
 // 共享原语（池/标签常量、stableJson、normalizeEvent、上海日界等）在 triage-shared.mjs，
 // SQLite 账本在 triage-store.mjs；这里统一 re-export，既有 import 全部不用改。
 export * from './triage-shared.mjs';
 export { TriageStore } from './triage-store.mjs';
+export { parseHubTimestampMs } from './hub-time.mjs';
+export * from '../shared/coordination-keys/index.mjs';
 
 export const DEFAULT_CATEGORIES = [
   'calendar',
@@ -555,12 +559,7 @@ export function shouldSuppressUnchangedFileWatch(previousDigest, nextDigest) {
 export function messageTimestampMs(message) {
   if (!message || typeof message !== 'object') return null;
   const raw = message.created_at ?? message.createdAt ?? message.timestamp ?? null;
-  if (raw == null || raw === '') return null;
-  if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
-  const asNumber = Number(raw);
-  if (Number.isFinite(asNumber) && !/[-T:]/.test(String(raw))) return asNumber;
-  const parsed = Date.parse(String(raw));
-  return Number.isFinite(parsed) ? parsed : null;
+  return parseHubTimestampMs(raw);
 }
 
 export function normalizeTaskReminderConfig(raw = {}, proactive = normalizeProactiveConfig({})) {
@@ -1136,7 +1135,7 @@ function unquoteFrontmatterValue(value) {
   return text;
 }
 
-function parseTaskFrontmatter(text) {
+export function parseTaskFrontmatter(text) {
   const frontmatterMatch = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!frontmatterMatch) return null;
   const frontmatter = {};
@@ -1241,47 +1240,6 @@ export function parseCoordinationTask(raw, { taskPath = '' } = {}) {
     branch,
     planHash,
   };
-}
-
-// --- coordination fingerprint v2 ---
-// Dispatch identity must cover everything that changes the semantics of a
-// dispatch, not just the Plan text: reassigning executor/verifier while the
-// Plan or due date stays unchanged must still produce a new key. The same
-// canonicalization runs in server/src/workers/coordinationKeys.ts — keep the
-// two implementations byte-identical (parity-tested in server/test).
-
-function canonicalWorkspacePath(workspace) {
-  let value = String(workspace ?? '').trim().replaceAll('\\', '/');
-  while (value.length > 1 && value.endsWith('/')) value = value.slice(0, -1);
-  return /^[A-Za-z]:\//.test(value) ? value.toLowerCase() : value;
-}
-
-export function executionFingerprint(task) {
-  return crypto.createHash('sha256').update([
-    'ai-hub-coordination-execution',
-    'v2',
-    String(task?.taskPath ?? '').trim().replaceAll('\\', '/'),
-    String(task?.executor ?? '').trim().toLowerCase(),
-    canonicalWorkspacePath(task?.workspace),
-    String(task?.branch ?? '').trim(),
-    String(task?.planHash ?? '').trim().toLowerCase(),
-  ].join('\n')).digest('hex');
-}
-
-export function executionDispatchKey(task) {
-  return `coordination:v2:${task.taskPath}:${executionFingerprint(task)}`;
-}
-
-export function legacyExecutionDispatchKey(task) {
-  return `coordination:${task.taskPath}:${task.planHash}`;
-}
-
-export function verificationDispatchKey(task) {
-  return `verification:v2:${task.taskPath}:${task.due}:${String(task?.verifier ?? '').trim().toLowerCase()}`;
-}
-
-export function legacyVerificationDispatchKey(task) {
-  return `verification:v1:${task.taskPath}:${task.due}`;
 }
 
 export function parseVerificationTask(raw, { taskPath = '' } = {}) {

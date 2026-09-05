@@ -57,9 +57,9 @@ const A: WorkflowProfile = {
   description: 'Fable 负责 Plan/Review，Codex 执行，Grok 维护与巡逻。',
   routes: {
     plan: { primary: { runner: 'claude', model: 'fable', reasoning: 'high' } },
-    review: { primary: { runner: 'claude', model: 'fable', reasoning: 'high' } },
-    execute: { primary: { runner: 'codex', model: 'gpt-5.6-sol', reasoning: 'high' } },
-    fix: { primary: { runner: 'codex', model: 'gpt-5.6-sol', reasoning: 'high' } },
+    review: { primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' } },
+    execute: { primary: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'medium' } },
+    fix: { primary: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'medium' } },
     maintenance: { primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' } },
     patrol: { primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' } },
   },
@@ -72,20 +72,20 @@ const B: WorkflowProfile = {
   label: 'B · Codex / Grok 双引擎',
   description: 'Codex 规划与评审，Grok 执行；连续三次质量未收敛后切换兜底。',
   routes: {
-    plan: { primary: { runner: 'codex', model: 'gpt-5.6-sol', reasoning: 'ultra' } },
+    plan: { primary: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'high' } },
     review: {
-      primary: { runner: 'codex', model: 'gpt-5.6-sol', reasoning: 'high' },
+      primary: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'high' },
       fallback: { runner: 'claude', model: 'claude-opus-4-7', reasoning: 'high' },
       fallbackAfter: 3,
     },
     execute: {
       primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' },
-      fallback: { runner: 'codex', model: 'gpt-5.6-sol', reasoning: 'medium' },
+      fallback: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'high' },
       fallbackAfter: 3,
     },
     fix: {
       primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' },
-      fallback: { runner: 'codex', model: 'gpt-5.6-sol', reasoning: 'medium' },
+      fallback: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'high' },
       fallbackAfter: 3,
     },
     maintenance: { primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' } },

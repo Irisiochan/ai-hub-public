@@ -75,3 +75,11 @@ export function formatMessageTimestamp(value: string): string {
     parts.find((item) => item.type === type)?.value ?? '';
   return `${part('year')}/${part('month')}/${part('day')} ${part('hour')}:${part('minute')}:${part('second')}`;
 }
+
+export function formatRemainingMinutes(expiresAt: string, now = new Date()): string {
+  const expires = parseUtcTimestamp(expiresAt);
+  if (Number.isNaN(expires.getTime())) return '剩 0 分钟';
+  const minutes = Math.max(0, Math.ceil((expires.getTime() - now.getTime()) / 60_000));
+  if (minutes <= 60) return `剩 ${minutes} 分钟`;
+  return `剩 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}

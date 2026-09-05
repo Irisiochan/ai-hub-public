@@ -1,11 +1,12 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { formatContactConfigError, validateContactConfig } from '@ai-hub/contact-config';
-import { api, type Contact } from '../api';
+import { api, type Contact, type ModelOption } from '../api';
 import ApiFields from './contact-config/ApiFields';
 import CliFields from './contact-config/CliFields';
 import DelegationFields from './contact-config/DelegationFields';
 import RoomFields from './contact-config/RoomFields';
 import { useConfirm } from './ConfirmDialog';
+import { Icon } from './icons';
 
 interface Props {
   contact: Contact | null; // null = create new
@@ -98,6 +99,29 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
   const [rawJson, setRawJson] = useState(() => JSON.stringify(cfg, null, 2));
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [apiModelOptions, setApiModelOptions] = useState<ModelOption[]>([]);
+  const [apiModelsWarning, setApiModelsWarning] = useState<string | undefined>();
+
+  useEffect(() => {
+    if (!contact || !isApi) {
+      setApiModelOptions([]);
+      setApiModelsWarning(undefined);
+      return;
+    }
+    let cancelled = false;
+    void api.models(contact.id).then((catalog) => {
+      if (cancelled) return;
+      setApiModelOptions(catalog.models);
+      setApiModelsWarning(catalog.warning);
+    }).catch(() => {
+      if (cancelled) return;
+      setApiModelOptions([]);
+      setApiModelsWarning(undefined);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [contact?.id, isApi]);
 
   // 三类联系人的 tab 集合不同：CLI 由服务端配置只能改项目访问；
   // API 是唯一能新建的普通联系人；群聊没有自己的记忆和派单。
@@ -310,7 +334,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
             <small>{TAB_DEFS[activeTab].hint}</small>
             <span className="spacer" />
             <button type="button" className="modal-close" onClick={onClose}>
-              ✕
+              <Icon name="close" />
             </button>
           </header>
 
@@ -355,6 +379,8 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
                   readOnlyConnection={!isApi}
                   provider={provider}
                   model={model}
+                  modelOptions={apiModelOptions}
+                  modelsWarning={apiModelsWarning}
                   visionModel={visionModel}
                   imageSupport={imageSupport}
                   baseUrl={baseUrl}
@@ -416,7 +442,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
             {activeTab === 'json' && (
               <div className="cfg-group">
                 <p className="cfg-warn">
-                  ⚠ 直接编辑整份 config，保存前会做一次 schema 校验；上面各页的改动会被这里覆盖。
+                  <Icon name="warning" /> 直接编辑整份 config，保存前会做一次 schema 校验；上面各页的改动会被这里覆盖。
                 </p>
                 <textarea
                   className="json-editor"
@@ -428,7 +454,7 @@ export default function ContactConfig({ contact, contacts, onClose }: Props) {
               </div>
             )}
 
-            {error && <div className="modal-error">⚠ {error}</div>}
+            {error && <div className="modal-error"><Icon name="warning" /> {error}</div>}
           </div>
 
           <footer className="cfg-foot">

@@ -11,7 +11,6 @@ import {
 import { nextWallClockDelay, shanghaiDateAt } from './triage-core.mjs';
 import { agendaOnce, log, once } from './worker-shared.mjs';
 
-const LAST_AGENDA_FINGERPRINT_KEY = 'agenda-shadow:v1:last-fingerprint';
 const LEGACY_AGENDA_INCREMENT_STATE_KEY = 'agenda-shadow:v2:increment-state';
 const AGENDA_INCREMENT_STATE_KEY = 'agenda-shadow:v3:increment-state';
 
@@ -36,7 +35,7 @@ function frontmatterMode(content) {
   return value === 'ask' || value === 'auto' ? value : null;
 }
 
-function taskFilePath(tasksDir, vaultPath) {
+export function taskFilePath(tasksDir, vaultPath) {
   const normalized = path.posix.normalize(String(vaultPath).replaceAll('\\', '/'));
   if (!normalized.startsWith('tasks/') || normalized.includes('../')) return null;
   const relative = normalized.slice('tasks/'.length);
@@ -197,7 +196,6 @@ export const agendaMethods = {
       settledAt: now,
     }));
     this.store.setSourceState(AGENDA_INCREMENT_STATE_KEY, JSON.stringify(plan.sourceState));
-    this.store.setSourceState(LAST_AGENDA_FINGERPRINT_KEY, plan.fingerprint);
     log('info', 'agenda shadow dispatched', {
       date,
       messageId: dispatched?.messageId,

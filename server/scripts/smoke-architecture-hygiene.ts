@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DirectApiBackend } from '../dist/agents/directApi.js';
 import { chooseKeepFrom } from '../dist/agents/historyPolicy.js';
-import { parseRoomTargets } from '../dist/agents/roomTargets.js';
+import { parseRoomTargets, roomDirectlyMentions } from '../dist/agents/roomTargets.js';
 import { HeuristicTokenizer } from '../dist/agents/tokenEstimate.js';
 import { openDb } from '../dist/db.js';
 
@@ -25,6 +25,9 @@ assert.deepEqual(parseRoomTargets(members, '@all 集合', {}).map((row) => row.i
 assert.deepEqual(parseRoomTargets(members, '无点名', {}).map((row) => row.id), []);
 assert.deepEqual(parseRoomTargets(members, '无点名', { respondAllByDefault: true }).map((row) => row.id),
   ['claude', 'gem', 'aye']);
+assert.equal(roomDirectlyMentions(members[2], '@阿野 修好了'), true);
+assert.equal(roomDirectlyMentions(members[2], '@aye 修好了'), true);
+assert.equal(roomDirectlyMentions(members[2], '@all 修好了'), false, '@all is not a direct member mention');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.architecture-hygiene.db');

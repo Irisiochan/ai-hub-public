@@ -28,6 +28,64 @@ interface GeminiRoundResponse {
 }
 
 /**
+ * Gemini FunctionDeclaration.parameters 走 protobuf Schema，未知 JSON 键会 HTTP 400。
+ * camera_snap / taobao_* 带 `additionalProperties: false`，必须在出口剥掉。
+ */
+const GEMINI_SCHEMA_KEYS = new Set([
+  'type',
+  'format',
+  'title',
+  'description',
+  'nullable',
+  'enum',
+  'items',
+  'properties',
+  'required',
+  'minItems',
+  'maxItems',
+  'minProperties',
+  'maxProperties',
+  'minLength',
+  'maxLength',
+  'minimum',
+  'maximum',
+  'pattern',
+  'anyOf',
+  'example',
+  'propertyOrdering',
+]);
+
+export function sanitizeGeminiSchema(schema: unknown): Record<string, unknown> {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
+    return { type: 'object', properties: {} };
+  }
+  const input = schema as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (!GEMINI_SCHEMA_KEYS.has(key) || value === undefined) continue;
+    if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
+      out.properties = Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([name, nested]) => [
+          name,
+          sanitizeGeminiSchema(nested),
+        ]),
+      );
+      continue;
+    }
+    if (key === 'items') {
+      out.items = sanitizeGeminiSchema(value);
+      continue;
+    }
+    if (key === 'anyOf' && Array.isArray(value)) {
+      out.anyOf = value.map((entry) => sanitizeGeminiSchema(entry));
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
  * Gemini 原生 finishReason（如 MAX_TOKENS / STOP）归一成与 OpenAI 兼容的小写标签，
  * 好让 message meta 与前端 `outputLimitWarning`（认 `length`）共用一条路径。
  */
@@ -83,7 +141,7 @@ export class GeminiProvider implements DirectApiProvider<GeminiConversation> {
           functionDeclarations: tools.definitions.map((tool) => ({
             name: tool.name,
             description: tool.description,
-            parameters: tool.schema,
+            parameters: sanitizeGeminiSchema(tool.schema),
           })),
         }]
       : undefined;
@@ -174,13 +232,18 @@ export class GeminiProvider implements DirectApiProvider<GeminiConversation> {
     conversation.contents.push({ role: 'model', parts });
     conversation.contents.push({
       role: 'user',
-      parts: results.map((result) => ({
-        functionResponse: {
-          name: result.name,
-          ...(result.id ? { id: result.id } : {}),
-          response: { output: result.text, ok: result.ok },
+      parts: results.flatMap((result) => [
+        {
+          functionResponse: {
+            name: result.name,
+            ...(result.id ? { id: result.id } : {}),
+            response: { output: result.text, ok: result.ok },
+          },
         },
-      })),
+        ...(result.image
+          ? [{ inlineData: { mimeType: result.image.mimeType, data: result.image.data } }]
+          : []),
+      ]),
     });
   }
 

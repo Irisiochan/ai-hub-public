@@ -600,6 +600,7 @@ export class TriageStore {
       ideaDiariesWritten: Number(ideaDiaryOutbox.written ?? 0),
       ideaDiaryLastError,
       outcomes: this.outcomeSummary(),
+      routeSuggestions: this.routeSuggestionSummary(),
       lastDailyDeliveryAt: dailyUsage.lastAt === null
         ? null
         : new Date(dailyUsage.lastAt).toISOString(),
@@ -630,6 +631,258 @@ export class TriageStore {
         return [];
       }
     });
+  }
+
+  /**
+   * 路由初筛收口：建议行、source_state、delivery、event 终态同一事务落盘。
+   * 与 settleCoordinationDispatch 同理：远端 nudge 已发成功后本地任一半落
+   * 都会造成「群里问了但账本没记」，重试则靠 (item_path, suggest_date)
+   * 唯一约束与 hub idempotencyKey 双重幂等。
+   */
+  settleRouteTriage(eventIdValue, {
+    roomId,
+    suggestions = [],
+    stateKey,
+    stateValue,
+    messageId = null,
+    triageResult = null,
+  }, now = Date.now()) {
+    const normalizedMessageId = Number.isInteger(Number(messageId)) ? Number(messageId) : null;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of suggestions) {
+        this.db.prepare(`
+          INSERT OR IGNORE INTO route_suggestions
+            (item_path, kind, suggest_date, stage, recipient, reason, event_id, message_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          row.path,
+          row.kind ?? 'task',
+          row.suggestDate,
+          row.stage,
+          row.recipient,
+          row.reason ?? null,
+          eventIdValue,
+          normalizedMessageId,
+          now,
+        );
+      }
+      this.db.prepare(`
+        INSERT INTO triage_source_state (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `).run(stateKey, String(stateValue), now);
+      this.db.prepare(`
+        INSERT INTO triage_deliveries
+          (event_id, recipient_id, delivered_at, pool, message_id, executed_via)
+        SELECT ?, ?, ?, ?, ?, 'contact'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM triage_deliveries WHERE event_id = ? AND pool = ?
+        )
+      `).run(
+        eventIdValue, roomId, now, DELIVERY_POOL_COORDINATION, normalizedMessageId,
+        eventIdValue, DELIVERY_POOL_COORDINATION,
+      );
+      this.db.prepare(`
+        UPDATE triage_events
+        SET status = 'dispatched', updated_at = ?, triage_result = ?, recipient_id = ?, error = NULL
+        WHERE id = ?
+      `).run(now, triageResult ? stableJson(triageResult) : null, roomId, eventIdValue);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /** 晚到补收的独立插入：不动 event/state（settleRouteTriage 才是收口事务）。 */
+  insertRouteSuggestions(rows, now = Date.now()) {
+    let inserted = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of rows) {
+        inserted += this.db.prepare(`
+          INSERT OR IGNORE INTO route_suggestions
+            (item_path, kind, suggest_date, stage, recipient, reason, event_id, message_id, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          row.path,
+          row.kind ?? 'task',
+          row.suggestDate,
+          row.stage,
+          row.recipient,
+          row.reason ?? null,
+          row.eventId ?? null,
+          Number.isInteger(Number(row.messageId)) ? Number(row.messageId) : null,
+          now,
+        ).changes;
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+    return inserted;
+  }
+
+  pendingRouteSuggestions(limit = 100) {
+    return this.db.prepare(`
+      SELECT * FROM route_suggestions
+      WHERE status = 'pending'
+      ORDER BY created_at ASC, id ASC
+      LIMIT ?
+    `).all(Math.max(1, Number(limit) || 100));
+  }
+
+  pendingRouteSuggestionPaths() {
+    return this.db.prepare(`
+      SELECT DISTINCT item_path FROM route_suggestions WHERE status = 'pending'
+    `).all().map((row) => row.item_path);
+  }
+
+  /** 阶段二候选：过了否决窗口、未超龄的 pending 建议（升序，先到先派）。 */
+  autoDispatchCandidates({ delayMs, maxAgeMs, now = Date.now(), limit = 20 } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM route_suggestions
+      WHERE status = 'pending'
+        AND created_at <= ?
+        AND created_at >= ?
+      ORDER BY created_at ASC, id ASC
+      LIMIT ?
+    `).all(
+      now - Math.max(0, Number(delayMs) || 0),
+      now - Math.max(0, Number(maxAgeMs) || 0),
+      Math.max(1, Number(limit) || 20),
+    );
+  }
+
+  routeSuggestionPathsForDate(date) {
+    return this.db.prepare(`
+      SELECT item_path FROM route_suggestions WHERE suggest_date = ?
+    `).all(String(date)).map((row) => row.item_path);
+  }
+
+  resolveRouteSuggestionRow(id, status, {
+    resolvedRecipient = null,
+    resolvedVia = null,
+  } = {}, now = Date.now()) {
+    const allowed = new Set(['followed', 'overridden', 'closed', 'expired', 'dispatched', 'vetoed']);
+    if (!allowed.has(status)) throw new Error(`invalid route suggestion status: ${status}`);
+    return this.db.prepare(`
+      UPDATE route_suggestions
+      SET status = ?, resolved_recipient = ?, resolved_via = ?, resolved_at = ?
+      WHERE id = ? AND status = 'pending'
+    `).run(status, resolvedRecipient, resolvedVia, now, Number(id)).changes;
+  }
+
+  markRouteSuggestionDispatched(id, {
+    resolvedRecipient,
+    dispatchMessageId = null,
+    dispatchRoundId = null,
+  }, now = Date.now()) {
+    return this.db.prepare(`
+      UPDATE route_suggestions
+      SET status = 'dispatched', resolved_recipient = ?, resolved_via = 'auto-dispatch',
+          dispatch_message_id = ?, dispatch_round_id = ?, resolved_at = ?
+      WHERE id = ? AND status = 'pending'
+    `).run(
+      resolvedRecipient,
+      Number.isInteger(Number(dispatchMessageId)) ? Number(dispatchMessageId) : null,
+      String(dispatchRoundId ?? '').trim() || null,
+      now,
+      Number(id),
+    ).changes;
+  }
+
+  dispatchedRouteSuggestions(limit = 100) {
+    return this.db.prepare(`
+      SELECT * FROM route_suggestions
+      WHERE status = 'dispatched'
+      ORDER BY resolved_at ASC, id ASC
+      LIMIT ?
+    `).all(Math.max(1, Number(limit) || 100));
+  }
+
+  bindRouteSuggestionRound(id, { dispatchMessageId, dispatchRoundId }) {
+    return this.db.prepare(`
+      UPDATE route_suggestions
+      SET dispatch_message_id = ?, dispatch_round_id = ?
+      WHERE id = ? AND status = 'dispatched'
+    `).run(
+      Number.isInteger(Number(dispatchMessageId)) ? Number(dispatchMessageId) : null,
+      String(dispatchRoundId ?? '').trim() || null,
+      Number(id),
+    ).changes;
+  }
+
+  passRouteSuggestionRow(id, now = Date.now()) {
+    return this.db.prepare(`
+      UPDATE route_suggestions
+      SET status = 'passed', resolved_recipient = NULL,
+          resolved_via = 'auto-dispatch-no-spoke', resolved_at = ?
+      WHERE id = ? AND status = 'dispatched'
+    `).run(now, Number(id)).changes;
+  }
+
+  passedRouteSuggestionPaths(limit = 100) {
+    return this.db.prepare(`
+      SELECT item_path FROM route_suggestions
+      WHERE status = 'passed'
+      ORDER BY resolved_at DESC, id DESC
+      LIMIT ?
+    `).all(Math.max(1, Number(limit) || 100)).map((row) => row.item_path);
+  }
+
+  routeSuggestionStats(sinceMs = 0) {
+    const rows = this.db.prepare(`
+      SELECT status, recipient, COUNT(*) AS count
+      FROM route_suggestions
+      WHERE created_at >= ?
+      GROUP BY status, recipient
+    `).all(Math.max(0, Number(sinceMs) || 0));
+    const stats = {
+      pending: 0,
+      followed: 0,
+      overridden: 0,
+      closed: 0,
+      expired: 0,
+      dispatched: 0,
+      vetoed: 0,
+      passed: 0,
+      byRecipient: {},
+    };
+    for (const row of rows) {
+      stats[row.status] += Number(row.count);
+      if (row.status === 'followed' || row.status === 'overridden') {
+        const bucket = stats.byRecipient[row.recipient] ??= { followed: 0, overridden: 0 };
+        bucket[row.status] += Number(row.count);
+      }
+    }
+    return stats;
+  }
+
+  routeSuggestionSummary() {
+    const stats = this.routeSuggestionStats(0);
+    const last = this.db.prepare(`
+      SELECT MAX(created_at) AS created_at,
+             MAX(resolved_at) AS resolved_at
+      FROM route_suggestions
+    `).get();
+    return {
+      ...stats,
+      lastSuggestedAt: last.created_at === null
+        ? null
+        : new Date(Number(last.created_at)).toISOString(),
+      lastResolvedAt: last.resolved_at === null
+        ? null
+        : new Date(Number(last.resolved_at)).toISOString(),
+    };
+  }
+
+  eventRecipient(eventIdValue) {
+    return this.db.prepare(`
+      SELECT recipient_id FROM triage_events WHERE id = ?
+    `).get(String(eventIdValue))?.recipient_id ?? null;
   }
 
   getSourceState(key) {

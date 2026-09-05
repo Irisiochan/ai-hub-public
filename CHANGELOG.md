@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-06
+
+- Add a companion heartbeat: periodic autonomous ticks for both CLI and API contacts with
+  randomized intervals, model-decided speech, an unlimited manual mode, and runtime-drawer
+  controls; heartbeats can bridge desktop MCP tools and guarded PC camera capture that
+  returns frames as MCP images.
+- Add an OpenCode CLI backend (OpenCode Go) with model discovery in the picker, image input
+  via `run --file`, and stdin/idle-timeout fixes.
+- Close the route-triage loop: a patrol contact pre-screens unrouted tasks, suggestions
+  auto-dispatch after an unvetoed veto window, late same-day replies are harvested, and
+  presence checks are timezone-safe.
+- Harden coordination rooms: structured receipts with automated deploy closure, resumable
+  deploy events, guarded receipt pagination, task outcomes and due reminders routed through
+  the room, and worker actions shown on room receipts.
+- Refresh the web client with a Telegram-style shell, controlled theme manifests, motion and
+  sound preferences, split styles with a visual baseline, and bounded long-session rendering.
+- Import Alipay/WeChat/CMB bills into a personal ledger with deduplication and monthly advice.
+- Add living architecture docs: a product charter, `docs/ARCHITECTURE.md` with a drift-guard
+  test, and a core-implementation convergence pass unifying worker state, task transactions,
+  and gateway contracts.
+- List provider models with a searchable picker and keep Gemini tool schemas compatible by
+  stripping unsupported JSON Schema keys.
+
+This public release is a curated, sanitized snapshot based on private source revision
+`3cbdc973256a67179991bc1c873ac9ff823fa677`; private contacts, personas, real evaluation data,
+databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
+
 ## 0.2.1 - 2026-08-25
 
 - Make task rescheduling converge the new `due` value back into Memory Vault so the controller

@@ -62,6 +62,7 @@ import {
   legacyVerificationDispatchKey,
 } from './triage-core.mjs';
 import { DeepSeekClient, HubClient, VaultClient } from './triage-clients.mjs';
+import { coordinationMethods } from './worker-coordination.mjs';
 import {
   evaluateFollowupGate,
   formatFollowupDispatchBlock,
@@ -450,6 +451,27 @@ test('coordination parser requires open executor Plan and hashes only the Plan v
   assert.equal(coordinationPolicyState(config, { count: 7 }).remaining, 1);
   assert.equal(coordinationPolicyState(config, { count: 8 }).poolFull, true);
   assert.equal(coordinationPolicyState({ enabled: true, roomId: '', dailyLimit: 8 }).poolFull, true);
+});
+
+test('coordination snapshot keeps execution and verification eligibility independent and refreshes files', (t) => {
+  const tasksDir = fs.mkdtempSync(path.join(os.tmpdir(), 'coordination-snapshot-'));
+  t.after(() => fs.rmSync(tasksDir, { recursive: true, force: true }));
+  const worker = { coordinationConfig: () => ({ tasksDir }) };
+  const read = () => coordinationMethods.coordinationTaskSnapshot.call(worker);
+  const dualTask = [
+    '---', 'status: open', 'executor: codex', 'verifier: aye', 'due: 2026-09-05', '---',
+    '# Both stages', '## Plan（2026-09-05）', '- `C:/ai-hub`：`git checkout -b coordination-demo origin/master`。',
+  ].join('\n');
+  fs.writeFileSync(path.join(tasksDir, 'both.md'), dualTask);
+  fs.writeFileSync(path.join(tasksDir, 'verify.md'), dualTask.replace('executor: codex\n', '').split('## Plan')[0]);
+  fs.writeFileSync(path.join(tasksDir, 'closed.md'), dualTask.replace('status: open', 'status: done'));
+  fs.writeFileSync(path.join(tasksDir, 'invalid.md'), '# No task frontmatter');
+  const snapshot = read();
+  assert.deepEqual(snapshot.plans.map((task) => task.taskPath), ['tasks/both.md']);
+  assert.deepEqual(snapshot.verifications.map((task) => task.taskPath), ['tasks/both.md', 'tasks/verify.md']);
+  fs.writeFileSync(path.join(tasksDir, 'both.md'), dualTask.replace('status: open', 'status: done'));
+  assert.equal(read().plans.length, 0, 'a later scan must observe closure without a cache');
+  assert.equal(snapshot.plans.length, 1, 'a prior scan remains a local snapshot');
 });
 
 test('fingerprint v2 covers executor/workspace/branch and canonicalizes workspace paths', () => {

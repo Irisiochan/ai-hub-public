@@ -129,6 +129,25 @@ try {
   assert.deepEqual(seenMeta, [null, true], '已完成步骤不得在重试时重跑');
   assert.equal(outboxRow(job4.id)?.status, 'done');
 
+  // ── 同一 job 的真实后续终态迁移：复用同一 outbox 行重新投递 ──
+  const job4b = createRunning(storeB, 'blocked then resolved');
+  storeB.onFinished = () => {};
+  storeB.complete(job4b, 'blocked', 'waiting', null, 'blocked_unpushed', '{}');
+  clock += 40 * 60_000;
+  await storeB.drainOutboxOnce(clock);
+  assert.equal(outboxRow(job4b.id)?.status, 'done');
+  const resolved4b = storeB.resolveBlockedOutOfBand(storeB.get(job4b.id)!, 'User', { mode: 'manual' });
+  assert.equal('job' in resolved4b && resolved4b.job.status, 'done');
+  assert.equal(outboxRow(job4b.id)?.status, 'pending', '真实第二次终态迁移必须重新排队');
+  assert.equal(
+    (db.prepare('SELECT COUNT(*) AS c FROM job_outbox WHERE job_id = ?').get(job4b.id) as { c: number }).c,
+    1,
+    '后续终态迁移仍复用同一 durable outbox 行',
+  );
+  clock += 40 * 60_000;
+  await storeB.drainOutboxOnce(clock);
+  assert.equal(outboxRow(job4b.id)?.status, 'done');
+
   // ── 启动补偿：缺 outbox 行且缺回执的终态 job 被补；已有回执的不补 ──
   const job5 = createRunning(storeB, 'pre-migration terminal without receipt');
   db.prepare("UPDATE jobs SET status = 'done' WHERE id = ?").run(job5.id);

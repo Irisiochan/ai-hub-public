@@ -27,6 +27,7 @@ import {
 } from './triage-core.mjs';
 import { normalizeFollowupConfig } from './followups.mjs';
 import { normalizeAgendaConfig } from './agenda-core.mjs';
+import { normalizeRouteTriageConfig } from './route-triage-core.mjs';
 import { DeepSeekClient, HubClient, VaultClient } from './triage-clients.mjs';
 import {
   agendaOnce,
@@ -37,6 +38,7 @@ import {
   once,
   reminderOnce,
   reminderShadow,
+  routeAutoCleanupOnce,
   sleep,
 } from './worker-shared.mjs';
 import { followupMethods } from './worker-followups.mjs';
@@ -48,6 +50,7 @@ import { reminderMethods } from './worker-reminders.mjs';
 import { ideaDiaryMethods } from './worker-idea-diary.mjs';
 import { pipelineMethods } from './worker-pipeline.mjs';
 import { agendaMethods } from './worker-agenda.mjs';
+import { routeTriageMethods } from './worker-route-triage.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const configPath = path.resolve(process.argv.find((arg) => !arg.startsWith('--') && arg !== process.argv[0] && arg !== process.argv[1])
@@ -78,6 +81,7 @@ function loadConfig() {
   value.followups = normalizeFollowupConfig(value.followups ?? {});
   value.backlogSweep = normalizeBacklogSweepConfig(value.backlogSweep ?? {});
   value.agenda = normalizeAgendaConfig(value.agenda ?? {}, value.coordination);
+  value.routeTriage = normalizeRouteTriageConfig(value.routeTriage ?? {}, value.coordination);
   return value;
 }
 
@@ -105,6 +109,7 @@ class TriageWorker {
     this.nextOutcomePollAt = 0;
     this.nextFollowupPollAt = 0;
     this.nextCoordinationPollAt = 0;
+    this.nextRouteResolveAt = 0;
     /** @type {Promise<unknown>[]} */
     this.pendingSourceJobs = [];
   }
@@ -524,6 +529,11 @@ class TriageWorker {
       await this.startAgenda();
       return;
     }
+    if (routeAutoCleanupOnce) {
+      const result = await this.reconcileRouteAutoDispatches();
+      process.stdout.write(`${JSON.stringify({ routeAutoCleanup: result })}\n`);
+      return;
+    }
     // Reminder-only commands must not wake unrelated timers. In particular,
     // --reminder-shadow is a read-only production probe and may never dispatch.
     if (reminderShadow || reminderOnce) {
@@ -535,12 +545,14 @@ class TriageWorker {
       await this.startTaskReminders();
       await this.startBacklogSweep();
       await this.startAgenda();
+      await this.startRouteTriage();
     }
     this.startWebhook();
     do {
       await this.collectOutcomesIfDue();
       await this.processFollowupsIfDue();
       await this.scanCoordinationIfDue();
+      await this.resolveRouteSuggestionsIfDue();
       const vaultWorked = await this.processVaultOutboxOne();
       const eventWorked = await this.processOne();
       if (once && !vaultWorked && !eventWorked) break;
@@ -582,6 +594,7 @@ Object.assign(
   ideaDiaryMethods,
   pipelineMethods,
   agendaMethods,
+  routeTriageMethods,
 );
 
 async function main() {

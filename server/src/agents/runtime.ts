@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { heartbeatReceipt } from './heartbeatPolicy.js';
 import path from 'node:path';
 import type { HubConfig, MemoryConfig } from '../config.js';
 import { attachmentPathsForMessages, hardDeleteMessages } from '../attachments.js';
@@ -11,6 +12,8 @@ import { getUserProfile } from '../routes/user.js';
 import type { SseHub } from '../sse.js';
 import type { JobStore } from '../workers/jobStore.js';
 import type { HubLogger } from '../logger.js';
+import type { CameraSnapBroker } from '../workers/cameraSnap.js';
+import type { TaobaoBridge } from '../workers/taobaoBridge.js';
 import { BackendFactory } from './backendFactory.js';
 import { touchConversationSummary } from './conversationSummary.js';
 import { ConversationSummaryRepo } from './conversationSummaryRepo.js';
@@ -31,6 +34,11 @@ import { SessionRepo } from './sessionRepo.js';
 import type { AgentBackend, TurnHandle } from './types.js';
 import { AffectService } from './affectService.js';
 import { LifeEventService } from './lifeEvents.js';
+import type { CompanionHeartbeat } from './companionHeartbeat.js';
+import {
+  interruptionDisplayText,
+  type TurnInterruptionReason,
+} from './turnInterruption.js';
 
 export type RoomTurnOutcome = 'spoke' | 'passed' | 'silent' | 'error';
 
@@ -38,6 +46,7 @@ export interface DmTurnResult {
   outcome: 'done' | 'error' | 'interrupted';
   text: string;
   messageId?: number;
+  interruptionReason?: TurnInterruptionReason;
 }
 
 export interface TrackedDmTurn {
@@ -95,7 +104,16 @@ type QueueItem =
       resolve?: (result: DmTurnResult) => void;
     }
   // 群聊回合：出队时才构建增量 transcript；reaction = 接话轮（可 [PASS] 沉默）
-  | { kind: 'room-turn'; mode: 'normal' | 'reaction'; enqueuedAt: number; resolve: (r: RoomTurnOutcome) => void };
+  | {
+      kind: 'room-turn';
+      mode: 'normal' | 'reaction';
+      replaySourceMessageId?: number;
+      triggerMessageId?: number;
+      directMentioned?: boolean;
+      roomHostTargeted?: boolean;
+      enqueuedAt: number;
+      resolve: (r: RoomTurnOutcome) => void;
+    };
 
 const PASS_RE = /^[\s（(【\[]*(pass|不接话|沉默|skip)[\s）)】\]。.!～~]*$/i;
 
@@ -116,6 +134,9 @@ export interface AgentDeps {
   config: HubConfig;
   vault: VaultClient | null;
   jobStore: JobStore | null;
+  broker?: CameraSnapBroker;
+  heartbeat?: CompanionHeartbeat;
+  taobao?: TaobaoBridge;
   logger?: HubLogger;
 }
 
@@ -137,6 +158,8 @@ export class AgentRuntime {
   stateOrigin: MessageOrigin = 'main';
   private stateTrigger: Record<string, unknown> | null = null;
   private replyToMessageId: number | null = null;
+  private currentInterruptionReason: TurnInterruptionReason | null = null;
+  private stopping = false;
 
   private readonly messages: MessageRepo;
   private readonly sessions: SessionRepo;
@@ -163,6 +186,9 @@ export class AgentRuntime {
       config: deps.config,
       vault: deps.vault,
       jobStore: deps.jobStore,
+      broker: deps.broker,
+      heartbeat: deps.heartbeat,
+      taobao: deps.taobao,
       prompts: this.prompts,
     });
   }
@@ -245,19 +271,36 @@ export class AgentRuntime {
   }
 
   /** 群聊回合：编排器 await 结果（spoke/silent/error），实现顺序发言与接话轮。 */
-  runRoomTurn(mode: 'normal' | 'reaction'): Promise<RoomTurnOutcome> {
+  runRoomTurn(
+    mode: 'normal' | 'reaction',
+    replaySourceMessageId?: number,
+    triggerMessageId?: number,
+    directMentioned: boolean = false,
+    roomHostTargeted: boolean = false
+  ): Promise<RoomTurnOutcome> {
     return new Promise((resolve) => {
-      this.queue.push({ kind: 'room-turn', mode, enqueuedAt: Date.now(), resolve });
+      this.queue.push({
+        kind: 'room-turn',
+        mode,
+        replaySourceMessageId,
+        triggerMessageId,
+        directMentioned,
+        roomHostTargeted,
+        enqueuedAt: Date.now(),
+        resolve,
+      });
       void this.run();
     });
   }
 
-  interrupt(): void {
+  interrupt(reason: TurnInterruptionReason = 'user-interrupt'): void {
+    this.currentInterruptionReason = reason;
     void this.currentHandle?.interrupt();
   }
 
   async reset(): Promise<void> {
     this.cancelQueued('会话已重置');
+    this.currentInterruptionReason = 'user-interrupt';
     await this.currentHandle?.interrupt();
     await this.backend?.stop();
     this.backend = null;
@@ -268,10 +311,25 @@ export class AgentRuntime {
     this.setState('idle');
   }
 
-  async stop(): Promise<void> {
+  /** Resume scheduling after a transient heartbeat failure without resetting conversation history. */
+  recoverHeartbeatError(): boolean {
+    if (this.state !== 'error' || this.running || this.stopping || this.queue.length || this.lockedOut()) return false;
+    if (this.stateTrigger?.eventSource !== 'heartbeat') return false;
+    this.setState('idle');
+    return true;
+  }
+
+  async stop(reason: TurnInterruptionReason = 'claude-error'): Promise<void> {
+    this.stopping = true;
     this.cancelQueued('网关正在停止');
+    this.currentInterruptionReason = reason;
+    await this.currentHandle?.interrupt();
     await this.backend?.stop();
     this.backend = null;
+    const deadline = Date.now() + 5_000;
+    while (this.running && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
   }
 
   private log(msg: string, fields: Record<string, unknown> = {}): void {
@@ -466,19 +524,36 @@ export class AgentRuntime {
    * 错误/工具消息永不进入。超长时保留更近的消息，丢掉较早未读（仍推进 last_seen 到 upToId，
    * 避免卡死；被丢掉的早期未读可走成员自己的滚动摘要/历史预算）。
    */
-  private buildRoomDelivery(): RoomDelivery | null {
+  private buildRoomDelivery(requiredMessageId?: number): RoomDelivery | null {
     const lastSeen = this.sessions.lastSeen(this.convo.id, this.agent.id);
     const cfg = contactConfig(this.agent);
     const maxChars = Math.max(Number(cfg.roomDeliveryMaxChars ?? 12_000), 2_000);
     const maxRows = Math.min(Math.max(Number(cfg.roomDeliveryMaxMessages ?? 40), 4), 80);
-    const rows = this.messages.unreadRoomText(
+    let rows = this.messages.unreadRoomText(
       this.convo.id,
       lastSeen,
       this.agent.id,
       maxRows
     );
+    if (
+      typeof requiredMessageId === 'number'
+      && requiredMessageId > lastSeen
+      && !rows.some((row) => row.id === requiredMessageId)
+    ) {
+      const required = this.messages.roomDeliveryTextById(
+        this.convo.id,
+        requiredMessageId,
+        this.agent.id
+      );
+      if (required) {
+        const others = rows.slice(-(maxRows - 1));
+        rows = [...others, required].sort((a, b) => a.id - b.id);
+      } else {
+        this.log(`room trigger message unavailable id=${requiredMessageId}`);
+      }
+    }
     if (rows.length === 0) return null;
-    const upToId = rows[rows.length - 1].id;
+    const upToId = Math.max(...rows.map((row) => row.id));
     // 未读可能是几小时前甚至隔天的：带上绝对时间，别让离线后上线的成员当成"刚说的"
     const render = (row: RoomDeliveryRow) =>
       timestampedMessage(
@@ -495,16 +570,22 @@ export class AgentRuntime {
         temporal: '本轮新消息',
       });
     // 从最新往回装，保证接话轮看到最近上下文
-    const kept: typeof rows = [];
-    let used = 0;
+    const required = typeof requiredMessageId === 'number'
+      ? rows.find((row) => row.id === requiredMessageId)
+      : undefined;
+    const kept: typeof rows = required ? [required] : [];
+    let used = required
+      ? Math.max(render(required).length, renderPrompt(required).length)
+      : 0;
     for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].id === required?.id) continue;
       const cost = Math.max(render(rows[i]).length, renderPrompt(rows[i]).length)
         + (kept.length ? 1 : 0);
       if (kept.length > 0 && used + cost > maxChars) break;
       kept.push(rows[i]);
       used += cost;
     }
-    kept.reverse();
+    kept.sort((a, b) => a.id - b.id);
     if (kept.length < rows.length) {
       this.log(
         `room delivery trimmed ${rows.length - kept.length}/${rows.length} older unread (maxChars=${maxChars})`
@@ -604,16 +685,23 @@ export class AgentRuntime {
     // 群聊：出队时构建增量投递（合批天然完成）
     let delivery: RoomDelivery | null = null;
     if (item.kind === 'room-turn') {
-      delivery = this.buildRoomDelivery();
+      delivery = this.buildRoomDelivery(item.triggerMessageId);
       if (!delivery) {
         settle('silent'); // 没有新东西可回
         return;
       }
     }
+    const interruptionMeta = (reason: TurnInterruptionReason) => ({
+      interruptionReason: reason,
+      ...(reason === 'deploy-restart' && item.kind === 'room-turn' && item.replaySourceMessageId
+        ? { replaySourceMessageId: item.replaySourceMessageId }
+        : {}),
+    });
 
     // Mark thinking as soon as we commit to a turn — before vault/backend prep —
     // so room member name is on the wire during slow ensureStarted (not blank/room title).
     const turnId = crypto.randomUUID();
+    this.currentInterruptionReason = null;
     this.setState('thinking');
 
     try {
@@ -641,6 +729,29 @@ export class AgentRuntime {
       return;
     }
 
+    if (this.stopping || !this.backend) {
+      const reason = this.currentInterruptionReason ?? 'claude-error';
+      const failure = interruptionDisplayText(reason, '后端事件流意外结束');
+      const row = this.insertMessage({
+        role: 'system',
+        kind: 'error',
+        content: this.isRoom ? `${this.agent.name}：${failure}` : failure,
+        status: 'done',
+        turnId,
+        meta: interruptionMeta(reason),
+      });
+      if (!backgroundTurn) sse.broadcast('message', row);
+      settleDm({
+        outcome: 'interrupted',
+        text: failure,
+        messageId: row.id,
+        interruptionReason: reason,
+      });
+      settle('error');
+      this.replyToMessageId = null;
+      return;
+    }
+
     let textRow: MessageRow | null = null;
     let thinkingRow: MessageRow | null = null;
     let textBuf = '';
@@ -652,6 +763,26 @@ export class AgentRuntime {
     const reactionSuffix =
       '（接话机会：看完上面新发言，想接就简短接一句；没什么可补充就只回 [PASS]。）';
     const normalSuffix = '（轮到你了。实在没话说也可以只回 [PASS]。）';
+    const directMentioned = item.kind === 'room-turn'
+      && item.directMentioned === true
+      && typeof item.triggerMessageId === 'number'
+      && delivery?.messageIds.includes(item.triggerMessageId) === true;
+    const directMentionSuffix =
+      '（User 本轮明确 @ 你。除非她明确要求沉默，至少简短确认，不能只回 [PASS]。）';
+    const roomHostDispatchSuffix =
+      '（roomHost 本轮明确点名派单给你。请三选一：1. [PASS]，并说明一句当前无事可做的原因；2. 就地完成并回执；3. 需要真实执行时调用 delegate_to_worker。不得只回裸 [PASS]。）';
+    const roomHostTargeted = item.kind === 'room-turn'
+      && item.mode === 'normal'
+      && item.roomHostTargeted === true;
+    const roomSuffix = item.kind !== 'room-turn'
+      ? ''
+      : item.mode === 'reaction'
+        ? reactionSuffix
+        : directMentioned
+          ? directMentionSuffix
+          : roomHostTargeted
+            ? roomHostDispatchSuffix
+            : normalSuffix;
     const roomWindow = delivery ? {
       messageIds: delivery.messageIds,
       fromCreatedAt: delivery.fromCreatedAt,
@@ -663,14 +794,14 @@ export class AgentRuntime {
     } else if (this.agent.backend === 'api') {
       // API 群历史含最新消息；稳定 history 不再翻转标签，本轮窗口由 manifest 标出。
       turnText = [
-        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id, resolveRoomOrchestratorId(contactConfig(this.convo))),
-        item.mode === 'reaction' ? reactionSuffix : normalSuffix,
+        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id, resolveRoomOrchestratorId(contactConfig(this.convo)), directMentioned),
+        roomSuffix,
       ].join('\n');
     } else {
       turnText = [
-        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id, resolveRoomOrchestratorId(contactConfig(this.convo))),
+        roomTurnNotice(item.mode, delivery!.senders, roomWindow, delivery!.coordinationDispatch, this.agent.id, resolveRoomOrchestratorId(contactConfig(this.convo)), directMentioned),
         delivery!.promptText,
-        item.mode === 'reaction' ? reactionSuffix : normalSuffix,
+        roomSuffix,
       ].join('\n');
     }
 
@@ -694,6 +825,7 @@ export class AgentRuntime {
       imagePaths: item.kind === 'dm'
         ? attachmentPathsForMessages(this.deps.db, this.deps.config.uploadsDir, [item.userMessageId])
         : delivery!.imagePaths,
+      ...(this.stateTrigger?.eventSource === 'heartbeat' ? { emptyVisibleText: 'HEARTBEAT_OK' } : {}),
     });
     this.currentHandle = handle;
 
@@ -768,7 +900,13 @@ export class AgentRuntime {
               const updated = this.updateMessage(thinkingRow.id, thinkingBuf, 'done');
               if (!backgroundTurn) sse.broadcast('message', updated);
             }
-            const finalText = stableFinalText(textBuf, ev.finalText);
+            let finalText = stableFinalText(textBuf, ev.finalText);
+            if (this.stateTrigger?.eventSource === 'heartbeat') {
+              const calls = this.deps.db.prepare(
+                "SELECT content FROM messages WHERE contact_id = ? AND turn_id = ? AND kind = 'tool_use'"
+              ).all(convoId, turnId) as Array<{ content: string }>;
+              finalText = heartbeatReceipt(finalText, calls.map((call) => call.content));
+            }
             const passed = this.isRoom && PASS_RE.test(finalText.trim());
 
             if (backgroundTurn) {
@@ -788,7 +926,7 @@ export class AgentRuntime {
                 messageId: row.id,
                 eventSource: this.stateTrigger?.eventSource,
               });
-            } else if (passed) {
+            } else if (passed && !roomHostTargeted) {
               // 成员选择沉默：内部气泡无审计价值 → 物理删除 + prune（不走 soft-delete）
               const retractIds = [textRow?.id, thinkingRow?.id].filter(
                 (id): id is number => typeof id === 'number'
@@ -876,24 +1014,27 @@ export class AgentRuntime {
 
           case 'error': {
             markEvent();
+            const reason = ev.reason ?? this.currentInterruptionReason ?? 'claude-error';
+            const failure = redactSecrets(interruptionDisplayText(reason, ev.message));
+            const interruption = interruptionMeta(reason);
             if (thinkingRow) {
-              const updated = this.updateMessage(thinkingRow.id, thinkingBuf, 'interrupted');
+              const updated = this.updateMessage(thinkingRow.id, thinkingBuf, 'interrupted', interruption);
               if (!backgroundTurn) sse.broadcast('message', updated);
             }
             if (textRow) {
-              sse.broadcast('message', this.updateMessage(textRow.id, textBuf, 'interrupted'));
+              sse.broadcast('message', this.updateMessage(textRow.id, textBuf, 'interrupted', interruption));
             }
-            const failure = redactSecrets(ev.message);
             const row = this.insertMessage({
               role: 'system',
               kind: 'error',
               content: this.isRoom ? `${this.agent.name}：${failure}` : failure,
               status: 'done',
               turnId,
+              meta: interruption,
             });
             if (!backgroundTurn) sse.broadcast('message', row);
-            settleDm({ outcome: 'error', text: failure, messageId: row.id });
-            if (ev.fatal) {
+            settleDm({ outcome: 'error', text: failure, messageId: row.id, interruptionReason: reason });
+            if (ev.fatal && reason === 'claude-error') {
               this.recordCrash();
               this.backend = null;
             }
@@ -908,18 +1049,35 @@ export class AgentRuntime {
     } finally {
       this.currentHandle = null;
       if (!terminalEventSeen) {
-        settleDm({ outcome: 'interrupted', text: '后端事件流意外结束' });
+        const reason = this.currentInterruptionReason ?? 'claude-error';
+        const failure = interruptionDisplayText(reason, '后端事件流意外结束');
+        const interruption = interruptionMeta(reason);
         if (thinkingRow) {
-          const updated = this.updateMessage(thinkingRow.id, thinkingBuf, 'interrupted');
+          const updated = this.updateMessage(thinkingRow.id, thinkingBuf, 'interrupted', interruption);
           if (!backgroundTurn) sse.broadcast('message', updated);
         }
         if (textRow) {
           sse.broadcast(
             'message',
-            this.updateMessage(textRow.id, textBuf, 'interrupted')
+            this.updateMessage(textRow.id, textBuf, 'interrupted', interruption)
           );
         }
-        this.log('backend event stream ended without a terminal event');
+        const row = this.insertMessage({
+          role: 'system',
+          kind: 'error',
+          content: this.isRoom ? `${this.agent.name}：${failure}` : failure,
+          status: 'done',
+          turnId,
+          meta: interruption,
+        });
+        if (!backgroundTurn) sse.broadcast('message', row);
+        settleDm({
+          outcome: 'interrupted',
+          text: failure,
+          messageId: row.id,
+          interruptionReason: reason,
+        });
+        this.log('backend event stream ended without a terminal event', { interruptionReason: reason });
       }
       settle('error'); // 流意外结束的兜底
       if (this.rolloverAfterTurn) {
@@ -934,6 +1092,7 @@ export class AgentRuntime {
         this.setState('idle');
       }
       if (!timingLogged) logTiming('error');
+      this.currentInterruptionReason = null;
       this.replyToMessageId = null;
     }
   }
