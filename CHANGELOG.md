@@ -24,9 +24,12 @@
   and gateway contracts.
 - List provider models with a searchable picker and keep Gemini tool schemas compatible by
   stripping unsupported JSON Schema keys.
+- Refresh dependency locks (fast-uri, @xmldom/xmldom, and a `qs` override where the express
+  chain pins a vulnerable range); local audits for server, web, mobile, and desktop report
+  zero known vulnerabilities.
 
 This public release is a curated, sanitized snapshot based on private source revision
-`3cbdc973256a67179991bc1c873ac9ff823fa677`; private contacts, personas, real evaluation data,
+`875f112af36bb0af14753e57c2f79a22f080086c`; private contacts, personas, real evaluation data,
 databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
 
 ## 0.2.1 - 2026-08-25

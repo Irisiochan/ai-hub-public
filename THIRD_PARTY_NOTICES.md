@@ -222,8 +222,8 @@ Generated component versions: **706**.
 | [@types/unist](https://www.npmjs.com/package/%40types%2Funist/v/3.0.3) | 3.0.3 | MIT | Web UI | runtime |
 | [@ungap/structured-clone](https://www.npmjs.com/package/%40ungap%2Fstructured-clone/v/1.3.3) | 1.3.3 | ISC | Web UI | runtime |
 | [@vitejs/plugin-react](https://www.npmjs.com/package/%40vitejs%2Fplugin-react/v/4.7.0) | 4.7.0 | MIT | Web UI | build/dev |
-| [@xmldom/xmldom](https://www.npmjs.com/package/%40xmldom%2Fxmldom/v/0.8.14) | 0.8.14 | MIT | Desktop | build/dev |
-| [@xmldom/xmldom](https://www.npmjs.com/package/%40xmldom%2Fxmldom/v/0.9.11) | 0.9.11 | MIT | Android | build/dev |
+| [@xmldom/xmldom](https://www.npmjs.com/package/%40xmldom%2Fxmldom/v/0.8.15) | 0.8.15 | MIT | Desktop | build/dev |
+| [@xmldom/xmldom](https://www.npmjs.com/package/%40xmldom%2Fxmldom/v/0.9.12) | 0.9.12 | MIT | Android | build/dev |
 | [abbrev](https://www.npmjs.com/package/abbrev/v/4.0.0) | 4.0.0 | ISC | Desktop | build/dev |
 | [accepts](https://www.npmjs.com/package/accepts/v/1.3.8) | 1.3.8 | MIT | Desktop, Gateway / Docker | runtime |
 | [accepts](https://www.npmjs.com/package/accepts/v/2.0.0) | 2.0.0 | MIT | Desktop, Gateway / Docker | runtime |
@@ -371,7 +371,7 @@ Generated component versions: **706**.
 | [express-rate-limit](https://www.npmjs.com/package/express-rate-limit/v/8.6.2) | 8.6.2 | MIT | Desktop, Gateway / Docker | runtime |
 | [extend](https://www.npmjs.com/package/extend/v/3.0.2) | 3.0.2 | MIT | Web UI | runtime |
 | [fast-deep-equal](https://www.npmjs.com/package/fast-deep-equal/v/3.1.3) | 3.1.3 | MIT | Desktop, Gateway / Docker | runtime |
-| [fast-uri](https://www.npmjs.com/package/fast-uri/v/3.1.5) | 3.1.5 | BSD-3-Clause | Desktop, Gateway / Docker | runtime |
+| [fast-uri](https://www.npmjs.com/package/fast-uri/v/3.1.7) | 3.1.7 | BSD-3-Clause | Desktop, Gateway / Docker | runtime |
 | [fd-slicer](https://www.npmjs.com/package/fd-slicer/v/1.1.0) | 1.1.0 | MIT | Android | build/dev |
 | [fdir](https://www.npmjs.com/package/fdir/v/6.5.0) | 6.5.0 | MIT | Desktop, Web UI | build/dev |
 | [fflate](https://www.npmjs.com/package/fflate/v/0.8.3) | 0.8.3 | MIT | Gateway / Docker, Web UI | runtime |
@@ -597,7 +597,7 @@ Generated component versions: **706**.
 | [pump](https://www.npmjs.com/package/pump/v/3.0.4) | 3.0.4 | MIT | Desktop, Gateway / Docker | runtime |
 | [pvtsutils](https://www.npmjs.com/package/pvtsutils/v/1.3.6) | 1.3.6 | MIT | Desktop | build/dev |
 | [pvutils](https://www.npmjs.com/package/pvutils/v/1.2.0) | 1.2.0 | MIT | Desktop | build/dev |
-| [qs](https://www.npmjs.com/package/qs/v/6.15.3) | 6.15.3 | BSD-3-Clause | Desktop, Gateway / Docker | runtime |
+| [qs](https://www.npmjs.com/package/qs/v/6.16.0) | 6.16.0 | BSD-3-Clause | Desktop, Gateway / Docker | runtime |
 | [quick-format-unescaped](https://www.npmjs.com/package/quick-format-unescaped/v/4.0.4) | 4.0.4 | MIT | Gateway / Docker | runtime |
 | [quick-lru](https://www.npmjs.com/package/quick-lru/v/5.1.1) | 5.1.1 | MIT | Desktop | build/dev |
 | [range-parser](https://www.npmjs.com/package/range-parser/v/1.2.1) | 1.2.1 | MIT | Desktop, Gateway / Docker | runtime |
