@@ -249,6 +249,57 @@ try {
   assert.equal(noodleTxn.statusText, '已全额退款');
   assert.equal(monthStats(db, '2026-08').expenseCents, 71_00);
 
+  // —— 跨来源去重后的退款：钱包行作废时，统计计入的银行行也要跟着不计支出 ——
+  const CMB_MALL = `招商银行信用卡
+交易日,记账日,卡号后四位,交易描述,支出,存入
+2026-08-15,2026-08-15,1234,商场,30.00,
+`;
+  const cmbMall = parseLedgerFile(Buffer.from(CMB_MALL), 'cmb-cc');
+  importLedgerRows(db, {
+    source: cmbMall.source,
+    originalName: 'cmb-mall.csv',
+    fileSha256: sha256Hex(Buffer.from(CMB_MALL)),
+    rows: cmbMall.rows,
+  });
+  assert.equal(monthStats(db, '2026-08').expenseCents, 101_00);
+
+  const WECHAT_MALL = `微信支付账单明细
+微信昵称：[User]
+起始时间：[2026-08-01 00:00:00] 终止时间：[2026-08-31 23:59:59]
+交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号,商户单号,备注
+2026-08-15 15:00:00,商户消费,商场,衣服,支出,¥30.00,招商银行信用卡,支付成功,wx-mall,m,
+`;
+  const mallPaid = parseLedgerFile(Buffer.from(WECHAT_MALL), 'wechat');
+  importLedgerRows(db, {
+    source: mallPaid.source,
+    originalName: 'wechat-mall.csv',
+    fileSha256: sha256Hex(Buffer.from(WECHAT_MALL)),
+    rows: mallPaid.rows,
+  });
+  const mallTxns = listTransactions(db, { month: '2026-08' });
+  const wxMall = mallTxns.find((row) => row.sourceTxnId === 'wx-mall');
+  const cmbMallTxn = mallTxns.find((row) => row.source === 'cmb-cc' && row.payee === '商场');
+  assert.ok(wxMall && cmbMallTxn);
+  assert.equal(wxMall.duplicateOf, cmbMallTxn.id);
+  assert.equal(monthStats(db, '2026-08').expenseCents, 101_00);
+
+  const WECHAT_MALL_REFUND = WECHAT_MALL.replace('支付成功,wx-mall', '已全额退款,wx-mall');
+  const mallRefund = parseLedgerFile(Buffer.from(WECHAT_MALL_REFUND), 'wechat');
+  importLedgerRows(db, {
+    source: mallRefund.source,
+    originalName: 'wechat-mall-refund.csv',
+    fileSha256: sha256Hex(Buffer.from(WECHAT_MALL_REFUND)),
+    rows: mallRefund.rows,
+  });
+  const afterRefund = listTransactions(db, { month: '2026-08' });
+  assert.equal(afterRefund.find((row) => row.sourceTxnId === 'wx-mall')?.kind, 'ignored');
+  assert.equal(
+    afterRefund.find((row) => row.source === 'cmb-cc' && row.payee === '商场')?.kind,
+    'ignored',
+    '退款要传导到被统计的银行流水行',
+  );
+  assert.equal(monthStats(db, '2026-08').expenseCents, 71_00);
+
   console.log('ledger tests ok');
 } finally {
   db.close();

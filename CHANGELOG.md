@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.3.2 - 2026-09-07
+
+- Cascade wallet-side refunds to the linked bank row: after cross-source dedup the bank
+  transaction is the one month stats count, so re-importing a fully refunded wallet
+  transaction now marks its linked bank row ignored as well instead of leaving the amount
+  in monthly spending.
+- Restore third-party lockfile versions (`media-typer`, `node-api-version`) that a blanket
+  release-version sed had rewritten without changing the resolved tarballs, and regenerate
+  the third-party notices from the corrected locks; version bumps now go through
+  `npm pkg set` + `npm install --package-lock-only`.
+
+This public release is a curated, sanitized snapshot based on private source revision
+`a68119c9c7aa8597e5c6d9825ade365d6280847a`; private contacts, personas, real evaluation data,
+databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
+
 ## 0.3.1 - 2026-09-07
 
 - Ship the desktop shell's gateway runtime dependencies (`fflate`, `pino`,

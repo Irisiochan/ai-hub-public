@@ -1,7 +1,7 @@
 {
   "name": "ai-hub-mobile",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "ai-hub Android 伴侣壳（Capacitor）：打包 web/dist，连接远端 hub 网关",
   "scripts": {
     "sync": "cap sync android"

@@ -488,7 +488,7 @@ Generated component versions: **706**.
 | [mdast-util-to-hast](https://www.npmjs.com/package/mdast-util-to-hast/v/13.2.1) | 13.2.1 | MIT | Web UI | runtime |
 | [mdast-util-to-markdown](https://www.npmjs.com/package/mdast-util-to-markdown/v/2.1.2) | 2.1.2 | MIT | Web UI | runtime |
 | [mdast-util-to-string](https://www.npmjs.com/package/mdast-util-to-string/v/4.0.0) | 4.0.0 | MIT | Web UI | runtime |
-| [media-typer](https://www.npmjs.com/package/media-typer/v/0.3.1) | 0.3.1 | MIT | Desktop, Gateway / Docker | runtime |
+| [media-typer](https://www.npmjs.com/package/media-typer/v/0.3.0) | 0.3.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [media-typer](https://www.npmjs.com/package/media-typer/v/1.1.1) | 1.1.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [merge-descriptors](https://www.npmjs.com/package/merge-descriptors/v/1.0.3) | 1.0.3 | MIT | Desktop, Gateway / Docker | runtime |
 | [merge-descriptors](https://www.npmjs.com/package/merge-descriptors/v/2.0.0) | 2.0.0 | MIT | Desktop, Gateway / Docker | runtime |
@@ -548,7 +548,7 @@ Generated component versions: **706**.
 | [negotiator](https://www.npmjs.com/package/negotiator/v/1.0.0) | 1.0.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [node-abi](https://www.npmjs.com/package/node-abi/v/3.94.0) | 3.94.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [node-abi](https://www.npmjs.com/package/node-abi/v/4.33.0) | 4.33.0 | MIT | Desktop | build/dev |
-| [node-api-version](https://www.npmjs.com/package/node-api-version/v/0.3.1) | 0.3.1 | MIT | Desktop | build/dev |
+| [node-api-version](https://www.npmjs.com/package/node-api-version/v/0.2.1) | 0.2.1 | MIT | Desktop | build/dev |
 | [node-gyp](https://www.npmjs.com/package/node-gyp/v/12.4.0) | 12.4.0 | MIT | Desktop | build/dev |
 | [node-int64](https://www.npmjs.com/package/node-int64/v/0.4.0) | 0.4.0 | MIT | Desktop | build/dev |
 | [node-releases](https://www.npmjs.com/package/node-releases/v/2.0.53) | 2.0.53 | MIT | Web UI | build/dev |

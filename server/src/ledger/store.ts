@@ -231,9 +231,9 @@ export function importLedgerRows(
           // 同一交易再次导入时状态可能已变（如退款）：按 (source, fingerprint)
           // 找到旧行并刷新可变字段，让 kind/统计跟着最新账单走。
           const existingTxn = db.prepare(
-            'SELECT id, kind, status_text, amount_cents FROM ledger_transactions WHERE source = ? AND fingerprint = ?'
+            'SELECT id, kind, status_text, amount_cents, duplicate_of FROM ledger_transactions WHERE source = ? AND fingerprint = ?'
           ).get(input.source, row.fingerprint) as
-            | { id: number; kind: LedgerKind; status_text: string; amount_cents: number }
+            | { id: number; kind: LedgerKind; status_text: string; amount_cents: number; duplicate_of: number | null }
             | undefined;
           if (
             existingTxn &&
@@ -253,6 +253,14 @@ export function importLedgerRows(
               JSON.stringify(row.raw),
               existingTxn.id,
             );
+            // 跨来源去重后，统计计入的是被指向的银行流水行；钱包侧整单作废
+            // （退款/撤销 → ignored）时要把同一笔钱的银行行一并置 ignored，
+            // 否则月支出仍会保留已退款的金额。链接仍保留，防止该银行行被
+            // 后续批次重新当成可匹配流水。
+            if (row.kind === 'ignored' && existingTxn.kind !== 'ignored' && existingTxn.duplicate_of !== null) {
+              db.prepare('UPDATE ledger_transactions SET kind = ? WHERE id = ?')
+                .run('ignored', existingTxn.duplicate_of);
+            }
           }
           duplicate += 1;
           continue;
