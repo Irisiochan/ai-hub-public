@@ -9,6 +9,7 @@ import { parseCoordinationMarker } from './coordinationReceipt.js';
 import {
   problemFingerprint,
   stageForRouteClass,
+  WORKFLOW_HUMAN_ESCALATION_ERROR,
   type WorkflowSnapshot,
   type WorkflowStage,
   WorkflowProfileStore,
@@ -626,6 +627,12 @@ export class JobStore {
       taskPath: workflowTaskPath,
       problemFingerprint: fingerprint,
     });
+    if (
+      rawOptions.runnerSource !== 'override'
+      && this.workflowProfiles.isEscalatedToHuman(workflow)
+    ) {
+      return { error: WORKFLOW_HUMAN_ESCALATION_ERROR };
+    }
     const options = JSON.stringify({
       ...rawOptions,
       workflowStage: stage,

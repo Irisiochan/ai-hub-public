@@ -127,10 +127,13 @@ function linkCrossSourceKind(db: Db, kind: 'expense' | 'transfer'): number {
   }>;
   const cmbRows = db.prepare(
     `SELECT id, occurred_at, amount_cents, payee, description
-       FROM ledger_transactions
+       FROM ledger_transactions AS cmb
       WHERE source = 'cmb-cc'
         AND kind = ?
-        AND duplicate_of IS NULL`
+        AND duplicate_of IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM ledger_transactions AS linked WHERE linked.duplicate_of = cmb.id
+        )`
   ).all(kind) as Array<{
     id: number;
     occurred_at: string;
@@ -225,6 +228,32 @@ export function importLedgerRows(
       } catch (error) {
         const code = (error as { code?: string }).code;
         if (code === 'SQLITE_CONSTRAINT_UNIQUE') {
+          // 同一交易再次导入时状态可能已变（如退款）：按 (source, fingerprint)
+          // 找到旧行并刷新可变字段，让 kind/统计跟着最新账单走。
+          const existingTxn = db.prepare(
+            'SELECT id, kind, status_text, amount_cents FROM ledger_transactions WHERE source = ? AND fingerprint = ?'
+          ).get(input.source, row.fingerprint) as
+            | { id: number; kind: LedgerKind; status_text: string; amount_cents: number }
+            | undefined;
+          if (
+            existingTxn &&
+            (existingTxn.kind !== row.kind ||
+              existingTxn.status_text !== row.status ||
+              existingTxn.amount_cents !== row.amountCents)
+          ) {
+            db.prepare(
+              `UPDATE ledger_transactions
+                  SET kind = ?, category = ?, status_text = ?, amount_cents = ?, raw_json = ?
+                WHERE id = ?`
+            ).run(
+              row.kind,
+              row.category,
+              row.status,
+              row.amountCents,
+              JSON.stringify(row.raw),
+              existingTxn.id,
+            );
+          }
           duplicate += 1;
           continue;
         }

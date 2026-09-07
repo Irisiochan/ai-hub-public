@@ -154,7 +154,7 @@ Generated component versions: **706**.
 | [@peculiar/json-schema](https://www.npmjs.com/package/%40peculiar%2Fjson-schema/v/1.1.12) | 1.1.12 | MIT | Desktop | build/dev |
 | [@peculiar/utils](https://www.npmjs.com/package/%40peculiar%2Futils/v/2.0.3) | 2.0.3 | MIT | Desktop | build/dev |
 | [@peculiar/webcrypto](https://www.npmjs.com/package/%40peculiar%2Fwebcrypto/v/1.7.1) | 1.7.1 | MIT | Desktop | build/dev |
-| [@pinojs/redact](https://www.npmjs.com/package/%40pinojs%2Fredact/v/0.4.0) | 0.4.0 | MIT | Gateway / Docker | runtime |
+| [@pinojs/redact](https://www.npmjs.com/package/%40pinojs%2Fredact/v/0.4.0) | 0.4.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [@rolldown/pluginutils](https://www.npmjs.com/package/%40rolldown%2Fpluginutils/v/1.0.0-beta.27) | 1.0.0-beta.27 | MIT | Web UI | build/dev |
 | [@rollup/rollup-android-arm-eabi](https://www.npmjs.com/package/%40rollup%2Frollup-android-arm-eabi/v/4.62.4) | 4.62.4 | MIT | Web UI | build/dev |
 | [@rollup/rollup-android-arm64](https://www.npmjs.com/package/%40rollup%2Frollup-android-arm64/v/4.62.4) | 4.62.4 | MIT | Web UI | build/dev |
@@ -242,7 +242,7 @@ Generated component versions: **706**.
 | [async-exit-hook](https://www.npmjs.com/package/async-exit-hook/v/2.0.1) | 2.0.1 | MIT | Desktop | build/dev |
 | [asynckit](https://www.npmjs.com/package/asynckit/v/0.4.0) | 0.4.0 | MIT | Desktop | build/dev |
 | [at-least-node](https://www.npmjs.com/package/at-least-node/v/1.0.0) | 1.0.0 | ISC | Android, Desktop | build/dev |
-| [atomic-sleep](https://www.npmjs.com/package/atomic-sleep/v/1.0.0) | 1.0.0 | MIT | Gateway / Docker | runtime |
+| [atomic-sleep](https://www.npmjs.com/package/atomic-sleep/v/1.0.0) | 1.0.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [aws4](https://www.npmjs.com/package/aws4/v/1.13.2) | 1.13.2 | MIT | Desktop | build/dev |
 | [bail](https://www.npmjs.com/package/bail/v/2.0.2) | 2.0.2 | MIT | Web UI | runtime |
 | [balanced-match](https://www.npmjs.com/package/balanced-match/v/1.0.2) | 1.0.2 | MIT | Desktop | build/dev |
@@ -374,7 +374,7 @@ Generated component versions: **706**.
 | [fast-uri](https://www.npmjs.com/package/fast-uri/v/3.1.7) | 3.1.7 | BSD-3-Clause | Desktop, Gateway / Docker | runtime |
 | [fd-slicer](https://www.npmjs.com/package/fd-slicer/v/1.1.0) | 1.1.0 | MIT | Android | build/dev |
 | [fdir](https://www.npmjs.com/package/fdir/v/6.5.0) | 6.5.0 | MIT | Desktop, Web UI | build/dev |
-| [fflate](https://www.npmjs.com/package/fflate/v/0.8.3) | 0.8.3 | MIT | Gateway / Docker, Web UI | runtime |
+| [fflate](https://www.npmjs.com/package/fflate/v/0.8.3) | 0.8.3 | MIT | Desktop, Gateway / Docker, Web UI | runtime |
 | [file-uri-to-path](https://www.npmjs.com/package/file-uri-to-path/v/1.0.0) | 1.0.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [filelist](https://www.npmjs.com/package/filelist/v/1.0.6) | 1.0.6 | Apache-2.0 | Desktop | build/dev |
 | [finalhandler](https://www.npmjs.com/package/finalhandler/v/1.3.2) | 1.3.2 | MIT | Desktop, Gateway / Docker | runtime |
@@ -488,7 +488,7 @@ Generated component versions: **706**.
 | [mdast-util-to-hast](https://www.npmjs.com/package/mdast-util-to-hast/v/13.2.1) | 13.2.1 | MIT | Web UI | runtime |
 | [mdast-util-to-markdown](https://www.npmjs.com/package/mdast-util-to-markdown/v/2.1.2) | 2.1.2 | MIT | Web UI | runtime |
 | [mdast-util-to-string](https://www.npmjs.com/package/mdast-util-to-string/v/4.0.0) | 4.0.0 | MIT | Web UI | runtime |
-| [media-typer](https://www.npmjs.com/package/media-typer/v/0.3.0) | 0.3.0 | MIT | Desktop, Gateway / Docker | runtime |
+| [media-typer](https://www.npmjs.com/package/media-typer/v/0.3.1) | 0.3.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [media-typer](https://www.npmjs.com/package/media-typer/v/1.1.1) | 1.1.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [merge-descriptors](https://www.npmjs.com/package/merge-descriptors/v/1.0.3) | 1.0.3 | MIT | Desktop, Gateway / Docker | runtime |
 | [merge-descriptors](https://www.npmjs.com/package/merge-descriptors/v/2.0.0) | 2.0.0 | MIT | Desktop, Gateway / Docker | runtime |
@@ -548,7 +548,7 @@ Generated component versions: **706**.
 | [negotiator](https://www.npmjs.com/package/negotiator/v/1.0.0) | 1.0.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [node-abi](https://www.npmjs.com/package/node-abi/v/3.94.0) | 3.94.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [node-abi](https://www.npmjs.com/package/node-abi/v/4.33.0) | 4.33.0 | MIT | Desktop | build/dev |
-| [node-api-version](https://www.npmjs.com/package/node-api-version/v/0.3.0) | 0.3.0 | MIT | Desktop | build/dev |
+| [node-api-version](https://www.npmjs.com/package/node-api-version/v/0.3.1) | 0.3.1 | MIT | Desktop | build/dev |
 | [node-gyp](https://www.npmjs.com/package/node-gyp/v/12.4.0) | 12.4.0 | MIT | Desktop | build/dev |
 | [node-int64](https://www.npmjs.com/package/node-int64/v/0.4.0) | 0.4.0 | MIT | Desktop | build/dev |
 | [node-releases](https://www.npmjs.com/package/node-releases/v/2.0.53) | 2.0.53 | MIT | Web UI | build/dev |
@@ -557,7 +557,7 @@ Generated component versions: **706**.
 | [object-assign](https://www.npmjs.com/package/object-assign/v/4.1.1) | 4.1.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [object-inspect](https://www.npmjs.com/package/object-inspect/v/1.13.4) | 1.13.4 | MIT | Desktop, Gateway / Docker | runtime |
 | [object-keys](https://www.npmjs.com/package/object-keys/v/1.1.1) | 1.1.1 | MIT | Desktop | build/dev |
-| [on-exit-leak-free](https://www.npmjs.com/package/on-exit-leak-free/v/2.1.2) | 2.1.2 | MIT | Gateway / Docker | runtime |
+| [on-exit-leak-free](https://www.npmjs.com/package/on-exit-leak-free/v/2.1.2) | 2.1.2 | MIT | Desktop, Gateway / Docker | runtime |
 | [on-finished](https://www.npmjs.com/package/on-finished/v/2.4.1) | 2.4.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [once](https://www.npmjs.com/package/once/v/1.4.0) | 1.4.0 | ISC | Desktop, Gateway / Docker | runtime |
 | [open](https://www.npmjs.com/package/open/v/8.4.2) | 8.4.2 | MIT | Android | build/dev |
@@ -575,9 +575,9 @@ Generated component versions: **706**.
 | [pend](https://www.npmjs.com/package/pend/v/1.2.0) | 1.2.0 | MIT | Android | build/dev |
 | [picocolors](https://www.npmjs.com/package/picocolors/v/1.1.1) | 1.1.1 | ISC | Desktop, Web UI | build/dev |
 | [picomatch](https://www.npmjs.com/package/picomatch/v/4.0.5) | 4.0.5 | MIT | Desktop, Web UI | build/dev |
-| [pino](https://www.npmjs.com/package/pino/v/9.14.0) | 9.14.0 | MIT | Gateway / Docker | runtime |
-| [pino-abstract-transport](https://www.npmjs.com/package/pino-abstract-transport/v/2.0.0) | 2.0.0 | MIT | Gateway / Docker | runtime |
-| [pino-std-serializers](https://www.npmjs.com/package/pino-std-serializers/v/7.1.0) | 7.1.0 | MIT | Gateway / Docker | runtime |
+| [pino](https://www.npmjs.com/package/pino/v/9.14.0) | 9.14.0 | MIT | Desktop, Gateway / Docker | runtime |
+| [pino-abstract-transport](https://www.npmjs.com/package/pino-abstract-transport/v/2.0.0) | 2.0.0 | MIT | Desktop, Gateway / Docker | runtime |
+| [pino-std-serializers](https://www.npmjs.com/package/pino-std-serializers/v/7.1.0) | 7.1.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [pkce-challenge](https://www.npmjs.com/package/pkce-challenge/v/5.0.1) | 5.0.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [pkijs](https://www.npmjs.com/package/pkijs/v/3.4.0) | 3.4.0 | BSD-3-Clause | Desktop | build/dev |
 | [plist](https://www.npmjs.com/package/plist/v/3.1.0) | 3.1.0 | MIT | Desktop | build/dev |
@@ -587,7 +587,7 @@ Generated component versions: **706**.
 | [prebuild-install](https://www.npmjs.com/package/prebuild-install/v/7.1.3) | 7.1.3 | MIT | Desktop, Gateway / Docker | runtime |
 | [proc-log](https://www.npmjs.com/package/proc-log/v/6.1.0) | 6.1.0 | ISC | Desktop | build/dev |
 | [process-nextick-args](https://www.npmjs.com/package/process-nextick-args/v/2.0.1) | 2.0.1 | MIT | Desktop | build/dev |
-| [process-warning](https://www.npmjs.com/package/process-warning/v/5.1.0) | 5.1.0 | MIT | Gateway / Docker | runtime |
+| [process-warning](https://www.npmjs.com/package/process-warning/v/5.1.0) | 5.1.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [progress](https://www.npmjs.com/package/progress/v/2.0.3) | 2.0.3 | MIT | Desktop | build/dev |
 | [promise-retry](https://www.npmjs.com/package/promise-retry/v/2.0.1) | 2.0.1 | MIT | Desktop | build/dev |
 | [prompts](https://www.npmjs.com/package/prompts/v/2.4.2) | 2.4.2 | MIT | Android | build/dev |
@@ -598,7 +598,7 @@ Generated component versions: **706**.
 | [pvtsutils](https://www.npmjs.com/package/pvtsutils/v/1.3.6) | 1.3.6 | MIT | Desktop | build/dev |
 | [pvutils](https://www.npmjs.com/package/pvutils/v/1.2.0) | 1.2.0 | MIT | Desktop | build/dev |
 | [qs](https://www.npmjs.com/package/qs/v/6.16.0) | 6.16.0 | BSD-3-Clause | Desktop, Gateway / Docker | runtime |
-| [quick-format-unescaped](https://www.npmjs.com/package/quick-format-unescaped/v/4.0.4) | 4.0.4 | MIT | Gateway / Docker | runtime |
+| [quick-format-unescaped](https://www.npmjs.com/package/quick-format-unescaped/v/4.0.4) | 4.0.4 | MIT | Desktop, Gateway / Docker | runtime |
 | [quick-lru](https://www.npmjs.com/package/quick-lru/v/5.1.1) | 5.1.1 | MIT | Desktop | build/dev |
 | [range-parser](https://www.npmjs.com/package/range-parser/v/1.2.1) | 1.2.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [raw-body](https://www.npmjs.com/package/raw-body/v/2.5.3) | 2.5.3 | MIT | Desktop, Gateway / Docker | runtime |
@@ -611,7 +611,7 @@ Generated component versions: **706**.
 | [read-binary-file-arch](https://www.npmjs.com/package/read-binary-file-arch/v/1.0.6) | 1.0.6 | MIT | Desktop | build/dev |
 | [readable-stream](https://www.npmjs.com/package/readable-stream/v/2.3.8) | 2.3.8 | MIT | Desktop | build/dev |
 | [readable-stream](https://www.npmjs.com/package/readable-stream/v/3.6.2) | 3.6.2 | MIT | Android, Desktop, Gateway / Docker | runtime |
-| [real-require](https://www.npmjs.com/package/real-require/v/0.2.0) | 0.2.0 | MIT | Gateway / Docker | runtime |
+| [real-require](https://www.npmjs.com/package/real-require/v/0.2.0) | 0.2.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [remark-gfm](https://www.npmjs.com/package/remark-gfm/v/4.0.1) | 4.0.1 | MIT | Web UI | runtime |
 | [remark-parse](https://www.npmjs.com/package/remark-parse/v/11.0.0) | 11.0.0 | MIT | Web UI | runtime |
 | [remark-rehype](https://www.npmjs.com/package/remark-rehype/v/11.1.2) | 11.1.2 | MIT | Web UI | runtime |
@@ -629,7 +629,7 @@ Generated component versions: **706**.
 | [router](https://www.npmjs.com/package/router/v/2.2.0) | 2.2.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [safe-buffer](https://www.npmjs.com/package/safe-buffer/v/5.1.2) | 5.1.2 | MIT | Desktop | build/dev |
 | [safe-buffer](https://www.npmjs.com/package/safe-buffer/v/5.2.1) | 5.2.1 | MIT | Android, Desktop, Gateway / Docker | runtime |
-| [safe-stable-stringify](https://www.npmjs.com/package/safe-stable-stringify/v/2.5.0) | 2.5.0 | MIT | Gateway / Docker | runtime |
+| [safe-stable-stringify](https://www.npmjs.com/package/safe-stable-stringify/v/2.5.0) | 2.5.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [safer-buffer](https://www.npmjs.com/package/safer-buffer/v/2.1.2) | 2.1.2 | MIT | Desktop, Gateway / Docker | runtime |
 | [sanitize-filename](https://www.npmjs.com/package/sanitize-filename/v/1.6.4) | 1.6.4 | WTFPL OR ISC | Desktop | build/dev |
 | [sax](https://www.npmjs.com/package/sax/v/1.1.4) | 1.1.4 | ISC | Android | build/dev |
@@ -658,12 +658,12 @@ Generated component versions: **706**.
 | [simple-update-notifier](https://www.npmjs.com/package/simple-update-notifier/v/2.0.0) | 2.0.0 | MIT | Desktop | build/dev |
 | [sisteransi](https://www.npmjs.com/package/sisteransi/v/1.0.5) | 1.0.5 | MIT | Android | build/dev |
 | [slice-ansi](https://www.npmjs.com/package/slice-ansi/v/4.0.0) | 4.0.0 | MIT | Android | build/dev |
-| [sonic-boom](https://www.npmjs.com/package/sonic-boom/v/4.2.1) | 4.2.1 | MIT | Gateway / Docker | runtime |
+| [sonic-boom](https://www.npmjs.com/package/sonic-boom/v/4.2.1) | 4.2.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [source-map](https://www.npmjs.com/package/source-map/v/0.6.1) | 0.6.1 | BSD-3-Clause | Desktop | build/dev |
 | [source-map-js](https://www.npmjs.com/package/source-map-js/v/1.2.1) | 1.2.1 | BSD-3-Clause | Web UI | build/dev |
 | [source-map-support](https://www.npmjs.com/package/source-map-support/v/0.5.21) | 0.5.21 | MIT | Desktop | build/dev |
 | [space-separated-tokens](https://www.npmjs.com/package/space-separated-tokens/v/2.0.2) | 2.0.2 | MIT | Web UI | runtime |
-| [split2](https://www.npmjs.com/package/split2/v/4.2.0) | 4.2.0 | ISC | Android, Gateway / Docker | runtime |
+| [split2](https://www.npmjs.com/package/split2/v/4.2.0) | 4.2.0 | ISC | Android, Desktop, Gateway / Docker | runtime |
 | [sprintf-js](https://www.npmjs.com/package/sprintf-js/v/1.1.3) | 1.1.3 | BSD-3-Clause | Desktop | build/dev |
 | [stat-mode](https://www.npmjs.com/package/stat-mode/v/1.0.0) | 1.0.0 | MIT | Desktop | build/dev |
 | [statuses](https://www.npmjs.com/package/statuses/v/2.0.2) | 2.0.2 | MIT | Desktop, Gateway / Docker | runtime |
@@ -683,7 +683,7 @@ Generated component versions: **706**.
 | [tar-stream](https://www.npmjs.com/package/tar-stream/v/2.2.0) | 2.2.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [temp](https://www.npmjs.com/package/temp/v/0.9.4) | 0.9.4 | MIT | Desktop | build/dev |
 | [temp-file](https://www.npmjs.com/package/temp-file/v/3.4.0) | 3.4.0 | MIT | Desktop | build/dev |
-| [thread-stream](https://www.npmjs.com/package/thread-stream/v/3.2.0) | 3.2.0 | MIT | Gateway / Docker | runtime |
+| [thread-stream](https://www.npmjs.com/package/thread-stream/v/3.2.0) | 3.2.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [through2](https://www.npmjs.com/package/through2/v/4.0.2) | 4.0.2 | MIT | Android | build/dev |
 | [tiny-async-pool](https://www.npmjs.com/package/tiny-async-pool/v/1.3.0) | 1.3.0 | MIT | Desktop | build/dev |
 | [tinyglobby](https://www.npmjs.com/package/tinyglobby/v/0.2.17) | 0.2.17 | MIT | Desktop, Web UI | build/dev |

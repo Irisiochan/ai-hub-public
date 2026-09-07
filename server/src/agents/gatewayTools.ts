@@ -11,6 +11,7 @@ import { structuredReceiptFields, structuredReceiptLines } from '../workers/rece
 import {
   problemFingerprint,
   stageForRouteClass,
+  WORKFLOW_HUMAN_ESCALATION_ERROR,
   type WorkflowSnapshot,
 } from '../workers/workflowProfiles.js';
 
@@ -386,6 +387,9 @@ export function buildDelegateTools(
         if (!runners.includes(runner))
           return { ok: false, text: `runner=${runner} 未在该联系人的可用配置中（${runners.join('/')}）` };
         const runnerSource: RunnerSource = overrideReason ? 'override' : 'policy';
+        if (runnerSource !== 'override' && store.workflowProfiles.isEscalatedToHuman(workflow)) {
+          return { ok: false, text: WORKFLOW_HUMAN_ESCALATION_ERROR };
+        }
         const workspace = typeof input.workspace === 'string' ? input.workspace.trim() : '';
         if (!workspace || !workspaceAllowed(workspace, workspaces))
           return { ok: false, text: `workspace 不在白名单内。可用：${workspaces.join('、')}` };

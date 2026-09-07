@@ -1518,7 +1518,7 @@ test('crash between remote dispatch and local settle replays into exactly one vi
   }
 });
 
-test('daily path uses real context, a guaranteed slot, and a companion-specific prompt', async () => {
+test('daily path uses real context, a marked date event, and a companion-specific prompt', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-triage-daily-e2e-'));
   const dispatched = [];
   const today = shanghaiClock().date;
@@ -1643,8 +1643,8 @@ test('daily path uses real context, a guaranteed slot, and a companion-specific 
     proactive: {
       enabled: true,
       dailyDispatchLimit: 10,
-      minDailyDispatches: 1,
-      forceAfterHour: 0,
+      minDailyDispatches: 0,
+      forceAfterHour: 23,
       minimumGapMinutes: 180,
       silentStartHour: 0,
       silentEndHour: 0,

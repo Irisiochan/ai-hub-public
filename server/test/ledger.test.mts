@@ -194,6 +194,61 @@ try {
   assert.equal(forced.stats.txnCount > 0, true);
 
   await summaries.tick(Date.parse('2026-09-02T04:00:00+08:00'));
+
+  // —— 跨批次一对一匹配：已被消费的银行流水不能再吃掉后续批次的新消费 ——
+  const ALIPAY_BATCH2 = `支付宝（中国）网络技术有限公司
+账号:[User@example.com]
+----------------------------------------------
+交易时间,交易分类,交易对方,对方账号,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号,商家订单号,备注
+2026-08-03 13:00:00,餐饮美食,美团,,"午餐二号",支出,28.00,招商银行信用卡,交易成功,ali-meituan-2,m9,
+`;
+  const alipay2 = parseLedgerFile(Buffer.from(ALIPAY_BATCH2), 'alipay');
+  importLedgerRows(db, {
+    source: alipay2.source,
+    originalName: 'alipay-batch2.csv',
+    fileSha256: sha256Hex(Buffer.from(ALIPAY_BATCH2)),
+    rows: alipay2.rows,
+  });
+  const meituan2 = listTransactions(db, { month: '2026-08' }).find(
+    (row) => row.sourceTxnId === 'ali-meituan-2',
+  );
+  assert.ok(meituan2);
+  assert.equal(meituan2.duplicateOf, null, '银行侧 28 元已被首批消费，第二笔必须保持独立');
+  assert.equal(monthStats(db, '2026-08').expenseCents, 43_00 + 28_00);
+
+  // —— 重导带退款状态的同一订单：按交易 ID 更新状态并反映进统计 ——
+  const WECHAT_NOODLE = `微信支付账单明细
+微信昵称：[User]
+起始时间：[2026-08-01 00:00:00] 终止时间：[2026-08-31 23:59:59]
+交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号,商户单号,备注
+2026-08-12 10:00:00,商户消费,面馆,面,支出,¥28.00,零钱,支付成功,wx-noodle,m,
+`;
+  const noodlePaid = parseLedgerFile(Buffer.from(WECHAT_NOODLE), 'wechat');
+  importLedgerRows(db, {
+    source: noodlePaid.source,
+    originalName: 'wechat-noodle.csv',
+    fileSha256: sha256Hex(Buffer.from(WECHAT_NOODLE)),
+    rows: noodlePaid.rows,
+  });
+  assert.equal(monthStats(db, '2026-08').expenseCents, 71_00 + 28_00);
+
+  const WECHAT_NOODLE_REFUND = WECHAT_NOODLE.replace('支付成功,wx-noodle', '已全额退款,wx-noodle');
+  const noodleRefund = parseLedgerFile(Buffer.from(WECHAT_NOODLE_REFUND), 'wechat');
+  const refundImport = importLedgerRows(db, {
+    source: noodleRefund.source,
+    originalName: 'wechat-noodle-refund.csv',
+    fileSha256: sha256Hex(Buffer.from(WECHAT_NOODLE_REFUND)),
+    rows: noodleRefund.rows,
+  });
+  assert.equal(refundImport.duplicateCount, 1);
+  const noodleTxn = listTransactions(db, { month: '2026-08' }).find(
+    (row) => row.sourceTxnId === 'wx-noodle',
+  );
+  assert.ok(noodleTxn);
+  assert.equal(noodleTxn.kind, 'ignored', '全额退款后同一订单要更新为不计支出');
+  assert.equal(noodleTxn.statusText, '已全额退款');
+  assert.equal(monthStats(db, '2026-08').expenseCents, 71_00);
+
   console.log('ledger tests ok');
 } finally {
   db.close();

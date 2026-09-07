@@ -78,6 +78,9 @@ jobs:
           npm run build
           npm run dist --prefix desktop
 
+      - name: Smoke-test packaged gateway
+        run: npm run smoke:packaged --prefix desktop
+
       - name: Upload desktop installers
         uses: actions/upload-artifact@v7
         with:

@@ -70,12 +70,13 @@ try {
   const cart = taobaoToolNames('cart');
   const full = taobaoToolNames('full');
   assert.equal(browse.length, 13);
-  assert.equal(cart.length, 14);
-  assert.equal(full.length, 22);
+  assert.equal(cart.length, 13);
+  assert.equal(full.length, 21);
   for (const blocked of ['taobao_add_to_cart', 'taobao_input_text', 'taobao_open_chat', 'taobao_send_chat_message', 'taobao_submit_product_rating']) {
     assert.equal(browse.includes(blocked), false, `browse mode never offers ${blocked}`);
   }
-  assert.ok(cart.includes('taobao_add_to_cart'));
+  assert.equal(cart.includes('taobao_add_to_cart'), false);
+  assert.equal(full.includes('taobao_add_to_cart'), false);
   assert.equal(cart.includes('taobao_open_chat'), false, 'cart mode still cannot message merchants');
   const addToCartEntry = TAOBAO_TOOL_CATALOG.find((entry) => entry.name === 'add_to_cart');
   assert.match(addToCartEntry!.description, /必须开口告诉她加了什么/);
@@ -120,16 +121,16 @@ try {
   assert.match(browsePrompt, /camera_snap/, 'camera stays available alongside Taobao');
   assert.equal(browsePrompt.includes('必须开口'), false, 'browse may stay silent after looking');
   const cartPrompt = heartbeatPrompt(3, 5, { taobaoMode: 'cart' });
-  assert.match(cartPrompt, /可以加购物车，但不下单/);
-  assert.match(cartPrompt, /一旦加了购物车，必须开口告诉她加了什么/);
+  assert.match(cartPrompt, /可以收藏商品，不加购物车、不下单/);
+  assert.match(cartPrompt, /一旦收藏了商品，必须开口告诉她收藏了什么/);
   assert.match(cartPrompt, /不能只回 HEARTBEAT_OK/);
   const fullPrompt = heartbeatPrompt(3, 5, { taobaoMode: 'full' });
   assert.match(fullPrompt, /付款永远由她本人完成/);
-  assert.match(fullPrompt, /一旦加了购物车或给商家发了消息，必须开口告诉她/);
-  assert.match(taobaoGuidance('cart'), /加了购物车必须开口告诉她加了什么/);
+  assert.match(fullPrompt, /一旦收藏了商品或给商家发了消息，必须开口告诉她/);
+  assert.match(taobaoGuidance('cart'), /收藏后必须开口告诉她收藏了什么/);
   assert.match(taobaoGuidance('browse'), /只看不动手/);
   assert.equal(taobaoGuidance('browse').includes('必须开口'), false);
-  assert.match(HEARTBEAT_GUIDANCE, /一旦调用了 taobao_add_to_cart，必须开口告诉她加了什么/);
+  assert.match(HEARTBEAT_GUIDANCE, /一旦收藏了商品，必须开口告诉她收藏了什么/);
 
   // ── bridge broker ──
   assert.equal(taobao.takePending({ taobao: true }), null);
@@ -207,9 +208,29 @@ try {
   assert.equal(out.text, JSON.stringify({ url: 'https://taobao.com', title: '首页' }));
 
   const fullTools = buildTaobaoTools(taobao, heartbeat, db, 'claude', 'full');
-  const addToCart = fullTools.find((t) => t.name === 'taobao_add_to_cart')!;
-  out = await addToCart.exec({ itemId: '1' });
-  assert.match(out.text, /taobao_add_to_cart 在 browse 模式下不可用/, 'the stored contact policy wins over the mode the tool was built with');
+  assert.equal((await click.exec({ text: '收藏' })).ok, false, 'browse remains read-only');
+  heartbeat.startSession('defaults', 30);
+  const favoriteClick = buildTaobaoTools(taobao, heartbeat, db, 'defaults', 'cart')
+    .find(t => t.name === 'taobao_click_element')!;
+  for (const input of [
+    { text: '加入购物车' }, { text: '取消收藏' }, { text: '已收藏' },
+    { text: '收藏并购买' }, { text: '收藏', index: 7 }, { text: '付款' },
+  ]) {
+    assert.equal((await favoriteClick.exec(input)).ok, false);
+    assert.equal(taobao.pendingCount(), 0, 'blocked clicks never reach the PC');
+  }
+  const favoritePromise = favoriteClick.exec({ text: '收藏' });
+  await flush();
+  const favoriteRequest = taobao.takePending({ taobao: true });
+  assert.equal(favoriteRequest?.name, 'click_element');
+  assert.deepEqual(favoriteRequest?.arguments, { text: '收藏', sourceApp: 'ai-hub' });
+  taobao.fulfill(favoriteRequest!.id, { content: wrapped({ text: '已收藏' }) });
+  assert.equal((await favoritePromise).ok, true);
+  heartbeat.stopSession('defaults', 'manual');
+  assert.equal((await favoriteClick.exec({ text: '收藏' })).ok, false, 'favorites still require an active heartbeat');
+  const sendChat = fullTools.find((t) => t.name === 'taobao_send_chat_message')!;
+  out = await sendChat.exec({ message: 'test' });
+  assert.match(out.text, /taobao_send_chat_message 在 browse 模式下不可用/, 'the stored contact policy wins over the mode the tool was built with');
   heartbeat.stopSession('claude', 'manual');
 
   // ── HTTP round trip: hub-mcp → claim → worker result ──
@@ -233,7 +254,7 @@ try {
   assert.deepEqual((await codex.listTools()).tools.map((t) => t.name), ['camera_snap'], 'taobao.enabled=false lists camera only');
   await codex.close();
   const aye = await mcpFor('aye');
-  assert.equal((await aye.listTools()).tools.length, 1 + 22, 'full mode lists every Taobao tool');
+  assert.equal((await aye.listTools()).tools.length, 1 + 21, 'full mode excludes add-to-cart');
   await aye.close();
 
   const claude = await mcpFor('claude');
@@ -293,12 +314,13 @@ try {
 
   const guarded = await claude.callTool({ name: 'taobao_click_element', arguments: { text: '加入购物车' } });
   assert.equal(guarded.isError, true);
-  assert.match((guarded.content as Array<{ text: string }>)[0].text, /browse 模式下不点/);
+  assert.match((guarded.content as Array<{ text: string }>)[0].text, /心跳已改为收藏商品/);
   heartbeat.stopSession('claude', 'manual');
   await claude.close();
 
   console.log('taobao bridge smoke: ok');
 } finally {
+  server?.closeAllConnections();
   if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
   heartbeat.stop();
   db.close();

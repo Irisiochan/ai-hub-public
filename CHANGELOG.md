@@ -2,7 +2,30 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-07
+
+- Ship the desktop shell's gateway runtime dependencies (`fflate`, `pino`,
+  `@ai-hub/contact-config`) and stage `server/migrations` into the packaged app; a
+  packaged local-mode gateway previously crashed on boot with `ERR_MODULE_NOT_FOUND`.
+- Add a post-package startup check (`npm run smoke:packaged --prefix desktop`) that boots the
+  win-unpacked gateway via `ELECTRON_RUN_AS_NODE` and requires `/api/health` to answer; CI now
+  runs it after building the installers instead of only proving the installer can be generated.
+- Keep ledger cross-source dedup one-to-one across import batches: bank rows already consumed
+  by an earlier batch can no longer absorb a second same-amount purchase and undercount spending.
+- Refresh a ledger transaction's kind/status/amount when the same transaction ID is re-imported
+  with a changed status (e.g. a full refund), instead of silently skipping it as a duplicate.
+- Route triage escalates three-strike quality failures to the user instead of silently falling
+  back to another model, and the companion heartbeat's shopping bridge favorites products
+  instead of adding them to the cart.
+
+This public release is a curated, sanitized snapshot based on private source revision
+`80ed2360ad84cdec45a1205b99d14a431bee76d2`; private contacts, personas, real evaluation data,
+databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
+
 ## 0.3.0 - 2026-09-06
+
+> **Note:** the `v0.3.0` tag does not compile (its public seed lags a gateway import,
+> fixed on `main` right after tagging). Use `v0.3.1` instead.
 
 - Add a companion heartbeat: periodic autonomous ticks for both CLI and API contacts with
   randomized intervals, model-decided speech, an unlimited manual mode, and runtime-drawer

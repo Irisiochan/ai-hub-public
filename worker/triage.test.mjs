@@ -1105,6 +1105,12 @@ test('daily mode is source-owned and proactive safety config fails closed', () =
 
   const beforeFloor = Date.parse('2026-07-26T09:59:00Z'); // 17:59 Shanghai
   const afterFloor = Date.parse('2026-07-26T10:01:00Z'); // 18:01 Shanghai
+  const defaults = normalizeProactiveConfig({});
+  assert.equal(defaults.minDailyDispatches, 0);
+  assert.equal(
+    dailyPolicyState(defaults, { count: 0, lastAt: null }, afterFloor).forceActionable,
+    false,
+  );
   const proactive = normalizeProactiveConfig({
     dailyDispatchLimit: 10,
     minDailyDispatches: 1,

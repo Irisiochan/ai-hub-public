@@ -154,7 +154,7 @@ WORKFLOW_PRELOADED（静态，无时间无联系人名，保护 prompt-cache 前
 
 - PC Worker（`worker/worker.mjs`，Windows 由 `worker-launcher.ps1` 托管）**只出站**：`/worker/connect` 注册 → `/worker/claim?wait=` 长轮询领 job → `/start` `/events` `/heartbeat` `/complete` `/recover` 回传。领到的还包括摄像头 `snapRequest` 与淘宝 `taobaoRequest`：网关侧 `CameraSnapBroker` / `TaobaoBridge` 只是把请求停放在内存，没人领就超时失败，不落库。
 - job 权限位 `permissions`（write/shell/ssh）由联系人 `delegation` 配置与 job 选项共同决定；**`ssh: true` 不注入任何凭据**，只是允许去试。
-- Workflow profiles（[workflow-profiles.md](workflow-profiles.md)）只改角色→runner/model 映射，不改权限、审批闸门与任务状态机；三振 fallback 按 `(profile, taskPath, stage, fingerprint, runner)` 键计。
+- Workflow profiles（[workflow-profiles.md](workflow-profiles.md)）只改角色→runner/model 映射，不改权限、审批闸门与任务状态机；三振后转人工（不再换兜底模型），按 `(profile, taskPath, stage, fingerprint, runner)` 键计。
 - 工具输入唯一声明在各工具的 `inputSchema`（zod）；`agents/gatewayTool.ts` 从它生成 API JSON Schema 并统一验证，`routes/hubMcp.ts` 直接复用同一对象，不维护第二张参数表。未知字段与违约参数两种入口都拒绝后再执行，联系人权限、心跳及范围校验仍在领域实现中。
 - `/api/hub-mcp/:contactId` 暴露给 CLI 联系人的网关工具：`delegate_to_worker`、`worker_job_status/update_delivery/cancel`、`camera_snap`（返回 image content block，不落盘）、淘宝一组 `search_products/add_to_cart/…`（按联系人 `taobao.mode` 裁剪）。claude 通过 `--allowedTools mcp__hub__*` 白名单接入，grok 通过 `~/.grok/config.toml` 的 `[mcp_servers.hub]`（header 要写展开后的真实 bearer）。
 

@@ -509,9 +509,11 @@ export default function WorkerPanel({ onClose }: Props) {
                           {selected.options.workflow.selected.model}/{selected.options.workflow.selected.reasoning}
                         </span>
                         {selected.options.runnerSource === 'override' && (
-                          <em>手动 override，不计入 Profile fallback 统计</em>
+                          <em>手动 override，不计入 Profile 三振统计</em>
                         )}
-                        {selected.options.workflow.fallbackActive && <em>已触发兜底</em>}
+                        {(selected.options.workflow.escalateToHuman || selected.options.workflow.fallbackActive) && (
+                          <em>已转人工</em>
+                        )}
                       </div>
                       <code title={selected.options.workflow.workflowFingerprint}>
                         v3 {selected.options.workflow.workflowFingerprint.slice(0, 12)}

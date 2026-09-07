@@ -55,7 +55,7 @@
   "proactive": {
     "enabled": true,
     "dailyDispatchLimit": 10,
-    "minDailyDispatches": 1,
+    "minDailyDispatches": 0,
     "forceAfterHour": 18,
     "minimumGapMinutes": 180,
     "silentStartHour": 0,

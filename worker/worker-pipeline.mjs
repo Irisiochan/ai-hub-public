@@ -315,7 +315,7 @@ export const pipelineMethods = {
       }
 
       // Presence damping (on top of silent hours / minimumGap): if User herself
-      // spoke recently, skip pure proactive assessment, including the guaranteed
+      // spoke recently, skip pure proactive assessment, including an opted-in
       // forceAfterHour slot. Date-events, safety events, and followups still go
       // through. Presence probe errors remain fail-open to dispatch.
       if (

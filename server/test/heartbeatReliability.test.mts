@@ -56,7 +56,7 @@ try {
   await due(); assert.equal(calls, before + 2, 'paused session does not retry');
   heartbeat.stopSession('gem', 'manual');
   heartbeat.startSession('gem', null);
-  tools = ['taobao_add_to_cart'];
+  tools = ['taobao_click_element'];
   await due();
   assert.match(heartbeat.status('gem').pausedReason!, /操作结果/);
   assert.equal(heartbeatReceipt('HEARTBEAT_OK', tools).includes('结果需要核对'), true);

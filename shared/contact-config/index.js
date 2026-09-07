@@ -34,7 +34,7 @@ export const DelegationConfigSchema = z.object({
 }).passthrough().default({});
 
 // Taobao desktop-client bridge inside the heartbeat window. `mode` is the
-// gateway-side policy: browse = look only, cart = browse + add_to_cart,
+// gateway-side policy: browse = look only, cart = browse + favorite clicks (legacy config name),
 // full = everything. Default is cart. The PC Worker's own `allowTaobao`
 // gate must also be open for any of it to work.
 export const HeartbeatTaobaoConfigSchema = z.object({

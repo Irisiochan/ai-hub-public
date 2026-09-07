@@ -4,12 +4,12 @@ AI Hub keeps safety and delivery rules in one immutable workflow core. A workflo
 
 ## Built-in profiles
 
-| Stage | Profile A | Profile B | Profile B fallback |
-| --- | --- | --- | --- |
-| Plan | Claude Fable / high | Codex gpt-5.6-sol / ultra | — |
-| Review | Claude Fable / high | Codex gpt-5.6-sol / high | Claude Opus 4.7 / high |
-| Execute, Fix | Codex gpt-5.6-sol / high | Grok 4.6 / high | Codex gpt-5.6-sol / medium |
-| Maintenance, Patrol | Grok 4.6 / high | Grok 4.6 / high | — |
+| Stage | Profile A | Profile B |
+| --- | --- | --- |
+| Plan | Claude Fable / high | Codex gpt-6-astra / high |
+| Review | Grok 4.6 / high | Codex gpt-6-astra / high |
+| Execute, Fix | Codex gpt-6-astra / medium | Grok 4.6 / high |
+| Maintenance, Patrol | Grok 4.6 / high | Grok 4.6 / high |
 
 DeepSeek bulk/coding harness is deliberately marked `planned`. The existing triage DeepSeek API client is not exposed as a coding runner.
 
@@ -24,7 +24,7 @@ DeepSeek bulk/coding harness is deliberately marked `planned`. The existing tria
 
 The migration activates Profile A so rollout preserves the declared current protocol. Profile B remains available for an explicit switch.
 
-## Three-strike fallback
+## Three-strike human escalation
 
 Quality is explicit and structured:
 
@@ -32,6 +32,6 @@ Quality is explicit and structured:
 - `inadequate`: increment the semantic-quality streak.
 - `infrastructure`: record the event but do not increment or reset the streak.
 
-The streak key includes profile id/version, task path, stage, problem fingerprint, and primary runner/model. Each job may contribute only one quality result. On the third `inadequate` result, the fallback is pinned for subsequent jobs with that key until a success or a changed problem fingerprint resets routing.
+The streak key includes profile id/version, task path, stage, problem fingerprint, and primary runner/model. Each job may contribute only one quality result. Profile B Review / Execute / Fix escalate after three `inadequate` results: subsequent policy jobs for that key are blocked and the triggering job is marked `user_decision` for User. A manual runner override can continue; a success or a changed problem fingerprint clears the gate. There is no automatic fallback model.
 
 Review `REJECT` is not interpreted as reviewer failure. A correct review may reject weak code; the orchestrator or User must explicitly record `inadequate` when the review itself missed the problem or did not converge.

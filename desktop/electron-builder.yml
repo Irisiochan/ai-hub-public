@@ -9,6 +9,7 @@ files:
   - main.cjs
   - server-dist/**/*
   - web-dist/**/*
+  - migrations/**/*
 # server-dist keeps the gateway's ../../../shared imports; in packaged apps
 # those resolve next to resources/app, while dev uses the repository's shared/.
 extraResources:

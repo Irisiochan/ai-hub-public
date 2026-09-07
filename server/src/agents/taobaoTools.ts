@@ -12,7 +12,7 @@ import { defineGatewayTool, type GatewayTool } from './gatewayTool.js';
  * `sourceApp` argument is injected by the gateway and hidden from the model.
  * Which subset a contact sees is a per-contact policy (`heartbeat.taobao.mode`, default cart):
  *   browse — look, search, scroll, open pages; nothing that changes her account
- *   cart   — browse + add_to_cart
+ *   cart   — browse + favorite clicks (legacy config name)
  *   full   — every tool, including Wangwang messages, ratings and raw key events
  */
 
@@ -26,6 +26,7 @@ interface CatalogProperty {
   type: 'string' | 'number' | 'boolean' | 'array';
   description: string;
   enum?: string[];
+  items?: ZodTypeAny;
 }
 
 export interface TaobaoCatalogEntry {
@@ -41,7 +42,7 @@ const str = (description: string, enumValues?: string[]): CatalogProperty =>
   ({ type: 'string', description, ...(enumValues ? { enum: enumValues } : {}) });
 const num = (description: string): CatalogProperty => ({ type: 'number', description });
 const bool = (description: string): CatalogProperty => ({ type: 'boolean', description });
-const arr = (description: string): CatalogProperty => ({ type: 'array', description });
+const arr = (description: string, items: ZodTypeAny): CatalogProperty => ({ type: 'array', description, items });
 
 export const TAOBAO_TOOL_CATALOG: TaobaoCatalogEntry[] = [
   {
@@ -151,7 +152,7 @@ export const TAOBAO_TOOL_CATALOG: TaobaoCatalogEntry[] = [
     description: '加入购物车（自动处理 SKU 与弹窗）。sku 必须与页面维度数量一致；传空数组可拿到 availableSkus。needsSkuSelection=true 时要告诉她让她自己选，不能替她换规格。加购成功后必须开口告诉她加了什么、为什么，不能只回 HEARTBEAT_OK。',
     properties: {
       itemId: str('商品 ID（可选，提供则先导航到该商品）'),
-      sku: arr('SKU 属性值数组，如 ["黑色", "XL"]'),
+      sku: arr('SKU 属性值数组，如 ["黑色", "XL"]', z.string()),
     },
     minMode: 'cart',
   },
@@ -201,13 +202,13 @@ export const TAOBAO_TOOL_CATALOG: TaobaoCatalogEntry[] = [
     description: '填写并提交商品评价（评价页唯一方式）。首次评价需三项评分；多商品必须用 qualityContents 且每条不同。',
     properties: {
       qualityContent: str('单商品评价内容'),
-      qualityContents: arr('多商品评价内容数组，长度等于商品数且各不相同'),
+      qualityContents: arr('多商品评价内容数组，长度等于商品数且各不相同', z.string()),
       merDsr: num('描述相符 1-5'),
       serviceQualityScore: num('卖家服务 1-5'),
       saleConsignmentScore: num('物流服务 1-5'),
       isAppend: bool('是否追加评价'),
       serviceContent: str('服务评价内容'),
-      imageUrls: arr('图片路径数组，最多 5 张'),
+      imageUrls: arr('图片路径数组，最多 5 张', z.string()),
       anonymous: bool('是否匿名，默认 true'),
       submit: bool('是否自动点击提交，默认 true'),
     },
@@ -233,7 +234,16 @@ export const TAOBAO_TOOL_CATALOG: TaobaoCatalogEntry[] = [
     name: 'trigger_key_sequence',
     description: '连续触发按键序列或逐字输入文本。',
     properties: {
-      sequence: arr('按键事件数组'),
+      sequence: arr('按键事件数组', z.object({
+        key: z.string().optional(),
+        keyCode: z.number().optional(),
+        eventType: z.enum(['keydown', 'keyup', 'keypress']).optional(),
+        ctrlKey: z.boolean().optional(),
+        altKey: z.boolean().optional(),
+        shiftKey: z.boolean().optional(),
+        metaKey: z.boolean().optional(),
+        delay: z.number().optional(),
+      }).passthrough()),
       text: str('逐字输入的文本'),
       target: str('目标元素 CSS 选择器'),
       interval: num('按键间隔毫秒，默认 50'),
@@ -269,7 +279,8 @@ export function normalizeTaobaoMode(value: unknown): TaobaoMode {
 }
 
 export function taobaoCatalogForMode(mode: TaobaoMode): TaobaoCatalogEntry[] {
-  return TAOBAO_TOOL_CATALOG.filter((entry) => MODE_RANK[entry.minMode] <= MODE_RANK[mode]);
+  // Keep the native catalog for schema compatibility, but never offer broken add-to-cart in heartbeats.
+  return TAOBAO_TOOL_CATALOG.filter((entry) => entry.name !== 'add_to_cart' && MODE_RANK[entry.minMode] <= MODE_RANK[mode]);
 }
 
 export function taobaoToolNames(mode: TaobaoMode): string[] {
@@ -288,7 +299,10 @@ function zodFor(property: CatalogProperty): ZodTypeAny {
   if (property.enum) schema = z.enum(property.enum as [string, ...string[]]);
   else if (property.type === 'number') schema = z.number();
   else if (property.type === 'boolean') schema = z.boolean();
-  else if (property.type === 'array') schema = z.array(z.any());
+  else if (property.type === 'array') {
+    if (!property.items) throw new Error('Taobao array properties require a typed item schema');
+    schema = z.array(property.items);
+  }
   else schema = z.string();
   return schema.describe(property.description);
 }
@@ -312,11 +326,12 @@ export function taobaoGuidance(mode: TaobaoMode): string {
   const policy = mode === 'browse'
     ? '当前是 browse 模式：只看不动手——不加购、不下单、不给商家发消息、不改她的购物车和订单，网关也会拦这些动作。'
     : mode === 'cart'
-      ? '当前是 cart 模式：可以搜索浏览和加购物车，但不下单、不付款、不给商家发消息。只逛可以沉默；加了购物车必须开口告诉她加了什么、为什么，不能只回 HEARTBEAT_OK。'
-      : '当前是 full 模式：可以加购、联系商家和评价，但付款永远由 User 本人完成，涉及花钱或对外发消息前先跟她确认。只逛可以沉默；加了购物车或给商家发了消息必须开口告诉她，不能只回 HEARTBEAT_OK。';
+      ? '当前是 cart 模式：可以搜索浏览和收藏商品，不加购物车、不下单、不付款、不给商家发消息。只逛可以沉默；收藏后必须开口告诉她收藏了什么、为什么，不能只回 HEARTBEAT_OK。'
+      : '当前是 full 模式：可以收藏商品、联系商家和评价，不加购物车，但付款永远由 User 本人完成，涉及花钱或对外发消息前先跟她确认。只逛可以沉默；收藏了商品或给商家发了消息必须开口告诉她，不能只回 HEARTBEAT_OK。';
   return [
     '淘宝：心跳窗口内可用 taobao_* 工具逛 User 登录着的淘宝桌面客户端，同样只在心跳激活且 PC Worker 在线时可用。',
     policy,
+    ...(mode !== 'browse' ? ['收藏路径：先读取商品页并用 taobao_scan_page_elements 确认收藏按钮；未收藏时用 taobao_click_element 的 text（收藏/收藏宝贝/收藏商品/加入收藏）点击，不传 index。已经收藏就跳过，不能取消收藏；点击后读取页面确认状态，确认不了就如实说明，不能声称成功或反复点击。不要调用加购工具或点击加购按钮。'] : []),
     '典型路径：taobao_search_products → taobao_navigate_to_url 进商品页 → taobao_read_page_content；逛完调 taobao_close_page。',
     '淘宝里看到的东西可以拿来聊，但不要把她的地址、订单号、聊天记录等隐私复述进持久记忆。取不到结果就作罢，不要用别的工具或命令绕过。',
   ].join(' ');
@@ -396,9 +411,11 @@ export function buildTaobaoTools(
       if (!heartbeat.isActive(contactId)) {
         return failure('心跳窗口未激活，淘宝不可用。让 User 在运行时面板开启心跳后再试。');
       }
-      if (currentMode !== 'full' && entry.name === 'click_element') {
+      if (entry.name === 'click_element') {
         const text = typeof input.text === 'string' ? input.text : '';
-        if (GUARDED_CLICK_TEXT.test(text)) {
+        if (/加入购物车|加购物车|加购/.test(text)) return failure('心跳已改为收藏商品，不再加购物车。');
+        const favorite = currentMode === 'cart' && input.index === undefined && /^(收藏|收藏宝贝|收藏商品|加入收藏)$/.test(text);
+        if (currentMode !== 'full' && GUARDED_CLICK_TEXT.test(text) && !favorite) {
           return failure(`${currentMode} 模式下不点「${text}」这类会改动她账户的按钮。`);
         }
       }

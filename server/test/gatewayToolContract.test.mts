@@ -8,6 +8,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { buildCameraTool } from '../src/agents/cameraTool.js';
 import { buildDelegateTools } from '../src/agents/gatewayTools.js';
 import { buildTaobaoTools } from '../src/agents/taobaoTools.js';
+import { sanitizeGeminiSchema } from '../src/agents/directApi/gemini.js';
 import type { CompanionHeartbeat } from '../src/agents/companionHeartbeat.js';
 import { openDb } from '../src/db.js';
 import { hubMcpRouter } from '../src/routes/hubMcp.js';
@@ -66,14 +67,27 @@ try {
     new URL(`http://127.0.0.1:${address.port}/api/hub-mcp/codex`),
   ));
   const listed = (await client.listTools()).tools;
-  assert.equal(listed.length, 27, 'all four job tools, camera, and 22 Taobao tools are registered');
+  assert.equal(listed.length, 26, 'all four job tools, camera, and 21 Taobao tools are registered');
   for (const tool of tools) {
     const mcp = listed.find((entry) => entry.name === tool.name)!;
     assert.ok(mcp, `${tool.name} is available to CLI contacts`);
     assert.equal(mcp.description, tool.description);
     assert.deepEqual(mcp.inputSchema, tool.schema, `${tool.name}: API and MCP declarations match exactly`);
     assert.equal(tool.schema.additionalProperties, false, `${tool.name}: undeclared fields are rejected`);
+    // Gemini rejects the entire request, even for an unused tool, if array items lack a type.
+    const checkArrays = (schema: Record<string, any>, location: string) => {
+      if (schema.type === 'array') {
+        assert.ok(schema.items?.type, `${location}: Gemini needs typed array items`);
+        checkArrays(schema.items, `${location}.items`);
+      }
+      for (const [key, value] of Object.entries(schema.properties ?? {})) {
+        checkArrays(value as Record<string, any>, `${location}.${key}`);
+      }
+    };
+    checkArrays(sanitizeGeminiSchema(tool.schema), tool.name);
   }
+  assert.equal(listed.some(t => t.name === 'taobao_add_to_cart'), false);
+  assert.equal((await client.callTool({ name: 'taobao_add_to_cart', arguments: {} })).isError, true);
   const delegateSchema = tools[0].schema;
   assert.deepEqual(delegateSchema.required, ['route_class', 'workspace', 'prompt']);
   const properties = delegateSchema.properties as Record<string, Record<string, unknown>>;
@@ -97,6 +111,9 @@ try {
     ['taobao_navigate', { page: null }],
     ['taobao_scroll_page', { direction: 'sideways' }],
     ['taobao_get_current_tab', { sourceApp: 'spoofed' }],
+    ['taobao_submit_product_rating', { qualityContents: [{}] }],
+    ['taobao_submit_product_rating', { imageUrls: [null] }],
+    ['taobao_trigger_key_sequence', { sequence: ['Enter'] }],
     ...[-1, 0.5, '0'].map((result_offset): [string, Record<string, unknown>] =>
       ['worker_job_status', { job_id: 'missing', result_offset }]),
     ...[0, 12001, 1.5, '4000'].map((result_limit): [string, Record<string, unknown>] =>
@@ -127,6 +144,17 @@ try {
     name: 'navigate', args: { page: 'home', sourceApp: 'ai-hub' },
   })));
 
+  for (const [name, args] of [
+    ['taobao_submit_product_rating', { qualityContents: ['评价'], imageUrls: ['photo.jpg'] }],
+    ['taobao_trigger_key_sequence', { sequence: [{ key: 'a', ctrlKey: true }, { key: 'Delete' }] }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    assert.equal((await direct(name, args)).ok, true);
+    assert.equal((await client.callTool({ name, arguments: args })).isError, false);
+    assert.deepEqual(taobaoCalls.slice(-2), Array.from({ length: 2 }, () => ({
+      name: name.replace(/^taobao_/, ''), args: { ...args, sourceApp: 'ai-hub' },
+    })));
+  }
+
   // Schema validation does not replace authorization or heartbeat gates.
   for (const args of [
     { ...baseDispatch, workspace: 'C:/outside' },
@@ -149,7 +177,7 @@ try {
     assert.equal(mcp.isError, true);
   }
   assert.equal(cameraCalls, 2);
-  assert.equal(taobaoCalls.length, 2);
+  assert.equal(taobaoCalls.length, 6);
   console.log('gateway tool API/MCP contract tests: ok');
 } finally {
   await client.close();

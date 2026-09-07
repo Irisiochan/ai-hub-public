@@ -358,10 +358,12 @@ the task/backlog gate:
   Shanghai-calendar-day dispatches in delivery pool `daily`. Task per-recipient
   `dailyLimit` / cooldown only count pool `task`, so companion outreach does not
   burn work quotas.
-- **Natural minimum cadence**: `minDailyDispatches` defaults to 1. If no daily
-  message has been delivered by `forceAfterHour` (default 18:00 Shanghai), the
-  next wake must choose one low-pressure message. `minimumGapMinutes` defaults
-  to 180 so later checks cannot spam.
+- **No daily minimum**: L1 may `NO_OP` every wake. `minDailyDispatches` defaults
+  to 0, so an empty day is allowed. Marked date-events, fresh safety events, and
+  unfinished followups still force a message. Setting `minDailyDispatches` > 0
+  with `forceAfterHour` (default 18:00 Shanghai) restores a guaranteed slot; that
+  fallback is off unless a deployment opts in. `minimumGapMinutes` defaults to
+  180 so later checks cannot spam.
 - **Real context**: L1 receives a compact current task snapshot, the three most recent
   contact interaction timestamps, and the last daily delivery timestamp. Daily delivery
   mode is trusted from the event source only; a normal task cannot enter the
@@ -373,7 +375,7 @@ the task/backlog gate:
   "proactive": {
     "enabled": true,
     "dailyDispatchLimit": 10,
-    "minDailyDispatches": 1,
+    "minDailyDispatches": 0,
     "forceAfterHour": 18,
     "minimumGapMinutes": 180,
     "silentStartHour": 0,

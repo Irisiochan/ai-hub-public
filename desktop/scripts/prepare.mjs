@@ -14,6 +14,9 @@ const repoRoot = path.resolve(desktopRoot, '..');
 const stages = [
   { from: path.join(repoRoot, 'server', 'dist'), to: path.join(desktopRoot, 'server-dist'), hint: 'npm run build --prefix server' },
   { from: path.join(repoRoot, 'web', 'dist'), to: path.join(desktopRoot, 'web-dist'), hint: 'npm run build --prefix web' },
+  // 网关运行时从 server-dist/../migrations 读迁移（migrations.ts 的 DEFAULT_DIR），
+  // 开发态与打包后都要在 app 根旁边放一份。
+  { from: path.join(repoRoot, 'server', 'migrations'), to: path.join(desktopRoot, 'migrations'), hint: 'server/migrations missing' },
 ];
 
 for (const { from, to, hint } of stages) {

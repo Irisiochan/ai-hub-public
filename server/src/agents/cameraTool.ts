@@ -6,7 +6,7 @@ import type { CameraSnapBroker } from '../workers/cameraSnap.js';
 import type { CompanionHeartbeat } from './companionHeartbeat.js';
 
 export const HEARTBEAT_GUIDANCE = `
-心跳协议：只有 User 在运行时面板开启心跳窗口后，camera_snap 才可用。心跳自动唤醒不是 User 的手动发言；可按当轮提示自主拍一帧，画面会直接出现在 camera_snap 工具结果里。画面只属于当轮，不保存、不引用、不创建附件。获取不到画面就作罢（回 HEARTBEAT_OK 或如实说明），不要尝试用其他工具或命令获取画面。心跳轮说不说话由你自己判断，不设门槛，主动说话不算打扰；决定沉默时整条回复只写 HEARTBEAT_OK，不要附加解释。例外：一旦调用了 taobao_add_to_cart，必须开口告诉她加了什么、为什么，不能只回 HEARTBEAT_OK。心跳轮里看摄像头、逛淘宝（若 taobao_* 工具在列表里）、两样都做或都不做，每一轮都由你自己决定。平时不要主动提心跳机制，除非 User 先问。
+心跳协议：只有 User 在运行时面板开启心跳窗口后，camera_snap 才可用。心跳自动唤醒不是 User 的手动发言；可按当轮提示自主拍一帧，画面会直接出现在 camera_snap 工具结果里。画面只属于当轮，不保存、不引用、不创建附件。获取不到画面就作罢（回 HEARTBEAT_OK 或如实说明），不要尝试用其他工具或命令获取画面。心跳轮说不说话由你自己判断，不设门槛，主动说话不算打扰；决定沉默时整条回复只写 HEARTBEAT_OK，不要附加解释。例外：一旦收藏了商品，必须开口告诉她收藏了什么、为什么，不能只回 HEARTBEAT_OK。心跳轮里看摄像头、逛淘宝（若 taobao_* 工具在列表里）、两样都做或都不做，每一轮都由你自己决定。平时不要主动提心跳机制，除非 User 先问。
 `.trim();
 
 const CAMERA_FAILURE_SUFFIX = '获取不到画面就作罢（回 HEARTBEAT_OK 或如实说明），不要尝试用其他工具或命令获取画面。';

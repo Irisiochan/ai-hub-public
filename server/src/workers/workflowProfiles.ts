@@ -15,8 +15,8 @@ export interface WorkflowBinding {
 
 export interface WorkflowRoute {
   primary: WorkflowBinding;
-  fallback?: WorkflowBinding;
-  fallbackAfter?: number;
+  /** 连续 inadequate 次数达到后停止自动换模型，改转人工。 */
+  escalateAfter?: number;
 }
 
 export interface WorkflowProfile {
@@ -38,11 +38,23 @@ export interface WorkflowSnapshot {
   taskPath: string;
   problemFingerprint: string;
   primary: WorkflowBinding;
-  fallback?: WorkflowBinding;
-  fallbackAfter?: number;
+  escalateAfter?: number;
+  escalateToHuman: boolean;
+  /** @deprecated 与 escalateToHuman 同值，兼容旧 job 快照与前端 */
   fallbackActive: boolean;
   selected: WorkflowBinding;
   workflowFingerprint: string;
+}
+
+export const WORKFLOW_HUMAN_ESCALATION_ERROR =
+  '该问题已连续三次质量未收敛，已转人工。需要 User 决定下一步；若要继续，请显式覆盖 runner。';
+
+export function policyBlockedByHumanEscalation(
+  snapshot: Pick<WorkflowSnapshot, 'escalateToHuman' | 'fallbackActive'>,
+  runnerSource?: string,
+): boolean {
+  if (runnerSource === 'override') return false;
+  return snapshot.escalateToHuman === true || snapshot.fallbackActive === true;
 }
 
 export interface WorkflowQualityInput {
@@ -70,23 +82,20 @@ const B: WorkflowProfile = {
   id: 'protocol-b',
   version: 1,
   label: 'B · Codex / Grok 双引擎',
-  description: 'Codex 规划与评审，Grok 执行；连续三次质量未收敛后切换兜底。',
+  description: 'Codex 规划与评审，Grok 执行；连续三次质量未收敛后转人工。',
   routes: {
     plan: { primary: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'high' } },
     review: {
       primary: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'high' },
-      fallback: { runner: 'claude', model: 'claude-opus-4-7', reasoning: 'high' },
-      fallbackAfter: 3,
+      escalateAfter: 3,
     },
     execute: {
       primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' },
-      fallback: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'high' },
-      fallbackAfter: 3,
+      escalateAfter: 3,
     },
     fix: {
       primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' },
-      fallback: { runner: 'codex', model: 'gpt-6-astra', reasoning: 'high' },
-      fallbackAfter: 3,
+      escalateAfter: 3,
     },
     maintenance: { primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' } },
     patrol: { primary: { runner: 'grok', model: 'grok-4.6', reasoning: 'high' } },
@@ -240,27 +249,31 @@ export class WorkflowProfileStore {
     const grok = modelCatalog('grok-cli');
     const codexEfforts: WorkflowEffort[] = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
     for (const [stage, route] of Object.entries(profile.routes) as [WorkflowStage, WorkflowRoute][]) {
-      for (const [kind, binding] of [['primary', route.primary], ['fallback', route.fallback]] as const) {
-        if (!binding) continue;
-        if (!/^[a-zA-Z0-9._-]{1,100}$/.test(binding.model)) {
-          errors.push(`${stage}.${kind} model id is invalid`);
+      const binding = route.primary;
+      if (!/^[a-zA-Z0-9._-]{1,100}$/.test(binding.model)) {
+        errors.push(`${stage}.primary model id is invalid`);
+      }
+      if (binding.runner === 'claude') {
+        if (!claude.models.some((item) => item.id === binding.model)) {
+          errors.push(`${stage}.primary Claude model ${binding.model} is absent from the hot catalog`);
         }
-        if (binding.runner === 'claude') {
-          if (!claude.models.some((item) => item.id === binding.model)) {
-            errors.push(`${stage}.${kind} Claude model ${binding.model} is absent from the hot catalog`);
-          }
-          if (!claude.efforts?.some((item) => item.id === binding.reasoning)) {
-            errors.push(`${stage}.${kind} Claude effort ${binding.reasoning} is unavailable`);
-          }
+        if (!claude.efforts?.some((item) => item.id === binding.reasoning)) {
+          errors.push(`${stage}.primary Claude effort ${binding.reasoning} is unavailable`);
         }
-        if (binding.runner === 'grok' && !grok.models.some((item) => item.id === binding.model)) {
-          errors.push(`${stage}.${kind} Grok model ${binding.model} is absent from the hot catalog`);
-        }
-        if (binding.runner === 'codex' && !codexEfforts.includes(binding.reasoning)) {
-          errors.push(`${stage}.${kind} Codex effort ${binding.reasoning} is unavailable`);
-        }
-        if (binding.reasoning === 'ultra' && binding.runner !== 'codex') {
-          errors.push(`${stage}.${kind} ultra is only supported by Codex`);
+      }
+      if (binding.runner === 'grok' && !grok.models.some((item) => item.id === binding.model)) {
+        errors.push(`${stage}.primary Grok model ${binding.model} is absent from the hot catalog`);
+      }
+      if (binding.runner === 'codex' && !codexEfforts.includes(binding.reasoning)) {
+        errors.push(`${stage}.primary Codex effort ${binding.reasoning} is unavailable`);
+      }
+      if (binding.reasoning === 'ultra' && binding.runner !== 'codex') {
+        errors.push(`${stage}.primary ultra is only supported by Codex`);
+      }
+      if (route.escalateAfter !== undefined) {
+        const after = route.escalateAfter;
+        if (!Number.isInteger(after) || after < 1 || after > 10) {
+          errors.push(`${stage}.escalateAfter must be an integer between 1 and 10`);
         }
       }
     }
@@ -276,8 +289,7 @@ export class WorkflowProfileStore {
     const route = profile.routes[input.stage];
     const taskPath = canonical(input.taskPath ?? '');
     const streak = this.streak(profile, input.stage, taskPath, input.problemFingerprint, route.primary);
-    const fallbackActive = !!route.fallback && streak.fallback_active === 1;
-    const selected = fallbackActive ? route.fallback! : route.primary;
+    const escalateToHuman = !!route.escalateAfter && streak.fallback_active === 1;
     const base: Omit<WorkflowSnapshot, 'workflowFingerprint'> = {
       profileId: profile.id,
       profileVersion: profile.version,
@@ -286,12 +298,29 @@ export class WorkflowProfileStore {
       taskPath,
       problemFingerprint: input.problemFingerprint,
       primary: route.primary,
-      ...(route.fallback ? { fallback: route.fallback } : {}),
-      ...(route.fallbackAfter ? { fallbackAfter: route.fallbackAfter } : {}),
-      fallbackActive,
-      selected,
+      ...(route.escalateAfter ? { escalateAfter: route.escalateAfter } : {}),
+      escalateToHuman,
+      fallbackActive: escalateToHuman,
+      selected: route.primary,
     };
     return { ...base, workflowFingerprint: workflowFingerprint(base) };
+  }
+
+  isEscalatedToHuman(snapshot: Pick<
+    WorkflowSnapshot,
+    'profileId' | 'profileVersion' | 'stage' | 'taskPath' | 'problemFingerprint' | 'primary'
+  > & { escalateToHuman?: boolean; fallbackActive?: boolean }): boolean {
+    const profile = findProfile(snapshot.profileId, snapshot.profileVersion);
+    if (!profile) return snapshot.escalateToHuman === true || snapshot.fallbackActive === true;
+    const route = profile.routes[snapshot.stage];
+    if (!route?.escalateAfter) return false;
+    return this.streak(
+      profile,
+      snapshot.stage,
+      snapshot.taskPath,
+      snapshot.problemFingerprint,
+      snapshot.primary,
+    ).fallback_active === 1;
   }
 
   record(job: JobRow, input: WorkflowQualityInput) {
@@ -336,7 +365,7 @@ export class WorkflowProfileStore {
       if (options.runnerSource === 'override') {
         return {
           counted: false,
-          reason: 'manual runner overrides do not affect profile fallback streaks',
+          reason: 'manual runner overrides do not affect profile quality streaks',
         } as const;
       }
       if (input.quality === 'infrastructure') {
@@ -348,9 +377,9 @@ export class WorkflowProfileStore {
            WHERE profile_id = ? AND profile_version = ? AND task_path = ? AND stage = ?
              AND problem_fingerprint = ? AND primary_runner = ? AND primary_model = ?`
         ).run(...key);
-        return { counted: true, streak: 0, fallbackActive: false } as const;
+        return { counted: true, streak: 0, fallbackActive: false, escalateToHuman: false } as const;
       }
-      const threshold = route.fallback && route.fallbackAfter ? route.fallbackAfter : null;
+      const threshold = route.escalateAfter ?? null;
       this.db.prepare(
         `INSERT INTO workflow_quality_streaks
          (profile_id, profile_version, task_path, stage, problem_fingerprint, primary_runner, primary_model,
@@ -368,10 +397,12 @@ export class WorkflowProfileStore {
         snapshot.problemFingerprint,
         snapshot.primary,
       );
+      const escalateToHuman = updated.fallback_active === 1;
       return {
         counted: true,
         streak: updated.streak,
-        fallbackActive: updated.fallback_active === 1,
+        fallbackActive: escalateToHuman,
+        escalateToHuman,
         threshold,
       } as const;
     })();

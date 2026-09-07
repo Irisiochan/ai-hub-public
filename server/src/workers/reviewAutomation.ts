@@ -158,6 +158,9 @@ export function ensureAutomaticReviewJob(
     taskPath,
     problemFingerprint: fingerprint,
   });
+  if (store.workflowProfiles.isEscalatedToHuman(workflow)) {
+    return { status: 'not-eligible' };
+  }
   const created = store.create({
     requestedBy: 'claude',
     runner: workflow.selected.runner,

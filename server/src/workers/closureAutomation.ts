@@ -180,6 +180,9 @@ function createMergeJob(store: JobStore, review: JobRow): ClosureOutcome {
     taskPath: source.taskPath,
     problemFingerprint: fingerprint,
   });
+  if (store.workflowProfiles.isEscalatedToHuman(workflow)) {
+    return { status: 'rejected', kind: 'merge', reason: 'workflow three-strike escalation requires User' };
+  }
   const created = store.create({
     requestedBy: 'claude',
     runner: workflow.selected.runner,
@@ -258,6 +261,9 @@ function createDeployJob(store: JobStore, merge: JobRow): ClosureOutcome {
     taskPath,
     problemFingerprint: fingerprint,
   });
+  if (store.workflowProfiles.isEscalatedToHuman(workflow)) {
+    return { status: 'rejected', kind: 'deploy', reason: 'workflow three-strike escalation requires User' };
+  }
   const created = store.create({
     requestedBy: 'claude',
     runner: workflow.selected.runner,

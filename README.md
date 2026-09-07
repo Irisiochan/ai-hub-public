@@ -7,7 +7,7 @@ Grok CLI、OpenCode 和任意 API 模型接进同一套持久会话、长期记�
 PC Worker 在个人设备执行任务，triage worker 处理主动事件，会议室负责可信派单、handoff 和回执。
 Web、Electron 桌面端和 Android 客户端只是这套 harness 的交互入口。
 
-> 当前公开版本：**v0.3.0**（2026-09-06）。AI Hub 与 Memory Vault 独立版本化；
+> 当前公开版本：**v0.3.1**（2026-09-07）。AI Hub 与 Memory Vault 独立版本化；
 > 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，

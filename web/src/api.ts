@@ -332,8 +332,7 @@ export interface WorkflowBinding {
 
 export interface WorkflowRoute {
   primary: WorkflowBinding;
-  fallback?: WorkflowBinding;
-  fallbackAfter?: number;
+  escalateAfter?: number;
 }
 
 export interface WorkflowProfile {
@@ -353,8 +352,8 @@ export interface WorkflowSnapshot {
   taskPath: string;
   problemFingerprint: string;
   primary: WorkflowBinding;
-  fallback?: WorkflowBinding;
-  fallbackAfter?: number;
+  escalateAfter?: number;
+  escalateToHuman: boolean;
   fallbackActive: boolean;
   selected: WorkflowBinding;
   workflowFingerprint: string;
@@ -564,7 +563,7 @@ export const api = {
     }),
 
   recordJobQuality: (id: string, quality: 'success' | 'inadequate' | 'infrastructure', detail?: string) =>
-    req<{ ok: boolean; streak?: number; fallbackActive?: boolean }>(`/api/jobs/${id}/quality`, {
+    req<{ ok: boolean; streak?: number; fallbackActive?: boolean; escalateToHuman?: boolean }>(`/api/jobs/${id}/quality`, {
       method: 'POST', body: JSON.stringify({ quality, detail }),
     }),
 

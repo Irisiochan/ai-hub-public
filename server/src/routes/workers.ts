@@ -14,7 +14,7 @@ import { buildDeliveryChecks } from '../workers/deliveryChecks.js';
 import type { HubLogger } from '../logger.js';
 import { parsePositiveIntegerQuery } from '../queryParams.js';
 import type { WorkflowQuality } from '../workers/workflowProfiles.js';
-import { problemFingerprint, type WorkflowStage } from '../workers/workflowProfiles.js';
+import { problemFingerprint, WORKFLOW_HUMAN_ESCALATION_ERROR, type WorkflowStage } from '../workers/workflowProfiles.js';
 import type { CameraSnapBroker } from '../workers/cameraSnap.js';
 import type { TaobaoBridge } from '../workers/taobaoBridge.js';
 
@@ -318,7 +318,10 @@ export function workersRouter(
           : null,
     });
     if ('error' in created) {
-      const code = created.error === 'duplicate idempotency key' ? 409 : 400;
+      const code = created.error === 'duplicate idempotency key'
+        || created.error === WORKFLOW_HUMAN_ESCALATION_ERROR
+        ? 409
+        : 400;
       return res.status(code).json({ error: created.error });
     }
     if (created.merged) {
@@ -363,6 +366,14 @@ export function workersRouter(
     });
     if ('error' in outcome) return res.status(409).json({ error: outcome.error });
     jobs.addMessage(job.id, 'User', 'quality', JSON.stringify({ quality, ...outcome }));
+    if ('escalateToHuman' in outcome && outcome.escalateToHuman) {
+      jobs.updateDelivery(job.id, 'workflow', {
+        stage: 'user_decision',
+        summary: '连续 3 次效果不佳，已停止自动换模型，等 User 决定。',
+        nextOwner: 'User',
+        blocker: 'workflow_three_strike',
+      });
+    }
     res.json({ ok: true, ...outcome });
   });
 

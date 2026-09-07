@@ -7,6 +7,7 @@ import { buildDelegateTools } from '../src/agents/gatewayTools.js';
 import { JobStore } from '../src/workers/jobStore.js';
 import {
   WorkflowProfileStore,
+  WORKFLOW_HUMAN_ESCALATION_ERROR,
   problemFingerprint,
   workflowFingerprint,
 } from '../src/workers/workflowProfiles.js';
@@ -56,7 +57,7 @@ try {
   for (const id of ['override-poor-1', 'override-poor-2', 'override-poor-3']) {
     assert.deepEqual(store.record(overrideJob(id), { quality: 'inadequate' }), {
       counted: false,
-      reason: 'manual runner overrides do not affect profile fallback streaks',
+      reason: 'manual runner overrides do not affect profile quality streaks',
     });
   }
   const afterOverrides = store.snapshot({
@@ -71,12 +72,14 @@ try {
   const third = store.record(qualityJob('job-poor-3'), { quality: 'inadequate' });
   assert.equal(third.streak, 3);
   assert.equal(third.fallbackActive, true);
+  assert.equal(third.escalateToHuman, true);
 
-  const fallback = store.snapshot({ stage: 'execute', taskPath: 'tasks/demo.md', problemFingerprint: fingerprint });
-  assert.equal(fallback.selected.runner, 'codex');
-  assert.equal(fallback.selected.model, 'gpt-6-astra');
-  assert.equal(fallback.selected.reasoning, 'high');
-  assert.notEqual(fallback.workflowFingerprint, primary.workflowFingerprint);
+  const escalated = store.snapshot({ stage: 'execute', taskPath: 'tasks/demo.md', problemFingerprint: fingerprint });
+  assert.equal(escalated.selected.runner, 'grok');
+  assert.equal(escalated.selected.model, 'grok-4.6');
+  assert.equal(escalated.escalateToHuman, true);
+  assert.equal(escalated.fallbackActive, true);
+  assert.equal(escalated.workflowFingerprint, primary.workflowFingerprint);
 
   const changedProblem = store.snapshot({
     stage: 'execute',
@@ -92,14 +95,14 @@ try {
   for (const id of ['review-poor-1', 'review-poor-2', 'review-poor-3']) {
     store.record({ id, options: JSON.stringify({ workflow: review }) } as JobRow, { quality: 'inadequate' });
   }
-  const reviewFallback = store.snapshot({
+  const reviewEscalated = store.snapshot({
     stage: 'review',
     taskPath: 'tasks/review.md',
     problemFingerprint: reviewFingerprint,
   });
-  assert.equal(reviewFallback.selected.runner, 'claude');
-  assert.equal(reviewFallback.selected.model, 'claude-opus-4-7');
-  assert.equal(reviewFallback.selected.reasoning, 'high');
+  assert.equal(reviewEscalated.selected.runner, 'codex');
+  assert.equal(reviewEscalated.selected.model, 'gpt-6-astra');
+  assert.equal(reviewEscalated.escalateToHuman, true);
 
   store.record(qualityJob('job-success'), { quality: 'success' });
   const reset = store.snapshot({ stage: 'execute', taskPath: 'tasks/demo.md', problemFingerprint: fingerprint });
@@ -126,19 +129,42 @@ try {
   jobs.workflowProfiles.record(firstDelegated, { quality: 'inadequate' });
   jobs.workflowProfiles.record({ ...firstDelegated, id: 'delegated-poor-2' }, { quality: 'inadequate' });
   jobs.workflowProfiles.record({ ...firstDelegated, id: 'delegated-poor-3' }, { quality: 'inadequate' });
-  const fallbackDelegated = await delegate.exec({
+  const blockedDelegated = await delegate.exec({
     route_class: 'implement',
     workspace: 'C:\\repo',
     prompt: 'Retry the same bounded issue.',
     problem_fingerprint: fingerprint,
   });
-  assert.equal(fallbackDelegated.ok, true);
+  assert.equal(blockedDelegated.ok, false);
+  assert.equal(blockedDelegated.text, WORKFLOW_HUMAN_ESCALATION_ERROR);
+  const policyBlocked = jobs.create({
+    requestedBy: 'codex',
+    runner: 'grok',
+    workspace: 'C:\\repo',
+    prompt: 'Retry the same bounded issue.',
+    permissions: { write: true, shell: true, ssh: false },
+    options: {
+      routeClass: 'implement',
+      runnerSource: 'policy',
+      problemFingerprint: fingerprint,
+    },
+  });
+  assert.ok('error' in policyBlocked);
+  assert.equal(policyBlocked.error, WORKFLOW_HUMAN_ESCALATION_ERROR);
+  const overrideDelegated = await delegate.exec({
+    route_class: 'implement',
+    runner: 'codex',
+    runner_override_reason: 'User decided to continue after three-strike escalation',
+    workspace: 'C:\\repo',
+    prompt: 'User chose to continue the same bounded issue.',
+    problem_fingerprint: fingerprint,
+  });
+  assert.equal(overrideDelegated.ok, true);
   const secondDelegated = db.prepare('SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT 1').get() as JobRow;
   const secondOptions = JSON.parse(secondDelegated.options);
   assert.equal(secondDelegated.runner, 'codex');
-  assert.equal(secondOptions.model, 'gpt-6-astra');
-  assert.equal(secondOptions.reasoning, 'high');
-  assert.equal(secondOptions.workflow.fallbackActive, true);
+  assert.equal(secondOptions.runnerSource, 'override');
+  assert.equal(secondOptions.workflow.escalateToHuman, true);
 
   const { workflowFingerprint: _originalFingerprint, ...primaryInput } = primary;
   const v3ChangedByProfile = workflowFingerprint({

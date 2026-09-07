@@ -452,7 +452,7 @@ export function normalizeProactiveConfig(raw = {}) {
   );
   const minDailyDispatches = integerConfig(
     raw.minDailyDispatches,
-    1,
+    0,
     'proactive.minDailyDispatches',
     0,
     1000,
