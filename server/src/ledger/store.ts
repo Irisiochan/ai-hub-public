@@ -229,7 +229,9 @@ export function importLedgerRows(
         const code = (error as { code?: string }).code;
         if (code === 'SQLITE_CONSTRAINT_UNIQUE') {
           // 同一交易再次导入时状态可能已变（如退款）：按 (source, fingerprint)
-          // 找到旧行并刷新可变字段，让 kind/统计跟着最新账单走。
+          // 找到旧行，只有账单自身字段（状态/金额）真的变化时才刷新。
+          // 不比较 kind——它可能是我们级联推导出来的（如银行行被退款传导成
+          // ignored），拿相同的银行账单重导时不能据此把它改回 expense。
           const existingTxn = db.prepare(
             'SELECT id, kind, status_text, amount_cents, duplicate_of FROM ledger_transactions WHERE source = ? AND fingerprint = ?'
           ).get(input.source, row.fingerprint) as
@@ -237,8 +239,7 @@ export function importLedgerRows(
             | undefined;
           if (
             existingTxn &&
-            (existingTxn.kind !== row.kind ||
-              existingTxn.status_text !== row.status ||
+            (existingTxn.status_text !== row.status ||
               existingTxn.amount_cents !== row.amountCents)
           ) {
             db.prepare(
@@ -253,14 +254,15 @@ export function importLedgerRows(
               JSON.stringify(row.raw),
               existingTxn.id,
             );
-            // 跨来源去重后，统计计入的是被指向的银行流水行；钱包侧整单作废
-            // （退款/撤销 → ignored）时要把同一笔钱的银行行一并置 ignored，
-            // 否则月支出仍会保留已退款的金额。链接仍保留，防止该银行行被
-            // 后续批次重新当成可匹配流水。
-            if (row.kind === 'ignored' && existingTxn.kind !== 'ignored' && existingTxn.duplicate_of !== null) {
-              db.prepare('UPDATE ledger_transactions SET kind = ? WHERE id = ?')
-                .run('ignored', existingTxn.duplicate_of);
-            }
+          }
+          // 跨来源去重后，统计计入的是被指向的银行流水行；钱包侧整单作废
+          // （退款/撤销 → ignored）时要把同一笔钱的银行行一并置 ignored，
+          // 否则月支出仍会保留已退款的金额。每次重导都重新断言（不只在
+          // 首次翻转时），让退款状态在后续任何导入序列中持续生效。
+          // 链接仍保留，防止该银行行被后续批次重新当成可匹配流水。
+          if (existingTxn && row.kind === 'ignored' && existingTxn.duplicate_of !== null) {
+            db.prepare('UPDATE ledger_transactions SET kind = ? WHERE id = ?')
+              .run('ignored', existingTxn.duplicate_of);
           }
           duplicate += 1;
           continue;

@@ -300,6 +300,68 @@ try {
   );
   assert.equal(monthStats(db, '2026-08').expenseCents, 71_00);
 
+  // —— 连续导入：下一份银行账单包含原消费时不得复活已退款的支出 ——
+  const CMB_MALL_NEXT = `招商银行信用卡
+交易日,记账日,卡号后四位,交易描述,支出,存入
+2026-08-15,2026-08-15,1234,商场,30.00,
+2026-08-16,2026-08-16,1234,便利店,10.00,
+`;
+  const cmbNext = parseLedgerFile(Buffer.from(CMB_MALL_NEXT), 'cmb-cc');
+  importLedgerRows(db, {
+    source: cmbNext.source,
+    originalName: 'cmb-mall-next.csv',
+    fileSha256: sha256Hex(Buffer.from(CMB_MALL_NEXT)),
+    rows: cmbNext.rows,
+  });
+  const afterBankReimport = listTransactions(db, { month: '2026-08' });
+  assert.equal(
+    afterBankReimport.find((row) => row.source === 'cmb-cc' && row.payee === '商场')?.kind,
+    'ignored',
+    '银行账单重导不得把已退款传导的银行行改回支出',
+  );
+  assert.equal(
+    afterBankReimport.find((row) => row.source === 'cmb-cc' && row.payee === '便利店')?.kind,
+    'expense',
+  );
+  assert.equal(monthStats(db, '2026-08').expenseCents, 71_00 + 10_00, '应只新增 10 元');
+
+  // —— 再导入包含该退款的微信账单：状态保持正确 ——
+  const WECHAT_MALL_REFUND2 = WECHAT_MALL_REFUND.replace(
+    '终止时间：[2026-08-31 23:59:59]',
+    '终止时间：[2026-09-01 00:00:00]',
+  );
+  const mallRefund2 = parseLedgerFile(Buffer.from(WECHAT_MALL_REFUND2), 'wechat');
+  importLedgerRows(db, {
+    source: mallRefund2.source,
+    originalName: 'wechat-mall-refund2.csv',
+    fileSha256: sha256Hex(Buffer.from(WECHAT_MALL_REFUND2)),
+    rows: mallRefund2.rows,
+  });
+  assert.equal(monthStats(db, '2026-08').expenseCents, 81_00);
+
+  // —— 历史坏数据（银行行已被复活）也要能被退款账单重导治愈 ——
+  db.prepare("UPDATE ledger_transactions SET kind = 'expense' WHERE source = 'cmb-cc' AND payee = '商场'").run();
+  assert.equal(monthStats(db, '2026-08').expenseCents, 111_00);
+  const WECHAT_MALL_REFUND3 = WECHAT_MALL_REFUND.replace(
+    '终止时间：[2026-08-31 23:59:59]',
+    '终止时间：[2026-09-02 00:00:00]',
+  );
+  const mallRefund3 = parseLedgerFile(Buffer.from(WECHAT_MALL_REFUND3), 'wechat');
+  importLedgerRows(db, {
+    source: mallRefund3.source,
+    originalName: 'wechat-mall-refund3.csv',
+    fileSha256: sha256Hex(Buffer.from(WECHAT_MALL_REFUND3)),
+    rows: mallRefund3.rows,
+  });
+  assert.equal(
+    listTransactions(db, { month: '2026-08' }).find(
+      (row) => row.source === 'cmb-cc' && row.payee === '商场',
+    )?.kind,
+    'ignored',
+    '退款账单重导要重新断言银行行的 ignored 状态',
+  );
+  assert.equal(monthStats(db, '2026-08').expenseCents, 81_00);
+
   console.log('ledger tests ok');
 } finally {
   db.close();

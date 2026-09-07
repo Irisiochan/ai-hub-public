@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.3.3 - 2026-09-07
+
+- Stop bank-statement re-imports from resurrecting refunded spending: the duplicate-update
+  path now only refreshes a transaction when its bill-side fields (status/amount) actually
+  changed — a derived `ignored` kind from the refund cascade no longer looks like bill news —
+  and the refund cascade is re-asserted on every re-import of the refunded wallet row, so a
+  bank row that was already flipped back also heals. Covered by a sequential-import
+  regression (dedup → refund → next bank bill → refund bill again).
+
+This public release is a curated, sanitized snapshot based on private source revision
+`fb880c4116ac100158c38da5fb44c4d9f1738f7f`; private contacts, personas, real evaluation data,
+databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
+
 ## 0.3.2 - 2026-09-07
 
 - Cascade wallet-side refunds to the linked bank row: after cross-source dedup the bank
