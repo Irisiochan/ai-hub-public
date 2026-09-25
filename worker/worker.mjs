@@ -46,6 +46,7 @@ import {
   findRow,
   isSameProcess,
   inspectProcessHistory,
+  processTableSupported,
   queryProcessTable,
   readSessionEvidence,
   resolveStallConfig,
@@ -246,7 +247,7 @@ function processAlive(pid) {
 async function noteResidualTree(job, child) {
   const rootPid = child?.pid;
   if (job.runner !== 'opencode') return '';
-  if (process.platform !== 'win32' || !Number.isInteger(rootPid) || rootPid <= 0) return '';
+  if (!processTableSupported() || !Number.isInteger(rootPid) || rootPid <= 0) return '';
   let tree;
   try {
     tree = await cleanupProvenTree(rootPid);
@@ -956,7 +957,7 @@ async function runRunnerOnce({
         reason: `恢复前网关复核失败（${error.message}），无法确认任务仍允许运行；未启动第二个执行者`,
       };
     }
-    if (process.platform !== 'win32') {
+    if (!processTableSupported()) {
       return {
         proven: false, terminal: null,
         reason: '当前平台无法枚举子进程亲缘，残留归属无法证明；未启动第二个执行者',

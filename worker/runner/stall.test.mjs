@@ -11,11 +11,14 @@ import {
   cpuWindowBusy,
   createProgressTracker,
   descendantsOf,
+  inspectProcessHistory,
   fingerprintEvent,
   findRow,
   isSameProcess,
   normalizeSessionTools,
   OPENCODE_STALL_DEFAULTS,
+  parseProcStat,
+  processTableSupported,
   resolveStallConfig,
   roundScopedTools,
   sessionQuerySpawnSpec,
@@ -259,7 +262,8 @@ test('sessionQuerySpawnSpec keeps the SQL one argument through the cmd shim', ()
   assert.equal(posix.file, 'opencode');
   assert.equal(posix.args.length, 4);
 });
-const winOnly = { skip: process.platform !== 'win32' };
+// Injected snapshots, but the functions still gate on a supported platform.
+const winOnly = { skip: !processTableSupported() };
 
 test('dead parent remains evidence for newborns during termination', winOnly, async () => {
   const row = (pid, ppid) => ({ pid, ppid, created: String(pid) });
@@ -275,7 +279,7 @@ test('cleanup checks pre-kill identities even when parent chain disappeared', wi
   const live = [row(102, 101)];
   const result = await cleanupProvenTree(100, {
     known: [row(100, 1), row(101, 100), row(102, 101)],
-    query: async () => live, signal: () => {},
+    query: async () => live, signal: () => {}, settleMs: 0,
   });
   assert.ok(result.remaining.includes(102));
 });
@@ -320,4 +324,47 @@ test('terminateIdentities blocks on a newborn during the kill window and ignores
   assert.ok(!signaled.includes(50), 'an older process with a stale ppid must never be signaled');
   assert.ok(!signaled.includes(103), 'an unproven newborn must never be signaled');
   assert.equal(verdict.unprovable, true);
+});
+
+test('parseProcStat reads identity, session and CPU from a /proc stat line', () => {
+  // comm with spaces and a ')' must not shift the fields after it.
+  const line = '4242 (node (x) y) S 4200 4242 4242 0 -1 4194560 100 0 0 0 250 50 0 0 20 0 11 0 987654 1 2 3';
+  const row = parseProcStat(line, 'boot-a', 100);
+  assert.equal(row.pid, 4242);
+  assert.equal(row.ppid, 4200);
+  assert.equal(row.sid, 4242);
+  assert.equal(row.name, 'node (x) y');
+  assert.equal(row.created, '00000000000000987654@boot-a');
+  // 250 user / 50 system ticks at 100 Hz -> 100ns units.
+  assert.equal(row.user, 25_000_000n);
+  assert.equal(row.kernel, 5_000_000n);
+  assert.equal(parseProcStat(line.replace(' S ', ' Z '), 'boot-a'), null, 'zombies are not live processes');
+  assert.equal(parseProcStat('garbage', 'boot-a'), null);
+  assert.equal(parseProcStat(line, ''), null, 'no boot id means no durable identity');
+});
+
+test('linux start-time identities order numerically and never cross boots', () => {
+  const stat = (pid, ppid, start, boot) => parseProcStat(
+    `${pid} (n) S ${ppid} ${pid} ${pid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 ${start} 1 2`, boot);
+  // Padding keeps 99 < 100 as strings; a later-born child is attributed.
+  const parent = stat(10, 1, '99', 'b1');
+  const child = stat(11, 10, '100', 'b1');
+  assert.equal(inspectProcessHistory([parent, child], [parent]).unprovable, true);
+  assert.equal(inspectProcessHistory([parent, child], [parent, child]).unprovable, false);
+  // A pre-reboot identity is not the parent of anything in the current boot.
+  const oldParent = stat(10, 1, '5', 'b0');
+  assert.equal(inspectProcessHistory([child], [oldParent]).unprovable, false);
+  assert.equal(isSameProcess(oldParent, stat(10, 1, '5', 'b1')), false);
+});
+
+test('descendantsOf follows session membership after linux reparents orphans', () => {
+  const rows = [
+    { pid: 1, ppid: 0, sid: 1, created: 'a' },
+    { pid: 300, ppid: 1, sid: 200, created: 'b' }, // orphan of dead root 200
+    { pid: 301, ppid: 300, sid: 200, created: 'c' },
+    { pid: 400, ppid: 1, sid: 400, created: 'd' }, // stranger
+    { pid: 500, ppid: 1, created: 'e' }, // Windows rows carry no sid
+  ];
+  assert.deepEqual(descendantsOf(rows, 200).map((r) => r.pid).sort(), [300, 301]);
+  assert.deepEqual(descendantsOf(rows, 400), []);
 });

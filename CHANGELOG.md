@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.4.1 - 2026-09-26
+
+- Make OpenCode stall recovery work on Linux Workers. Process-tree enumeration previously
+  returned nothing outside Windows, so every stall on a Linux/VPS Worker failed closed as
+  `blocked` instead of resuming the same session. The Worker now reads `/proc/<pid>/stat`,
+  identifies processes by start time tagged with the boot id, traces orphans through session
+  membership (the POSIX runner is a detached session leader), accepts a known process that
+  was reparented, and waits a bounded time for signaled processes to exit before the final
+  cleanup check.
+- Make the Worker tests platform-aware instead of asserting Windows behavior on Linux, and
+  fix POSIX path splitting in the release-SHA lookup (`releaseShaFromRoot`).
+- Run `core-checks`, including the shared-package version guard, on pushes to `main`, so
+  public mirror releases get the same checks as the private trunk.
+
+This public release is a curated, sanitized snapshot based on private source revision
+`5ad8e4b32df279238db6825edf429f1a6be8774a`; private contacts, personas, real evaluation data,
+databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
+
 ## 0.4.0 - 2026-09-26
 
 - Replace Workflow Profiles with seven fixed workflow modules (plan, execute, review,

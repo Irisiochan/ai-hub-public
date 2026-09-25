@@ -42,3 +42,35 @@ test('real orphan is held after parent exit and cleaned only with its captured i
     // No blind PID kill: the orphan has its own bounded lifetime.
   }
 });
+
+test('linux: a dead session leader\'s reparented orphan is still found and reaped', {
+  skip: process.platform !== 'linux', timeout: 30_000,
+}, async () => {
+  // The Worker spawns POSIX runners detached (own session). When the runner
+  // dies its children reparent away, so only session membership ties them
+  // back; a stranger outside the session must never be touched.
+  const stranger = spawn(process.execPath, ['-e', 'setTimeout(()=>process.exit(0),20000)'], { stdio: 'ignore' });
+  const parent = spawn(process.execPath, ['-e', `
+    const {spawn}=require('node:child_process');
+    const child=spawn(process.execPath,['-e','setTimeout(()=>process.exit(0),20000)'],{stdio:'ignore'});
+    console.log(child.pid); child.unref(); process.exit(0);
+  `], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  let output = '';
+  parent.stdout.on('data', (c) => { output += c; });
+  await once(parent, 'exit');
+  const childPid = Number(output.trim());
+  try {
+    const rows = await queryProcessTable();
+    const orphan = rows.find((r) => r.pid === childPid);
+    assert.ok(orphan, 'orphan must be enumerable');
+    assert.notEqual(orphan.ppid, parent.pid, 'linux reparents orphans');
+    assert.equal(orphan.sid, parent.pid);
+    const verdict = await cleanupProvenTree(parent.pid);
+    assert.equal(verdict.unprovable, false);
+    assert.deepEqual(verdict.attempted, [childPid]);
+    assert.deepEqual(verdict.remaining, [], JSON.stringify(verdict));
+    assert.ok(!verdict.attempted.includes(stranger.pid));
+  } finally {
+    try { stranger.kill('SIGKILL'); } catch {}
+  }
+});

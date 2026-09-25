@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 
@@ -239,9 +239,9 @@ export function describeStall({ reason, sinceProgress, sinceBytes, recoveries })
   return `疑似停滞（${idle}；已恢复 ${recoveries ?? 0} 次）`;
 }
 
-// --- Identity-aware process enumeration (win32 only) -----------------------
+// --- Identity-aware process enumeration (win32 + linux) --------------------
 // Process identity is (pid, creation-time); a bare PID number is never
-// trusted across time because Windows reuses PIDs aggressively. Never kill
+// trusted across time because both Windows and Linux reuse PIDs. Never kill
 // by process name: only same-identity members of the stalled root's tree
 // are ever signaled.
 
@@ -302,13 +302,101 @@ function parseProcessTable(raw) {
   return rows;
 }
 
-// One full snapshot: [{ pid, ppid, created, kernel, user }].
-// Returns null when enumeration is unavailable (non-win32), forced off for
-// tests (OPENCODE_STALL_FORCE_NO_ENUM=1), or the query fails. Null always
+// Linux snapshot from /proc/<pid>/stat. Identity is the kernel start time
+// (field 22, clock ticks since boot), zero-padded so string order is time
+// order like the Windows timestamp, and tagged with the boot id: start
+// ticks restart at every boot, so an identity persisted before a reboot
+// must never match or order against a process of the current boot.
+// CPU is converted to the Windows 100ns unit cpuWindowBusy expects.
+const PROC_START_WIDTH = 20;
+let clockTicksPerSec = null;
+
+function linuxClockTicks() {
+  if (clockTicksPerSec == null) {
+    const probe = spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 5_000 });
+    const value = Number(String(probe.stdout ?? '').trim());
+    // USER_HZ is ABI-fixed at 100 on mainstream Linux; getconf only confirms.
+    clockTicksPerSec = Number.isInteger(value) && value > 0 ? value : 100;
+  }
+  return clockTicksPerSec;
+}
+
+// Pure: one /proc/<pid>/stat line -> row, or null for unparsable lines and
+// zombies (Z/X run no code and pin their PID against reuse; counting them
+// would block forever on orphans an unreaping subreaper never collects).
+export function parseProcStat(text, bootId, ticksPerSec = 100) {
+  const raw = String(text ?? '');
+  const open = raw.indexOf('(');
+  const close = raw.lastIndexOf(')');
+  if (open <= 0 || close <= open || !bootId) return null;
+  const pid = Number(raw.slice(0, open).trim());
+  // Fields after the comm: [0]=state(3) [1]=ppid(4) [3]=session(6)
+  // [11]=utime(14) [12]=stime(15) [19]=starttime(22).
+  const rest = raw.slice(close + 1).trim().split(/\s+/);
+  if (rest.length < 20) return null;
+  if (rest[0] === 'Z' || rest[0] === 'X' || rest[0] === 'x') return null;
+  const ppid = Number(rest[1]);
+  const sid = Number(rest[3]);
+  if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || ppid < 0) return null;
+  if (!/^\d+$/.test(rest[19])) return null;
+  let kernel = null;
+  let user = null;
+  try {
+    const unit = BigInt(Math.round(10_000_000 / ticksPerSec));
+    kernel = BigInt(rest[12]) * unit;
+    user = BigInt(rest[11]) * unit;
+  } catch { kernel = null; user = null; }
+  return {
+    pid,
+    ppid,
+    sid: Number.isInteger(sid) && sid > 0 ? sid : null,
+    created: `${rest[19].padStart(PROC_START_WIDTH, '0')}@${bootId}`,
+    kernel,
+    user,
+    name: raw.slice(open + 1, close),
+  };
+}
+
+export async function queryProcTable(procRoot = '/proc') {
+  let bootId;
+  let entries;
+  try {
+    bootId = (await fs.promises.readFile(`${procRoot}/sys/kernel/random/boot_id`, 'utf8')).trim();
+    entries = await fs.promises.readdir(procRoot);
+  } catch {
+    return null;
+  }
+  if (!bootId) return null;
+  const ticks = linuxClockTicks();
+  const rows = [];
+  await Promise.all(entries.filter((name) => /^\d+$/.test(name)).map(async (name) => {
+    let text;
+    try {
+      text = await fs.promises.readFile(`${procRoot}/${name}/stat`, 'utf8');
+    } catch {
+      return; // exited between readdir and read: simply absent
+    }
+    const row = parseProcStat(text, bootId, ticks);
+    if (row) rows.push(row);
+  }));
+  // A /proc that cannot even see this process is not a usable table
+  // (e.g. hidepid or a foreign pid namespace): report unprovable.
+  if (!rows.some((row) => row.pid === process.pid)) return null;
+  return rows;
+}
+
+export function processTableSupported(platform = process.platform) {
+  return platform === 'win32' || platform === 'linux';
+}
+
+// One full snapshot: [{ pid, ppid, created, kernel, user }] (+ sid on linux).
+// Returns null when enumeration is unavailable (other platforms), forced off
+// for tests (OPENCODE_STALL_FORCE_NO_ENUM=1), or the query fails. Null always
 // means "ownership unprovable" to the caller — never "tree is empty".
 export async function queryProcessTable() {
-  if (process.platform !== 'win32') return null;
+  if (!processTableSupported()) return null;
   if (process.env.OPENCODE_STALL_FORCE_NO_ENUM === '1') return null;
+  if (process.platform === 'linux') return queryProcTable();
   const raw = await runPowerShell(TABLE_SCRIPT);
   if (raw == null) return null;
   return parseProcessTable(raw);
@@ -319,6 +407,11 @@ export function findRow(rows, pid) {
 }
 
 // Pure: same-identity members of rootPid's tree (rows carry identity).
+// Linux reparents orphans to init/a subreaper, so the ppid chain alone loses
+// a dead root's survivors (Windows keeps the stale ppid instead). The POSIX
+// runner is spawned detached, i.e. as leader of its own session, and the
+// kernel never hands out a PID still in use as a session id: rows whose sid
+// is rootPid are members of that root's session, orphaned or not.
 export function descendantsOf(rows, rootPid) {
   const byParent = new Map();
   for (const row of rows ?? []) {
@@ -326,7 +419,8 @@ export function descendantsOf(rows, rootPid) {
     byParent.get(row.ppid).push(row);
   }
   const out = [];
-  const queue = [...(byParent.get(rootPid) ?? [])];
+  const sessionMembers = (rows ?? []).filter((row) => row.sid != null && row.sid === rootPid && row.pid !== rootPid);
+  const queue = [...(byParent.get(rootPid) ?? []), ...sessionMembers];
   const seen = new Set([rootPid]);
   while (queue.length) {
     const row = queue.shift();
@@ -363,7 +457,7 @@ export function treeCpuTotal(rows, rootPid) {
 export async function cleanupProvenTree(rootPid, deps = {}) {
   const query = deps.query ?? queryProcessTable;
   const signal = deps.signal ?? ((pid) => process.kill(pid, 'SIGTERM'));
-  if (process.platform !== 'win32' || !Number.isInteger(rootPid) || rootPid <= 0) {
+  if (!processTableSupported() || !Number.isInteger(rootPid) || rootPid <= 0) {
     return { attempted: [], remaining: [], unprovable: true };
   }
   const first = await query();
@@ -392,13 +486,16 @@ export async function cleanupProvenTree(rootPid, deps = {}) {
     }
   }
   // Kill only twice-verified same-identity members (present in both
-  // snapshots with identical identity and parent link).
+  // snapshots with identical identity and parent link). On Linux an orphan
+  // is reparented when its parent dies, so the link of a known identity may
+  // legitimately change; (pid, start time) alone still proves it ours.
+  const reparentOk = process.platform === 'linux';
   const targets = [...seen.values()].filter((member) => {
     const current = secondByPid.get(member.pid);
     const previous = findRow(first, member.pid);
     return current
       && previous && isSameProcess(previous, current)
-      && current.ppid === member.ppid
+      && (current.ppid === member.ppid || reparentOk)
       && isSameProcess(current, member);
   });
   const attempted = [];
@@ -406,7 +503,20 @@ export async function cleanupProvenTree(rootPid, deps = {}) {
   for (const target of [...targets].reverse()) {
     try { signal(target.pid); attempted.push(target.pid); } catch {}
   }
-  const third = await query();
+  // Signal delivery is asynchronous (on Linux a SIGTERMed node needs a few
+  // ms to exit): re-snapshot, bounded, while a signaled identity still lives,
+  // so the final proof does not race the kill it is proving.
+  const settleMs = Math.max(Number(deps.settleMs ?? 2_000) || 0, 0);
+  const settleDeadline = Date.now() + settleMs;
+  const signaledLive = (rows) => attempted.some((pid) => {
+    const row = findRow(rows, pid);
+    return row && isSameProcess(row, seen.get(pid));
+  });
+  let third = await query();
+  while (third && signaledLive(third) && Date.now() < settleDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    third = await query();
+  }
   if (!third) return { attempted, remaining: [], unprovable: true };
   const thirdByPid = new Map(third.map((row) => [row.pid, row]));
   const remaining = [];
@@ -432,11 +542,15 @@ export async function cleanupProvenTree(rootPid, deps = {}) {
 }
 
 // Windows keeps a dead parent's PID in ppid, so a PID-reusing parent can
-// "adopt" older processes. A real child is never created before its parent.
+// "adopt" older processes. A real child is never created before its parent,
+// nor in another boot (Linux identities end in "@<boot id>").
 function bornAfter(child, parent) {
   const c = String(child?.created ?? '');
   const p = String(parent?.created ?? '');
-  return c !== '' && p !== '' && c >= p;
+  if (c === '' || p === '') return false;
+  const [cStart, cBoot = ''] = c.split('@');
+  const [pStart, pBoot = ''] = p.split('@');
+  return cBoot === pBoot && cStart >= pStart;
 }
 
 // Historical parents remain evidence after exit. A newly seen child of a
@@ -492,7 +606,7 @@ export async function terminateIdentities(list, deps = {}) {
   const signal = deps.signal ?? ((pid, sig) => process.kill(pid, sig));
   const waitMs = Math.max(Number(deps.waitMs) || 3000, 0);
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  if (process.platform !== 'win32') return { ended: [], remaining: [], unprovable: true };
+  if (!processTableSupported()) return { ended: [], remaining: [], unprovable: true };
   const wanted = (list ?? []).filter((t) => Number.isInteger(t?.pid) && t.pid > 0 && t.created);
   if (wanted.length === 0) return { ended: [], remaining: [], unprovable: true };
   const first = await query();

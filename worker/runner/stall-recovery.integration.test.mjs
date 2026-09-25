@@ -30,7 +30,20 @@ function trace(msg) {
   }
 }
 
+function procHas(tag) {
+  // Zombies expose an empty cmdline, so only live processes match.
+  let found = false;
+  for (const name of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+    try {
+      if (fs.readFileSync(`/proc/${name}/cmdline`, 'utf8').includes(tag)) found = true;
+    } catch {}
+  }
+  return found;
+}
+
 function cimHas(tag) {
+  if (process.platform !== 'win32') return Promise.resolve(procHas(tag));
   return new Promise((resolve) => {
     // NOTE: match node.exe only — the querying powershell.exe carries the
     // tag in its own -Command line and must not self-match.
@@ -947,12 +960,15 @@ test('crashed worker heals verified leftovers before the next dispatch', async (
         assert.equal(completions.get('stall-job-s1')?.status, 'blocked');
         // The strand record must capture the whole live tree (shell + node),
         // not just the root PID: the shell dies with the worker, the node
-        // survives orphaned.
+        // survives orphaned. POSIX runners spawn without a shell (the fake
+        // CLI execs node), so there the node itself is the root.
         const spool = JSON.parse(fs.readFileSync(path.join(dir, 'worker-state.json'), 'utf8'));
         const record = spool.stranded?.['stall-job-s1'];
         assert.ok(record, 'strand record must persist after blocked handoff');
         const names = (record.tree ?? []).map((t) => t.name);
-        assert.ok(names.some((n) => /cmd\.exe/i.test(n ?? '')), `strand must track the shell, got ${JSON.stringify(names)}`);
+        if (process.platform === 'win32') {
+          assert.ok(names.some((n) => /cmd\.exe/i.test(n ?? '')), `strand must track the shell, got ${JSON.stringify(names)}`);
+        }
         assert.ok(names.some((n) => /node(\.exe)?/i.test(n ?? '')), `strand must track the node child, got ${JSON.stringify(names)}`);
       } finally {
         // Crash, not shutdown: SIGKILL skips all handlers (and may land
@@ -1034,9 +1050,7 @@ test('unverifiable strand refuses new work on the same workspace', async () => {
 });
 
 test('live snapshots observe newborns across cleanup windows', {
-  // cleanupProvenTree and the taskkill teardown are Windows-only. Running this
-  // on Linux leaves its continuously spawned children orphaned in the Worker.
-  skip: process.platform !== 'win32' ? 'Windows process-tree cleanup only' : false,
+  skip: !['win32', 'linux'].includes(process.platform) ? 'no process-tree enumeration on this platform' : false,
 }, async () => {
   // On Windows SIGTERM is instant, so a live forking cleanup either
   // genuinely succeeds or its timing is unstable second to second; the
@@ -1047,7 +1061,8 @@ test('live snapshots observe newborns across cleanup windows', {
   const { queryProcessTable, descendantsOf } = await import('./stall.mjs');
   const spawner = spawn(process.execPath,
     ['-e', 'const{spawn}=require("node:child_process");setInterval(()=>spawn(process.execPath,["-e","setInterval(()=>{},10000)"],{stdio:"ignore"}),200);setInterval(()=>{},500);'],
-    { windowsHide: true, stdio: 'ignore' });
+    // POSIX: own session/process group, so teardown can signal the group.
+    { windowsHide: true, stdio: 'ignore', detached: process.platform !== 'win32' });
   try {
     await new Promise((resolve) => setTimeout(resolve, 900));
     const first = await queryProcessTable();
@@ -1066,9 +1081,13 @@ test('live snapshots observe newborns across cleanup windows', {
     assert.ok(Array.isArray(verdict.attempted) && Array.isArray(verdict.remaining));
     assert.equal(typeof verdict.unprovable, 'boolean');
   } finally {
-    await new Promise((resolve) => {
-      execFile('taskkill', ['/PID', String(spawner.pid), '/T', '/F'], () => resolve());
-    });
+    if (process.platform === 'win32') {
+      await new Promise((resolve) => {
+        execFile('taskkill', ['/PID', String(spawner.pid), '/T', '/F'], () => resolve());
+      });
+    } else {
+      try { process.kill(-spawner.pid, 'SIGKILL'); } catch {}
+    }
     await waitFor(async () => {
       try { process.kill(spawner.pid, 0); return false; } catch { return true; }
     }, 10_000, 'spawner tree teardown');

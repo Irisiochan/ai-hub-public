@@ -31,7 +31,9 @@ export function releaseShaFromRoot(releaseRoot, env = process.env) {
   const override = normalizeReleaseSha(env?.AI_HUB_WORKER_RELEASE);
   if (override) return override;
   if (!releaseRoot) return null;
-  const base = path.basename(String(releaseRoot));
+  // win32 basename splits on both separators; posix basename would keep a
+  // whole backslash path (a PC launcher root reported to a Linux reader).
+  const base = path.win32.basename(String(releaseRoot));
   return RELEASE_DIR_RE.test(base) ? base.toLowerCase() : null;
 }
 

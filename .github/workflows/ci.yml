@@ -3,7 +3,8 @@ name: core-checks
 on:
   pull_request:
   push:
-    branches: [master]
+    # master is the private trunk; main is the public mirror's default branch.
+    branches: [master, main]
 
 permissions:
   contents: read
