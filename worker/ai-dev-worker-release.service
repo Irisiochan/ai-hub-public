@@ -1,0 +1,14 @@
+[Unit]
+Description=Retry a pending vps-dev worker release switch (ai-hub W2)
+Documentation=https://github.com/Irisiochan/ai-hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Root on purpose: flipping /opt/ai-hub-worker/current and restarting the
+# worker unit are privileged. Never runs with --force: with a live runner
+# child the installer re-records pending and exits 0, so this timer can only
+# restart an idle worker — never the closure job that is still reporting.
+ExecStart=/bin/bash /opt/ai-hub/deploy/install-vps-worker.sh --retry-pending
+Nice=5

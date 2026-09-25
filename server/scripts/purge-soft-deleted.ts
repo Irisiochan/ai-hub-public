@@ -10,9 +10,9 @@
  *   PURGE_JOBS_DAYS
  *   PURGE_BATCH
  */
-import { loadConfig } from '../src/config.js';
-import { openDb } from '../src/db.js';
-import { SoftDeletePurge } from '../src/purge.js';
+import { loadConfig } from '../src/platform/config.js';
+import { openDb } from '../src/platform/db.js';
+import { SoftDeletePurge } from '../src/ops/purge.js';
 
 const dryRun = process.argv.includes('--dry-run') || process.argv.includes('-n');
 const config = loadConfig();

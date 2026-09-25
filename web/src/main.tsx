@@ -1,12 +1,12 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
-import MobileGate from './components/MobileGate';
-import SessionGate from './components/SessionGate';
-import { ConfirmProvider } from './components/ConfirmDialog';
-import { initializeThemeSystem } from './theme/store';
-import { initializeUiPreferences } from './preferences/store';
-import { initializeSoundSystem } from './sound';
+import MobileGate from './app/MobileGate';
+import SessionGate from './app/SessionGate';
+import { ConfirmProvider } from './platform/ConfirmDialog';
+import { initializeThemeSystem } from './settings/theme/store';
+import { initializeUiPreferences } from './settings/preferences/store';
+import { initializeSoundSystem } from './settings/sound';
 import './styles.css';
 
 initializeThemeSystem();

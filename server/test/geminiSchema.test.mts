@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { GeminiProvider, sanitizeGeminiSchema } from '../src/agents/directApi/gemini.js';
+import { GeminiProvider, sanitizeGeminiSchema } from '../src/backends/directApi/gemini.js';
 
 const cameraLike = {
   type: 'object',

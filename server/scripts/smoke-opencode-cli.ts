@@ -8,7 +8,7 @@ import {
   opencodeImageMimeType,
   parseOpencodeModelList,
   prettyOpencodeModelLabel,
-} from '../src/agents/opencodeCli.js';
+} from '../src/backends/opencodeCli.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const mockCliPath = path.join(here, 'mock-opencode.mjs');
@@ -48,21 +48,19 @@ const hello = new OpencodeCliBackend({
   cliPath: mockCliPath,
   cwd: process.cwd(),
   model: 'opencode-go/muse-spark-1.2-contributor',
-  turnTimeoutMs: 5000,
   log: () => {},
 });
 await hello.start(null);
 const first = await turn(hello, 'hello');
 const done = first.find((event) => event.type === 'done');
 assert.equal(done?.type, 'done');
-if (done?.type === 'done') assert.equal(done.finalText, '缪斯在。');
+if (done?.type === 'done') assert.equal(done.finalText, 'Sora 在。');
 assert(first.some((event) => event.type === 'session' && event.sessionId === 'ses_mock_new'));
 await hello.stop();
 
 const resumed = new OpencodeCliBackend({
   cliPath: mockCliPath,
   cwd: process.cwd(),
-  turnTimeoutMs: 5000,
   log: () => {},
 });
 await resumed.start('ses_existing');
@@ -74,7 +72,6 @@ await resumed.stop();
 const failing = new OpencodeCliBackend({
   cliPath: mockCliPath,
   cwd: process.cwd(),
-  turnTimeoutMs: 5000,
   log: () => {},
 });
 await failing.start(null);
@@ -88,7 +85,6 @@ const flagCli = new OpencodeCliBackend({
   cwd: process.cwd(),
   model: 'opencode-go/muse-spark-1.2-contributor',
   variant: 'xhigh',
-  turnTimeoutMs: 5000,
   log: () => {},
 });
 await flagCli.start('ses_keep');
@@ -115,7 +111,6 @@ assert.throws(() => opencodeFileArgs([path.join(here, 'notes.bmp')]), /不支持
 const imageCli2 = new OpencodeCliBackend({
   cliPath: mockCliPath,
   cwd: process.cwd(),
-  turnTimeoutMs: 5000,
   log: () => {},
 });
 await imageCli2.start(null);
@@ -140,7 +135,6 @@ assert(!fileArgv.some((arg) => arg.startsWith('data:image/')), '不得把图片 
 const badImage = new OpencodeCliBackend({
   cliPath: mockCliPath,
   cwd: process.cwd(),
-  turnTimeoutMs: 5000,
   log: () => {},
 });
 await badImage.start(null);

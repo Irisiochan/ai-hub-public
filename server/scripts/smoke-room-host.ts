@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { openDb } from '../src/db.js';
-import { messagesRouter } from '../src/routes/messages.js';
-import { SseHub } from '../src/sse.js';
+import { openDb } from '../src/platform/db.js';
+import { messagesRouter } from '../src/runtime/messageRoutes.js';
+import { SseHub } from '../src/platform/sse.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.room-host-smoke.db');
@@ -116,6 +116,8 @@ try {
   assert.equal((await duplicate.json() as any).messageId, topic.messageId);
   assert.equal(trackedCalls, 1);
 
+  // Retired: coordination-kind host dispatches return 410 and insert nothing.
+  // The model-driven task ledger (task_* tools) replaces them.
   const coordination = {
     kind: 'execution',
     taskPath: 'tasks/coordination-smoke.md',
@@ -124,6 +126,7 @@ try {
     planHash: 'b'.repeat(64),
     executor: 'codex',
   };
+  const countBefore = (db.prepare('SELECT COUNT(*) AS c FROM messages').get() as { c: number }).c;
   const coordinationResponse = await fetch(
     'http://127.0.0.1:' + port + '/api/contacts/room/room-host/messages',
     {
@@ -138,17 +141,14 @@ try {
       }),
     }
   );
-  assert.equal(coordinationResponse.status, 202);
-  const coordinationRound = await coordinationResponse.json() as any;
-  await new Promise((resolve) => setImmediate(resolve));
-  const coordinationRow = db.prepare('SELECT meta, idempotency_key FROM messages WHERE id = ?')
-    .get(coordinationRound.messageId) as any;
-  assert.deepEqual(JSON.parse(coordinationRow.meta).roomHost.coordination, coordination);
+  assert.equal(coordinationResponse.status, 410);
+  assert.match((await coordinationResponse.json() as any).error, /retired/);
   assert.equal(
-    coordinationRow.idempotency_key,
-    'coordination:' + coordination.taskPath + ':' + coordination.planHash,
+    (db.prepare('SELECT COUNT(*) AS c FROM messages').get() as { c: number }).c,
+    countBefore,
+    'retired coordination dispatch inserts nothing',
   );
-  assert.equal(trackedCalls, 2);
+  assert.equal(trackedCalls, 1, 'retired coordination dispatch wakes nothing');
 
   const verification = {
     kind: 'verification',
@@ -170,17 +170,8 @@ try {
       }),
     }
   );
-  assert.equal(verificationResponse.status, 202);
-  const verificationRound = await verificationResponse.json() as any;
-  await new Promise((resolve) => setImmediate(resolve));
-  const verificationRow = db.prepare('SELECT meta, idempotency_key FROM messages WHERE id = ?')
-    .get(verificationRound.messageId) as any;
-  assert.deepEqual(JSON.parse(verificationRow.meta).roomHost.coordination, verification);
-  assert.equal(
-    verificationRow.idempotency_key,
-    'verification:v1:' + verification.taskPath + ':' + verification.due,
-  );
-  assert.equal(trackedCalls, 3);
+  assert.equal(verificationResponse.status, 410);
+  assert.equal(trackedCalls, 1, 'retired verification dispatch wakes nothing');
 
   const mismatchedVerificationResponse = await fetch(
     'http://127.0.0.1:' + port + '/api/contacts/room/room-host/messages',
@@ -195,8 +186,8 @@ try {
       }),
     }
   );
-  assert.equal(mismatchedVerificationResponse.status, 400);
-  assert.equal(trackedCalls, 3, 'verification contract mismatch must fail before room dispatch');
+  assert.equal(mismatchedVerificationResponse.status, 410);
+  assert.equal(trackedCalls, 1, 'retired coordination kinds fail before room dispatch');
 
   const forgedCoordinationResponse = await fetch(
     'http://127.0.0.1:' + port + '/api/contacts/room/room-host/messages',
@@ -211,8 +202,8 @@ try {
       }),
     }
   );
-  assert.equal(forgedCoordinationResponse.status, 400);
-  assert.equal(trackedCalls, 3, 'invalid coordination meta must fail before room dispatch');
+  assert.equal(forgedCoordinationResponse.status, 410);
+  assert.equal(trackedCalls, 1, 'retired coordination kinds fail before room dispatch');
 
   const summaryResponse = await fetch(
     `http://127.0.0.1:${port}/api/contacts/room/room-host/messages`,
@@ -229,7 +220,34 @@ try {
   );
   assert.equal(summaryResponse.status, 201);
   assert.equal((await summaryResponse.json() as any).status, 'done');
-  assert.equal(trackedCalls, 3, 'summary must not open another room round');
+  assert.equal(trackedCalls, 1, 'summary must not open another room round');
+
+  // Workflow rooms: the whole host write entry is retired — even without a
+  // coordination field, a waking post is refused; only wake-free notes land.
+  db.prepare(
+    `INSERT INTO contacts (id, name, backend, kind, config)
+     VALUES ('wroom', '工作室', 'api', 'room', ?)`
+  ).run(JSON.stringify({ workflowEnabled: true, members: members.map((member) => member.id) }));
+  const wroomWake = await fetch(
+    `http://127.0.0.1:${port}/api/contacts/wroom/room-host/messages`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: '@all 旁路唤醒', targetIds: ['all'], idempotencyKey: 'wroom:bypass' }),
+    }
+  );
+  assert.equal(wroomWake.status, 410);
+  assert.equal(trackedCalls, 1, 'workflow-room bypass wakes nothing');
+  const wroomNote = await fetch(
+    `http://127.0.0.1:${port}/api/contacts/wroom/room-host/messages`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: '仅记录，不唤醒', trigger: false, idempotencyKey: 'wroom:note' }),
+    }
+  );
+  assert.equal(wroomNote.status, 201);
+  assert.equal(trackedCalls, 1, 'wake-free notes persist without a round');
 
   console.log('room host smoke: ok');
 } finally {

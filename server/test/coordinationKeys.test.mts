@@ -5,13 +5,13 @@ import {
   legacyExecutionDispatchKey,
   legacyVerificationDispatchKey,
   verificationDispatchKey,
-} from '../src/workers/coordinationKeys.js';
+} from '../src/jobs/coordinationKeys.js';
 import {
   coordinationMarkerDispatchKey,
   parseCoordinationMarker,
-} from '../src/workers/coordinationReceipt.js';
+} from '../src/jobs/coordinationReceipt.js';
 // @ts-expect-error 跨包导入 worker 的 ESM 实现，仅用于 parity 校验
-import * as triageCore from '../../worker/triage-core.mjs';
+import * as triageCore from '../../worker/triage/triage-core.mjs';
 
 const executionSamples = [
   {

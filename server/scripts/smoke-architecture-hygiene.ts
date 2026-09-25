@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DirectApiBackend } from '../dist/agents/directApi.js';
-import { chooseKeepFrom } from '../dist/agents/historyPolicy.js';
-import { parseRoomTargets, roomDirectlyMentions } from '../dist/agents/roomTargets.js';
-import { HeuristicTokenizer } from '../dist/agents/tokenEstimate.js';
-import { openDb } from '../dist/db.js';
+import { DirectApiBackend } from '../src/backends/directApi.js';
+import { chooseKeepFrom } from '../src/prompt/historyPolicy.js';
+import { parseRoomTargets, roomDirectlyMentions } from '../src/rooms/roomTargets.js';
+import { HeuristicTokenizer } from '../src/prompt/tokenEstimate.js';
+import { openDb } from '../src/platform/db.js';
 
 const tokenizer = new HeuristicTokenizer();
 assert.equal(tokenizer.estimate('你好ab'), 3);
@@ -39,15 +39,16 @@ const db = openDb(dbPath);
 
 try {
   db.prepare("INSERT INTO contacts (id, name, backend, kind, config) VALUES ('api-test', 'API', 'api', 'dm', '{}')").run();
+  // created_at 是 SQLite 的 UTC 文本；固定下来，本轮消息的上海时间戳（+8h）才能逐字断言。
   const insert = db.prepare(
-    `INSERT INTO messages (contact_id, sender, role, kind, content, status)
-     VALUES ('api-test', ?, ?, 'text', ?, 'done')`
+    `INSERT INTO messages (contact_id, sender, role, kind, content, status, created_at)
+     VALUES ('api-test', ?, ?, 'text', ?, 'done', ?)`
   );
-  insert.run('api-test', 'assistant', 'orphan assistant');
-  insert.run('user', 'user', 'first');
-  insert.run('user', 'user', 'second');
-  insert.run('api-test', 'assistant', 'answer');
-  const current = insert.run('user', 'user', 'persisted current');
+  insert.run('api-test', 'assistant', 'orphan assistant', '2026-07-26 10:50:00');
+  insert.run('user', 'user', 'first', '2026-07-26 10:51:00');
+  insert.run('user', 'user', 'second', '2026-07-26 10:52:00');
+  insert.run('api-test', 'assistant', 'answer', '2026-07-26 10:53:00');
+  const current = insert.run('user', 'user', 'persisted current', '2026-07-26 10:54:00');
 
   const backend = new DirectApiBackend({
     provider: 'openai-compat',
@@ -70,7 +71,11 @@ try {
   });
   const history = (backend as any).history('injected current', Number(current.lastInsertRowid));
   assert.equal(history.messages[0].role, 'user', 'history cannot start with assistant');
-  assert.equal(history.messages.at(-1).content, 'injected current', 'current turn uses injected text');
+  // 私聊本轮用注入后的文本顶替已落库的那条，并标成带时间的本轮新消息
+  // （backends/directApi/base.ts history → memory/inject.ts timestampedMessage）。
+  assert.equal(history.messages.at(-1).content, '[2026-07-26 周日 18:54 CST｜本轮新消息] injected current',
+    'current turn uses injected text, stamped as this turn\'s new message');
+  assert(!JSON.stringify(history.messages).includes('persisted current'), 'persisted copy of the current turn is dropped');
   assert(history.messages.some((message: any) => message.role === 'user' && message.content.includes('first')),
     'adjacent user rows remain represented after merge');
 

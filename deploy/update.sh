@@ -11,6 +11,19 @@ cd "$repo"
 
 echo "== deploy start $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
 
+# 每个 start 标记都必须配一个终止标记：网关靠「最后一个 start 后面有没有 ok/fail」
+# 判断部署还在不在跑（routes/system.ts deployLogRunning），没有终止标记就会一直当作
+# 在跑，会议室 drain 跟着卡到 30 分钟 stale 阈值才自己松开。2026-09-16 实测：工作区脏
+# 被拒的早退路径没写标记，房间派发被白白 drain 了一轮。
+terminator_written=0
+on_exit() {
+  local code=$?
+  if [[ "$terminator_written" != 1 && $code -ne 0 ]]; then
+    echo "== deploy fail (aborted before rollout, exit $code) ==" >&2
+  fi
+}
+trap on_exit EXIT
+
 dirty="$(git status --porcelain --untracked-files=all)"
 if [[ -n "$dirty" ]]; then
   echo "Refusing to deploy: $repo has uncommitted changes." >&2
@@ -155,6 +168,7 @@ if ! { build_and_restart && wait_healthy; }; then
   else
     echo "== deploy fail (rollback ALSO unhealthy — manual intervention needed) ==" >&2
   fi
+  terminator_written=1
   exit 1
 fi
 
@@ -162,9 +176,41 @@ dirty="$(git status --porcelain --untracked-files=all)"
 if [[ -n "$dirty" ]]; then
   echo "Deploy completed, but the checkout became dirty:" >&2
   printf '%s\n' "$dirty" >&2
+  # 已经上线了，只是检出变脏：单独给一个终止标记，别让 trap 报成「上线前中止」。
+  echo "== deploy fail (rolled out, but checkout became dirty) ==" >&2
+  terminator_written=1
   exit 1
 fi
 
 git status -sb
 write_deploy_receipt
+terminator_written=1
 echo "== deploy ok $(git rev-parse --short HEAD) $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
+
+# W2: roll the vps-dev worker release forward to the deployed SHA.
+# Switching-moment guarantees (no suicidal restart):
+#   1. The deploy receipt above and the "== deploy ok ==" line are written
+#      BEFORE this step, so deferral/failure here never blocks deploy evidence.
+#   2. The installer checks for live worker children BEFORE flipping the
+#      `current` symlink; with a child running (normally the deploy closure
+#      job itself) it records a pending-release and exits 0 without restarting.
+#   3. This call never passes --force, so the closure job survives to upload
+#      its own receipt to the gateway.
+#   4. A restart happens only when zero children exist — either right here
+#      (idle worker) or later via ai-dev-worker-release.timer
+#      (`install-vps-worker.sh --retry-pending`), i.e. strictly after the
+#      closure job's receipt round-trip.
+# A failure here never fails the deploy (it is already ok); it only prints a
+# manual retry. Skip entirely with AI_HUB_SKIP_VPS_WORKER_FOLLOWUP=1.
+if [ "${AI_HUB_SKIP_VPS_WORKER_FOLLOWUP:-}" != "1" ]; then
+  installer_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" >/dev/null 2>&1 && pwd)"
+  installer="${AI_HUB_INSTALL_VPS_WORKER:-$installer_dir/install-vps-worker.sh}"
+  if [ -f "$installer" ]; then
+    deployed_sha="$(git rev-parse HEAD)"
+    if ! bash "$installer" "$deployed_sha"; then
+      echo "vps worker release follow-up failed for $deployed_sha; deploy itself is ok — retry manually: sudo bash $installer $deployed_sha" >&2
+    fi
+  else
+    echo "vps worker release follow-up skipped: installer not found at $installer" >&2
+  fi
+fi

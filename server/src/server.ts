@@ -1,59 +1,50 @@
 import express, { type Express } from 'express';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { type AgentManager } from './agents/manager.js';
+import {
+  type AgentManager,
+  contactModelRouter,
+  messagesRouter,
+  createRoomTaskDispatcher,
+} from './runtime/index.js';
 import {
   coordinationRoomHealth,
-  dispatchCoordinationRoomHost,
   updateCoordinationRoomReceipt,
-} from './agents/coordinationRoom.js';
-import { AffectRepo } from './agents/affect.js';
-import { LifeEventRepo } from './agents/lifeEvents.js';
-import { type DbBackup } from './backup.js';
-import { CaptionService } from './captionService.js';
-import { type HubConfig } from './config.js';
-import { type Db, type ContactRow, type JobRow, type MessageRow } from './db.js';
-import { logMessage, type HubLogger } from './logger.js';
-import { sessionAuth } from './middleware/auth.js';
-import { localCors } from './middleware/cors.js';
-import { type VaultClient } from './memory/vaultClient.js';
-import { type SoftDeletePurge } from './purge.js';
-import { type ClaudeQuotaPoller } from './quota/claudeQuota.js';
-import { type CodexQuotaPoller } from './quota/codexQuota.js';
-import { type GrokQuotaPoller } from './quota/grokQuota.js';
-import { attachmentsRouter } from './routes/attachments.js';
-import { appReleaseRouter } from './routes/appRelease.js';
-import { contactsRouter } from './routes/contacts.js';
-import { hubMcpRouter } from './routes/hubMcp.js';
-import { journalRouter } from './routes/journal.js';
-import { messagesRouter } from './routes/messages.js';
-import { deployControlRouter, systemRouter } from './routes/system.js';
-import { userRouter } from './routes/user.js';
-import { vaultTasksRouter } from './routes/vaultTasks.js';
-import { workersRouter } from './routes/workers.js';
-import { type SseHub } from './sse.js';
-import { taskPathFromOptions } from './tasks/invariants.js';
-import { TaskStateService } from './tasks/taskStateService.js';
-import { type JobStore } from './workers/jobStore.js';
-import { deriveDeliverySummary } from './workers/deliveryStatus.js';
-import { coordinationMarkerDispatchKey, formatCoordinationReceipt, parseCoordinationMarker } from './workers/coordinationReceipt.js';
-import { formatWorkerReceiptPreview } from './workers/receiptPreview.js';
-import { deliveryMeta, structuredReceiptFields } from './workers/receiptFields.js';
+  readWorkflowPools,
+} from './workflow/index.js';
+import { LifeEventRepo } from './companion/index.js';
 import {
-  ensureAutomaticReviewJob,
-  isHarnessAutoReview,
-  isWaitingReviewGate,
-  ReviewBatchCoordinator,
-} from './workers/reviewAutomation.js';
-import { ensureAutomaticClosureJob } from './workers/closureAutomation.js';
-import type { WechatChannel } from './wechat/channel.js';
-import type { CompanionHeartbeat } from './agents/companionHeartbeat.js';
-import type { CameraSnapBroker } from './workers/cameraSnap.js';
-import type { TaobaoBridge } from './workers/taobaoBridge.js';
-import { heartbeatRouter } from './routes/heartbeat.js';
-import { ledgerRouter } from './routes/ledger.js';
-import { LedgerSummaryService } from './ledger/summary.js';
+  type DbBackup,
+  type SoftDeletePurge,
+  appReleaseRouter,
+  deployControlRouter,
+  systemRouter,
+} from './ops/index.js';
+import { CaptionService, attachmentsRouter, journalRouter } from './messages/index.js';
+import {
+  type HubConfig,
+  type Db,
+  logMessage,
+  type HubLogger,
+  sessionAuth,
+  localCors,
+  type SseHub,
+} from './platform/index.js';
+import type { VaultClient } from './memory/index.js';
+import type { ClaudeQuotaPoller, CodexQuotaPoller, GrokQuotaPoller } from './quota/index.js';
+import { contactsRouter, userRouter } from './contacts/index.js';
+import { hubMcpRouter } from './tools/index.js';
+import {
+  roomTasksRouter,
+  RoomTaskStore,
+  readVaultTaskFile,
+  type RoomTaskStoreOptions,
+} from './roomTasks/index.js';
+import { vaultTasksRouter } from './tasks/index.js';
+import { workersRouter, workflowModulesRouter, type JobStore, deriveDeliverySummary } from './jobs/index.js';
+import type { WechatChannel } from './wechat/index.js';
+import { type CompanionHeartbeat, heartbeatRouter } from './heartbeat/index.js';
+import type { CameraSnapBroker, TaobaoBridge } from './devices/index.js';
 
 export interface ServerDependencies {
   config: HubConfig;
@@ -74,364 +65,91 @@ export interface ServerDependencies {
   wechatChannel?: Pick<WechatChannel, 'status'>;
   hubToken?: string;
   corsOrigins?: string;
-  ledgerSummary?: LedgerSummaryService;
+  /** Room task dispatcher + store options built once by the gateway root; tests may omit it. */
+  roomTasks?: ReturnType<typeof roomTaskPlumbing>;
+}
+
+/** Shared task-ledger plumbing: dispatcher + Vault-backed store options. */
+export function roomTaskPlumbing(
+  db: Db,
+  sse: SseHub,
+  manager: AgentManager,
+  tasksDir: string | null,
+  projectTargets?: RoomTaskStoreOptions['projectTargets'],
+): { taskDispatcher: ReturnType<typeof createRoomTaskDispatcher>; taskStoreOptions: Pick<RoomTaskStoreOptions, 'readVaultTask' | 'projectTargets'> } {
+  return {
+    taskDispatcher: createRoomTaskDispatcher({ db, sse, manager }),
+    taskStoreOptions: {
+      readVaultTask: (taskPath: string) => readVaultTaskFile(tasksDir, taskPath),
+      ...(projectTargets ? { projectTargets } : {}),
+    },
+  };
 }
 
 export function attachWorkerCompletion(deps: ServerDependencies): void {
-  const { config, db, jobStore, logger, manager, sse, vault } = deps;
+  const { config, db, jobStore, logger, manager, sse } = deps;
   const tasksDir = config?.memory?.repoPath ? path.join(config.memory.repoPath, 'tasks') : null;
-  const taskState = new TaskStateService(db);
-  const reviewBatch = new ReviewBatchCoordinator(
-    { db, sse, manager, logger },
-    config?.reviewBatch,
-  );
-  reviewBatch.start();
+  // Model-driven workflow: completion folds task-ledger jobs into their task
+  // and notifies ONLY the explicitly registered return callback. Legacy jobs
+  // keep their stored result plus an in-place receipt state update — zero new
+  // wakes, zero inferred next stages/recipients. The automatic
+  // review/rework/closure chain and the review batcher are retired (see
+  // docs/model-driven-room-workflow.md); worker-tail auto-projection is
+  // retired with them (explicit task_import + task_get replace it).
+  const { taskDispatcher, taskStoreOptions } = deps.roomTasks
+    ?? roomTaskPlumbing(db, sse, manager, tasksDir, config?.projectTargets);
 
-  const workerTailNote = (job: JobRow): string => {
-    const meta = deliveryMeta(job);
-    const receipt = structuredReceiptFields(job);
-    const files = Array.isArray(meta.dirtyFiles) && meta.dirtyFiles.length
-      ? meta.dirtyFiles.map((file) => `- \`${file}\``).join('\n')
-      : '- （工作区干净；存在尚未推送的 commit）';
-    const note = [
-      `Worker job：\`${job.id}\``,
-      `交付状态：\`${job.delivery_state}\``,
-      `workspace：\`${job.workspace}\``,
-      `branch：\`${receipt.branch ?? '未报告'}\``,
-      receipt.head ? `HEAD：\`${receipt.head}\`${typeof meta.ahead === 'number' ? `（领先 upstream ${meta.ahead}）` : ''}` : '',
-      '', '### 本地状态', files, '', '### 原始需求', job.prompt.slice(0, 6000), '', '### Worker 回执',
-      (job.result || job.error || '（无输出）').slice(0, 8000), '', '### 下一步',
-      '从现有工作区续接，核对改动后完成剩余验证；验证通过再只提交本任务文件并 push。禁止从头派单覆盖本地改动。',
-    ].filter((line) => line !== '').join('\n');
-    return note;
-  };
+  // (Retired helpers removed: ensureLegacyWorkerTail, annotateParentTask,
+  // closeLegacyWorkerTail, syncWorkerTail, dispatchRoomReceipt,
+  // dispatchCoordinationReceipt, dispatchDegradedDmReceipt. History rows stay;
+  // no new automatic wakes are produced.)
 
-  const taskFileExists = (taskPath: string): boolean => {
-    if (!tasksDir || !/^tasks\/[a-z0-9][a-z0-9-]*\.md$/.test(taskPath)) return false;
-    return fs.existsSync(path.join(tasksDir, taskPath.slice('tasks/'.length)));
-  };
-
-  const ensureLegacyWorkerTail = async (job: JobRow): Promise<void> => {
-    if (!vault) return;
-    const taskPath = `tasks/worker-tail-${job.id}.md`;
-    const note = workerTailNote(job);
-    const source = job.requested_by || 'codex';
-    try {
-      await vault.call('read_file', { path: taskPath }, 0);
-      await vault.write('update_task', { path: taskPath, status: 'open', note, source });
-      logger.info({ component: 'jobs', taskPath, jobId: job.id }, 'worker tail refreshed');
-    } catch {
-      const outcome = await vault.write('add_task', {
-        slug: `worker-tail-${job.id}`,
-        title: `Worker 未完成交付 ${job.id.slice(0, 8)}`,
-        due: '', content: note,
-        tags: ['backlog', 'worker-tail', path.basename(job.workspace).toLowerCase()], source,
-      });
-      logger.info({ component: 'jobs', taskPath, jobId: job.id, outcome }, 'worker tail registered');
-    }
-  };
-
-  const annotateParentTask = (job: JobRow, taskPath: string): void => {
-    if (!tasksDir) return;
-    const note = workerTailNote(job);
-    const source = job.requested_by || 'codex';
-    const meta = deliveryMeta(job);
-    const receipt = structuredReceiptFields(job);
-    const result = db.transaction(() => {
-      const current = taskState.refreshTask(tasksDir, taskPath);
-      const transition = taskState.annotate({
-        commandId: crypto.randomUUID(),
-        idempotencyKey: `worker-tail-parent:${job.id}:${job.delivery_state}`,
-        taskId: current.taskId,
-        expectedVersion: current.version,
-        actor: source,
-        source: 'worker-tail-projection',
-        reason: `Worker job ${job.id} stopped at ${job.delivery_state}`,
-        evidence: {
-          ahead: meta.ahead ?? null,
-          deliveryState: job.delivery_state,
-          dirtyFiles: meta.dirtyFiles ?? [],
-          branch: receipt.branch,
-          head: receipt.head,
-          jobId: job.id,
-          nextAction: 'continue existing workspace and finish validation before push',
-          workspace: job.workspace,
-        },
-        projection: { path: taskPath, note, source },
-      });
-      if (transition.result !== 'applied') {
-        throw new Error(`parent task annotation rejected: ${transition.error ?? 'unknown'}`);
-      }
-      return transition;
-    })();
-    logger.info({
-      component: 'jobs',
-      eventId: result.eventId,
-      jobId: job.id,
-      replayed: result.replayed,
-      taskPath,
-    }, 'worker delivery blocker projected to parent task');
-  };
-
-  const closeLegacyWorkerTail = (job: JobRow): void => {
-    if (!tasksDir) return;
-    const taskPath = `tasks/worker-tail-${job.id}.md`;
-    if (!taskFileExists(taskPath)) return;
-    const source = job.requested_by || 'codex';
-    const note = [
-      `Worker job \`${job.id}\` 已恢复完成。`,
-      `终态：\`${job.status}\` / \`${job.delivery_state}\`。`,
-      (job.result || '交付已由现有 job 回执确认。').slice(0, 4000),
-    ].join('\n');
-    const result = db.transaction(() => {
-      const current = taskState.refreshTask(tasksDir, taskPath);
-      if (current.status !== 'open') return null;
-      const transition = taskState.transition({
-        commandId: crypto.randomUUID(),
-        idempotencyKey: `worker-tail-close:${job.id}`,
-        taskId: current.taskId,
-        expectedVersion: current.version,
-        toStatus: 'done',
-        actor: source,
-        source: 'worker-tail-projection',
-        reason: `Worker job ${job.id} reached ${job.status}/${job.delivery_state}`,
-        evidence: {
-          deliveryState: job.delivery_state,
-          jobId: job.id,
-          status: job.status,
-        },
-        projection: { path: taskPath, note, source },
-      });
-      if (transition.result !== 'applied') {
-        throw new Error(`worker tail close rejected: ${transition.error ?? 'unknown'}`);
-      }
-      return transition;
-    })();
-    if (!result) return;
-    logger.info({
-      component: 'jobs',
-      eventId: result.eventId,
-      jobId: job.id,
-      replayed: result.replayed,
-      taskPath,
-    }, 'worker tail close projected');
-  };
-
-  const syncWorkerTail = async (job: JobRow): Promise<void> => {
-    if (!vault) return;
-    if (isWaitingReviewGate(job)) return;
-    if (job.status === 'done' && ['delivered', 'delivered_out_of_band'].includes(job.delivery_state ?? '')) {
-      closeLegacyWorkerTail(job);
-      return;
-    }
-    if (!['blocked_local_changes', 'blocked_unpushed'].includes(job.delivery_state ?? '')) return;
-    const parentTaskPath = taskPathFromOptions(job.options);
-    if (tasksDir && parentTaskPath && taskFileExists(parentTaskPath)) {
-      annotateParentTask(job, parentTaskPath);
-      return;
-    }
-    await ensureLegacyWorkerTail(job);
-  };
-
-  const dispatchRoomReceipt = (
-    job: JobRow,
-    input: Parameters<typeof dispatchCoordinationRoomHost>[1],
-    allowPool: boolean,
-  ) => allowPool && (isWaitingReviewGate(job) || isHarnessAutoReview(job))
-    ? reviewBatch.dispatchReceipt(job, input)
-    : dispatchCoordinationRoomHost({ db, sse, manager, logger }, input);
-
-  const dispatchCoordinationReceipt = (
-    job: JobRow,
-    allowPool: boolean,
-  ): 'sent' | 'unavailable' | 'not-coordination' => {
-    const marker = parseCoordinationMarker(job.prompt);
-    if (!marker) return 'not-coordination';
-    const dispatchKey = coordinationMarkerDispatchKey(marker);
-    const text = formatCoordinationReceipt(job, marker);
-    const outcome = dispatchRoomReceipt(job, {
-      content: text,
-      kind: 'receipt',
-      exactDispatchKey: dispatchKey,
-      idempotencyKey: `receipt:v1:${job.id}`,
-      meta: {
-        receipt: {
-          jobId: job.id,
-          requestedBy: job.requested_by,
-          status: job.status,
-          deliveryState: job.delivery_state ?? 'unknown',
-        },
-        coordination: {
-          jobId: job.id,
-          taskPath: marker.taskPath,
-          planHash: marker.planHash,
-          originAnchorId: job.origin_anchor_id,
-        },
-      },
-    }, allowPool);
-    if (outcome.status === 'unavailable') {
-      logger.warn({ component: 'jobs', jobId: job.id, reason: outcome.reason }, 'coordination receipt room unavailable');
-      return 'unavailable';
-    }
-    return 'sent';
-  };
-
-  /** 末次尝试的可见降级：DM 落一条回执。以 meta.jobId 幂等，重启后重放不重复气泡。 */
-  const dispatchDegradedDmReceipt = (job: JobRow): void => {
-    const contact = db.prepare("SELECT * FROM contacts WHERE id = ? AND enabled = 1 AND kind = 'dm'").get(job.requested_by) as ContactRow | undefined;
-    if (!contact) {
-      logger.error({ component: 'jobs', jobId: job.id, requestedBy: job.requested_by }, 'worker receipt dead-end: no room and no DM contact');
-      return;
-    }
-    const existing = db.prepare(
-      `SELECT id FROM messages
-       WHERE contact_id = ? AND json_extract(meta, '$.event') = 'worker-receipt'
-         AND json_extract(meta, '$.jobId') = ?
-       ORDER BY id DESC LIMIT 1`
-    ).get(contact.id, job.id);
-    if (existing) return;
-    const text = `【降级投递：会议室不可用】\n${formatWorkerReceiptPreview(job)}`;
-    const result = db.prepare(`INSERT INTO messages (contact_id, sender, role, kind, content, status, meta, origin) VALUES (?, 'system', 'user', 'text', ?, 'done', ?, 'main')`).run(contact.id, text, JSON.stringify({
-      event: 'worker-receipt',
-      jobId: job.id,
-      status: job.status,
-      deliveryState: job.delivery_state ?? 'unknown',
-      degradedDelivery: true,
-    }));
-    const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(Number(result.lastInsertRowid)) as MessageRow;
-    sse.broadcast('message', row);
-    if (manager.get(contact).enqueue({ userMessageId: row.id, text }) === 'full') {
-      logger.warn({ component: 'jobs', contactId: contact.id, jobId: job.id }, 'receipt persisted but continuation queue is full');
-    }
-  };
-
-  // Durable outbox 驱动：抛错 = 可重试（指数退避），finalAttempt 时改走可见降级，
-  // 处理器把仍然失败的行转 dead（outboxCounts 可观测）。回执幂等键保证整个
-  // 重试/重启链路上恰好一条用户可见回执。
+  // Durable outbox 驱动：抛错 = 可重试（指数退避），finalAttempt 时只记事件，
+  // 处理器把仍然失败的行转 dead（outboxCounts 可观测）。任务回调与回执更新
+  // 都是幂等的，整个重试/重启链路上恰好一次可见投递、零推断动作。
   jobStore.onFinished = async (job, ctx) => {
-    if (!ctx.meta.reviewDone) {
-      try {
-        const review = ensureAutomaticReviewJob(jobStore, job);
-        if (review.status !== 'not-eligible') {
-          ctx.setMeta({
-            reviewDone: true,
-            ...(review.job ? { reviewJobId: review.job.id } : {}),
-          });
-        }
-        if (review.status === 'created') {
-          logger.info({
-            component: 'jobs',
-            parentJobId: job.id,
-            reviewJobId: review.job?.id,
-          }, 'automatic review job created');
-        }
-      } catch (error) {
-        logger.error({ component: 'jobs', jobId: job.id, err: error }, 'automatic review creation failed');
-        if (!ctx.finalAttempt) throw error;
-        ctx.setMeta({
-          reviewDone: true,
-          reviewCreationFailed: true,
-          reviewError: (error instanceof Error ? error.message : String(error)).slice(0, 500),
-        });
-      }
-    }
-    if (!ctx.meta.closureDone) {
-      try {
-        const closure = ensureAutomaticClosureJob(jobStore, job);
-        if (closure.status !== 'not-eligible') {
-          ctx.setMeta({
-            closureDone: true,
-            closureStatus: closure.status,
-            ...(closure.kind ? { closureKind: closure.kind } : {}),
-            ...(closure.job ? { closureJobId: closure.job.id } : {}),
-            ...(closure.reason ? { closureReason: closure.reason.slice(0, 500) } : {}),
-          });
-        }
-        if (closure.status === 'created') {
-          logger.info({
-            component: 'jobs',
-            sourceJobId: job.id,
-            closureJobId: closure.job?.id,
-            closureKind: closure.kind,
-          }, 'automatic closure job created');
-        } else if (closure.status === 'rejected') {
-          logger.info({
-            component: 'jobs',
-            sourceJobId: job.id,
-            closureKind: closure.kind,
-            reason: closure.reason,
-          }, 'automatic closure gate rejected terminal job');
-        }
-      } catch (error) {
-        logger.error({ component: 'jobs', jobId: job.id, err: error }, 'automatic closure creation failed');
-        if (!ctx.finalAttempt) throw error;
-        ctx.setMeta({
-          closureDone: true,
-          closureStatus: 'failed',
-          closureError: (error instanceof Error ? error.message : String(error)).slice(0, 500),
-        });
-      }
-    }
-    if (!ctx.meta.tailDone) {
-      try {
-        await syncWorkerTail(job);
-        ctx.setMeta({ tailDone: true });
-      } catch (error) {
-        logger.error({ component: 'jobs', jobId: job.id, err: error }, 'worker tail projection failed');
-        // vault / Controller 恢复后重试；末次尝试放行，让回执仍然送达。
-        if (!ctx.finalAttempt) throw error;
-      }
-    }
-    const receiptUpdate = updateCoordinationRoomReceipt({ db, sse }, {
-      idempotencyKey: `receipt:v1:${job.id}`,
-      status: job.status,
-      deliveryState: job.delivery_state ?? 'unknown',
-      summary: deriveDeliverySummary(job).summary,
-    });
-    if (receiptUpdate.status === 'updated') {
-      logger.info({ component: 'jobs', jobId: job.id, messageId: receiptUpdate.messageId }, 'worker receipt state updated');
+    // Model-driven ledger path first: fold the receipt into the task and
+    // notify ONLY the explicitly registered return callback. Never creates
+    // jobs/handoffs; infra failures and stale attempts produce ledger events
+    // and retries, not new work.
+    try {
+      const tasks = new RoomTaskStore(db, jobStore, taskDispatcher, taskStoreOptions);
+      if (tasks.handleJobFinished(job, { finalAttempt: ctx.finalAttempt }).handled) return;
+    } catch (error) {
+      logger.error({ component: 'jobs', jobId: job.id, err: error }, 'room task finish fold failed');
+      if (!ctx.finalAttempt) throw error;
       return;
     }
-    const allowPool = ctx.meta.reviewCreationFailed !== true;
-    const coordinationOutcome = dispatchCoordinationReceipt(job, allowPool);
-    if (coordinationOutcome === 'sent') return;
-    if (coordinationOutcome === 'unavailable' && !ctx.finalAttempt) {
-      throw new Error('coordination room unavailable for receipt; will retry');
+    // Legacy path: preserve result storage in place, zero wakes. Fenced
+    // attempts get nothing (the takeover replacement owns notifications).
+    // No review/rework/closure jobs, no receipt dispatches, no DM fallback.
+    if (jobStore.workflowModules.isFenced(job.id)) return;
+    if (!ctx.meta.receiptUpdated) {
+      const receiptUpdate = updateCoordinationRoomReceipt({ db, sse }, {
+        idempotencyKey: `receipt:v1:${job.id}`,
+        status: job.status,
+        deliveryState: job.delivery_state ?? 'unknown',
+        summary: deriveDeliverySummary(job).summary,
+      });
+      if (receiptUpdate.status === 'updated') {
+        logger.info({ component: 'jobs', jobId: job.id, messageId: receiptUpdate.messageId }, 'worker receipt state updated');
+        ctx.setMeta({ receiptUpdated: true });
+      }
     }
-    if (!job.requested_by || job.requested_by === 'User') return;
-    const roomText = `@${job.requested_by} ${formatWorkerReceiptPreview(job)}`;
-    const roomOutcome = dispatchRoomReceipt(job, {
-      targetId: job.requested_by,
-      content: roomText,
-      kind: 'receipt',
-      idempotencyKey: `receipt:v1:${job.id}`,
-      meta: {
-        receipt: {
-          jobId: job.id,
-          requestedBy: job.requested_by,
-          status: job.status,
-          deliveryState: job.delivery_state ?? 'unknown',
-        },
-      },
-    }, allowPool);
-    if (roomOutcome.status !== 'unavailable') return;
-    if (!ctx.finalAttempt) {
-      throw new Error(`worker receipt room unavailable (${roomOutcome.reason ?? 'unknown'}); will retry`);
-    }
-    logger.warn({
-      component: 'jobs',
-      jobId: job.id,
-      requestedBy: job.requested_by,
-      reason: roomOutcome.reason,
-    }, 'worker receipt fell back to visible DM main');
-    dispatchDegradedDmReceipt(job);
   };
 }
 
 export function createServer(deps: ServerDependencies): Express {
   const { config, db, dbBackup, grokQuotaPoller, jobStore, manager, quotaPoller, codexQuotaPoller, softPurge, sse } = deps;
+  const workflowPools = () => readWorkflowPools(db, {
+    claude: () => quotaPoller.get(), codex: () => codexQuotaPoller.get(), grok: () => grokQuotaPoller.get(),
+  });
+  jobStore.setWorkflowPoolResolver((runner) => workflowPools()[`credential:${runner}`]?.reason ?? null);
   const captions = new CaptionService(db, config.uploadsDir, logMessage(deps.logger, 'caption'));
-  attachWorkerCompletion(deps);
+  const tasksDir = config?.memory?.repoPath ? path.join(config.memory.repoPath, 'tasks') : null;
+  const roomTasks = deps.roomTasks ?? roomTaskPlumbing(db, sse, manager, tasksDir, config?.projectTargets);
+  attachWorkerCompletion({ ...deps, roomTasks });
+  const { taskDispatcher, taskStoreOptions } = roomTasks;
   const app = express();
   app.use(localCors(deps.corsOrigins));
   app.use(express.json({ limit: '2mb' }));
@@ -453,9 +171,6 @@ export function createServer(deps: ServerDependencies): Express {
       ...(deps.wechatChannel ? { wechat: deps.wechatChannel.status() } : {}),
     });
   });
-  app.get('/api/system/affect', (_req, res) => {
-    res.json({ states: new AffectRepo(db).health() });
-  });
   app.get('/api/system/captions', (_req, res) => {
     res.json(captions.health());
   });
@@ -471,20 +186,21 @@ export function createServer(deps: ServerDependencies): Express {
   });
 
   app.use('/api/app', appReleaseRouter(config.releasesDir));
-  app.use('/api/contacts', contactsRouter(db, sse, manager, config, deps.logger));
+  app.use('/api/contacts', contactModelRouter(db, sse, manager, config, deps.logger));
+  app.use('/api/contacts', contactsRouter(db, sse, manager));
   app.use('/api/contacts', messagesRouter(db, sse, manager, config.uploadsDir, captions, jobStore));
   app.use('/api/contacts', heartbeatRouter(db, deps.heartbeat));
   app.use('/api/attachments', attachmentsRouter(db, config.uploadsDir));
-  const ledgerSummary = deps.ledgerSummary ?? new LedgerSummaryService(db, logMessage(deps.logger, 'ledger'));
-  app.use('/api/ledger', ledgerRouter(db, ledgerSummary));
   app.use('/api/user', userRouter(db, sse));
   app.use('/api', journalRouter(db));
   app.use('/api', workersRouter(db, sse, jobStore, deps.logger, deps.broker, deps.taobao));
+  app.use('/api', workflowModulesRouter(db, sse, jobStore, workflowPools, taskStoreOptions.projectTargets));
+  app.use('/api', roomTasksRouter(db, jobStore, { dispatcher: taskDispatcher, sse, ...taskStoreOptions }));
   app.use('/api', hubMcpRouter(db, jobStore, {
     hubToken: deps.hubToken,
     envMode: process.env.HUB_MCP_AUTH_MODE,
     logger: deps.logger,
-  }, { broker: deps.broker, heartbeat: deps.heartbeat, taobao: deps.taobao }));
+  }, { broker: deps.broker, heartbeat: deps.heartbeat, taobao: deps.taobao, taskDispatch: taskDispatcher, taskStoreOptions }));
   app.use('/api/vault', vaultTasksRouter({
     db,
     tasksDir: config.memory.repoPath ? path.join(config.memory.repoPath, 'tasks') : null,

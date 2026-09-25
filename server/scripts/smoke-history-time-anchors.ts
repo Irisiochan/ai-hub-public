@@ -5,10 +5,10 @@ import { fileURLToPath } from 'node:url';
 import {
   compactSummaryText,
   SUMMARY_FORMAT_MARKER,
-} from '../src/agents/conversationSummary.js';
-import { DirectApiBackend } from '../src/agents/directApi.js';
-import { roomTurnNotice } from '../src/agents/roomPrompt.js';
-import { openDb, type MessageRow } from '../src/db.js';
+} from '../src/prompt/conversationSummary.js';
+import { DirectApiBackend } from '../src/backends/directApi.js';
+import { roomTurnNotice } from '../src/rooms/roomPrompt.js';
+import { openDb, type MessageRow } from '../src/platform/db.js';
 import { shanghaiStamp } from '../src/memory/inject.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));

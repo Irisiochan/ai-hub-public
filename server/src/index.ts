@@ -1,29 +1,26 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { cleanupOrphanUploads } from './attachments.js';
-import { auditRoomOrchestratorConfigs } from './agents/coordinationRoom.js';
-import { AgentManager } from './agents/manager.js';
-import { DbBackup } from './backup.js';
-import { loadConfig } from './config.js';
-import { openDb } from './db.js';
-import { createLogger, logMessage } from './logger.js';
-import { VaultClient } from './memory/vaultClient.js';
-import { SoftDeletePurge } from './purge.js';
-import { ClaudeQuotaPoller } from './quota/claudeQuota.js';
-import { CodexQuotaPoller } from './quota/codexQuota.js';
-import { GrokQuotaPoller } from './quota/grokQuota.js';
-import { ensureCodexContact, ensureGrokContact, ensureMuseContact, seedIfEmpty } from './seed.js';
-import { createServer } from './server.js';
-import { SseHub } from './sse.js';
-import { VaultTaskProjection } from './tasks/vaultProjection.js';
-import { JobStore } from './workers/jobStore.js';
-import { DeployReceiptPoller } from './workers/deployReceipt.js';
-import { loadWechatChannelConfig } from './wechat/config.js';
-import { WechatChannel } from './wechat/channel.js';
-import { CameraSnapBroker } from './workers/cameraSnap.js';
-import { TaobaoBridge } from './workers/taobaoBridge.js';
-import { CompanionHeartbeat } from './agents/companionHeartbeat.js';
-import { LedgerSummaryService } from './ledger/summary.js';
+import { cleanupOrphanUploads } from './messages/index.js';
+import { auditRoomOrchestratorConfigs, ensureWorkflowRoomReserves } from './workflow/index.js';
+import { AgentManager, type AgentDeps } from './runtime/index.js';
+import { DbBackup, SoftDeletePurge } from './ops/index.js';
+import {
+  loadConfig,
+  resolveListenHosts,
+  openDb,
+  createLogger,
+  logMessage,
+  SseHub,
+} from './platform/index.js';
+import { VaultClient } from './memory/index.js';
+import { ClaudeQuotaPoller, CodexQuotaPoller, GrokQuotaPoller } from './quota/index.js';
+import { ensureCodexContact, ensureGrokContact, ensureMuseContact, ensureOpencodeDelegationRunner, ensureRoomOrchestratorCove, seedIfEmpty } from './contacts/index.js';
+import { createServer, roomTaskPlumbing } from './server.js';
+import { VaultTaskProjection } from './tasks/index.js';
+import { JobStore, DeployReceiptPoller } from './jobs/index.js';
+import { loadWechatChannelConfig, WechatChannel } from './wechat/index.js';
+import { CameraSnapBroker, TaobaoBridge } from './devices/index.js';
+import { CompanionHeartbeat } from './heartbeat/index.js';
 
 const logger = createLogger();
 const config = loadConfig();
@@ -32,6 +29,9 @@ seedIfEmpty(db, config, logger);
 ensureCodexContact(db, config, logger);
 ensureGrokContact(db, config, logger);
 ensureMuseContact(db, config, logger);
+ensureOpencodeDelegationRunner(db, logger);
+ensureRoomOrchestratorCove(db, logger);
+ensureWorkflowRoomReserves(db, logger);
 const orphanUploads = cleanupOrphanUploads(db, config.uploadsDir);
 if (orphanUploads > 0) logger.info({ component: 'uploads', count: orphanUploads }, 'orphan uploads cleaned');
 for (const issue of auditRoomOrchestratorConfigs(db)) {
@@ -52,7 +52,19 @@ const deployReceipts = new DeployReceiptPoller(
 );
 const broker = new CameraSnapBroker(logger);
 const taobao = new TaobaoBridge(logger);
-const manager = new AgentManager({ db, sse, config, vault, jobStore, broker, taobao, logger });
+const managerDeps: AgentDeps = { db, sse, config, vault, jobStore, broker, taobao, logger,
+  workflowPoolBlocked: (runner: string) => jobStore.workflowPoolBlocker(runner) };
+const manager = new AgentManager(managerDeps);
+// Model-driven task transport (native + MCP tools deliver through this). The
+// dispatcher wakes contacts through the manager, so it is built after it; one
+// instance is shared by the runtimes (read at turn time) and the HTTP layer.
+const roomTasks = roomTaskPlumbing(
+  db, sse, manager,
+  config.memory.repoPath ? path.join(config.memory.repoPath, 'tasks') : null,
+  config.projectTargets,
+);
+managerDeps.taskDispatch = roomTasks.taskDispatcher;
+managerDeps.taskStoreOptions = roomTasks.taskStoreOptions;
 const heartbeat = new CompanionHeartbeat({ db, sse, manager, broker, taobao, config, logger });
 manager.attachHeartbeat(heartbeat);
 const wechatChannel = new WechatChannel({
@@ -75,7 +87,6 @@ const grokQuotaPoller = new GrokQuotaPoller(
   (message, fields) => logger.warn({ component: 'quota.grok', ...fields }, message),
 );
 
-const ledgerSummary = new LedgerSummaryService(db, logMessage(logger, 'ledger'));
 const app = createServer({
   config,
   db,
@@ -95,7 +106,7 @@ const app = createServer({
   wechatChannel,
   hubToken: process.env.HUB_TOKEN,
   corsOrigins: process.env.HUB_CORS_ORIGINS,
-  ledgerSummary,
+  roomTasks,
 });
 const recoveredRoomDispatches = manager.recoverDeferredRoomDispatches();
 if (recoveredRoomDispatches > 0) {
@@ -107,28 +118,47 @@ if (recoveredRoomDispatches > 0) {
 
 dbBackup.start();
 softPurge.start();
-ledgerSummary.start();
 quotaPoller.start();
 codexQuotaPoller.start();
 grokQuotaPoller.start();
 deployReceipts.start();
 heartbeat.start();
 taskProjection?.start();
-jobStore.startOutOfBandResolver();
+// Retired: the blocked-job out-of-band auto-resolver (mechanical state
+// decisions every 30s). Explicit reconcile/resolve routes stay available;
+// the sweep remains callable as a pure explicit verifier.
 const outboxBackfilled = jobStore.startOutboxProcessor();
 if (outboxBackfilled > 0) {
   logger.info({ component: 'jobs', backfilled: outboxBackfilled }, 'job outbox backfilled terminal jobs missing receipts');
 }
 
-const server = app.listen(config.port, config.host, () => {
+// Bind every resolved address (primary + auto loopback + configured extras).
+// The first one owns startup side effects; the rest are additional doors to
+// the same app, so a same-host client never needs the tailnet address.
+const listenHosts = resolveListenHosts(config);
+const [primaryHost, ...secondaryHosts] = listenHosts;
+const server = app.listen(config.port, primaryHost, () => {
   wechatChannel.start();
   logger.info({
     component: 'gateway',
-    host: config.host,
+    host: primaryHost,
+    hosts: listenHosts,
     port: config.port,
     dbPath: config.dbPath,
     webDist: fs.existsSync(config.webDist) ? config.webDist : null,
   }, 'ai-hub gateway listening');
+});
+const secondaryServers = secondaryHosts.map((host) => {
+  const extra = app.listen(config.port, host, () => {
+    logger.info({ component: 'gateway', host, port: config.port }, 'ai-hub gateway extra listener');
+  });
+  // A dead secondary must never take the gateway down: the primary address is
+  // the contract, extras are convenience (e.g. loopback on a box where ::1 or
+  // the tailnet IP is momentarily unavailable at boot).
+  extra.on('error', (err) => {
+    logger.error({ component: 'gateway', host, port: config.port, err }, 'ai-hub gateway extra listener failed');
+  });
+  return extra;
 });
 
 let shuttingDown = false;
@@ -137,6 +167,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   logger.info({ component: 'gateway', signal }, 'graceful shutdown started');
   server.close();
+  for (const extra of secondaryServers) extra.close();
   const wechatStop = wechatChannel.stop();
   heartbeat.stop();
   await manager.stopAll(signal === 'SIGTERM' ? 'deploy-restart' : 'claude-error');
@@ -144,12 +175,10 @@ async function shutdown(signal: string): Promise<void> {
   sse.close();
   dbBackup.stop();
   softPurge.stop();
-  ledgerSummary.stop();
   codexQuotaPoller.stop();
   grokQuotaPoller.stop();
   deployReceipts.stop();
   taskProjection?.stop();
-  jobStore.stopOutOfBandResolver();
   jobStore.stopOutboxProcessor();
   await vault?.close();
   db.close();

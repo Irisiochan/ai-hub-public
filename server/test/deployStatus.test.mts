@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { deployLogRunning } from '../src/routes/system.js';
+import { deployLogRunning } from '../src/ops/systemRoutes.js';
 
 const now = Date.parse('2026-08-02T03:16:00Z');
 const start = '== deploy start 2026-08-02T03:15:18Z ==';

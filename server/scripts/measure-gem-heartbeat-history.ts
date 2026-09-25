@@ -1,9 +1,9 @@
 import Database from 'better-sqlite3';
-import { gemHeartbeatHistory } from '../src/agents/gemHeartbeatHistory.js';
+import { gemHeartbeatHistory } from '../src/prompt/gemHeartbeatHistory.js';
 import { timestampedMessage } from '../src/memory/inject.js';
-import { historicalMessageText } from '../src/agents/sideChannel.js';
-import { estimateTokens } from '../src/agents/tokenEstimate.js';
-import type { MessageRow } from '../src/db.js';
+import { historicalMessageText } from '../src/messages/sideChannel.js';
+import { estimateTokens } from '../src/prompt/tokenEstimate.js';
+import type { MessageRow } from '../src/platform/db.js';
 
 // Reads only; no migration, summary update, provider call, camera or shopping action.
 const dbPath = process.argv[2];

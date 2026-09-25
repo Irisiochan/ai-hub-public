@@ -59,7 +59,13 @@ worker row used to ping-pong the gateway state and break the pause.
 The claim response carries protocol version `2` and the current delivery
 contract. The Worker inserts that server-provided text into the runner prompt;
 contract wording can therefore change without a PC Worker restart. Runner
-permission flags are generated from the table in `runner.mjs`.
+permission flags are generated from the table in `runner/runner.mjs`.
+
+OpenCode (`opencode` runner) drives `opencode run --format json --pure`. Write/shell
+jobs pass `--auto`. Model ids are `provider/model` (default
+`opencode-go/muse-spark-1.3-contributor`). Prompt goes on stdin so Windows command-line
+limits do not clip the job. Resume uses `--session`. The CLI must already be on PATH
+or set `opencodeCommand`; auth is the same OpenCode Go login the desktop app uses.
 
 ### Heartbeat camera snapshots
 
@@ -109,7 +115,7 @@ decision**, and it changes what the workspace allowlist means:
   the whole machine. Enable it only where every allowed requester is trusted.
 - Escalation requires this worker config. Job payloads cannot turn it on —
   fields like `options.sandbox` or a `codexSandboxMode` smuggled into the job
-  are ignored (pinned by `runner.test.mjs`), and read-only jobs are still
+  are ignored (pinned by `runner/runner.test.mjs`), and read-only jobs are still
   forced to `read-only` even when the passthrough is configured.
 - Session resume explicitly re-applies the job's exact sandbox via
   `-c sandbox_mode="…"` (codex `exec resume` has no `--sandbox` flag), so
@@ -121,6 +127,63 @@ Claude/Codex/Grok session id was captured, the Worker performs one automatic
 resume. Jobs without either proof become `interrupted`; the server keeps a
 10-minute `recovering` window before making that terminal.
 
+### OpenCode stall watchdog (same-session, at most once)
+
+The plain execute path cannot tell "still working" from "process alive but no
+step advances" (2026-09-12: OpenCode produced a result and EXIT:1 while the
+tool part stayed `running`). For `opencode` jobs only — other runners keep
+their exact previous behavior — the Worker tracks two clocks: bytes from the
+child vs effective parsed progress (new session / result growth / new
+tool-thinking-log event fingerprint; duplicate lines never reset the timer).
+Either clock expiring opens a suspicion plus a diagnosis grace; only a still
+quiet run after the grace is treated as a confirmed stall. During the grace
+the worker also samples kernel+user CPU of the whole child tree, judged as a rate over the accumulated window (`cpuBusyRatio` of one core, default 5%; a live idle OpenCode alone burns ~1%, so a per-tick delta would clear every suspicion): real
+activity (busy long tool, thinking model) clears the suspicion, so a silent
+but working tool is never killed on a bare timer. If CPU evidence is
+unreadable the confirmation needs a multiplied quiet window and says so in
+the timeline. At confirmation the worker reads the session's own tool states
+(read-only `opencode db` part rows): only a tool call observed running past
+the agreed `toolLimitMs` after real progress (only calls started in this
+round count: a killed CLI leaves its tool part `running` forever) ends the
+old execution and may auto-resume. Every other quiet shape — unreadable
+session/evidence, ambiguous tool status, never-progressed, all tools
+finished but no output (a remote model may still be thinking), in-limit
+tool — does NOT end the run: the timeline and `stallState` say "evidence
+insufficient", diagnosis backs off for `noProgressMs`, and pause/cancel via
+the regular heartbeat still win immediately. Normal long tests with steady
+distinct output are never touched, and the resume preamble tells the next
+round to check connectivity first.
+
+A confirmed stall is ended safely: re-check the gateway (bounded fetch;
+pause/cancel wins, never auto-resurrect), SIGTERM then SIGKILL the old CLI,
+prove the exit via the process handle plus (pid, creation-time) identity
+(a reused PID with a different creation timestamp is a different process),
+and strictly clean only same-identity descendants — never by process name,
+never a Worker/Hub restart. Enumeration failure, unprovable ownership, or
+surviving residuals all block automatic recovery with an explicit reason;
+the old handle is detached and tracked for shutdown instead of hanging the
+blocked receipt. The failure path itself is bounded end to end: every gate
+fetch has a timeout, the main wait races exit against disposition, late
+output is detached, and exactly one completion is ever posted. The resume reuses the same job/session/workspace/branch/uncommitted
+work and persisted `resumeAttempts` budget (shared with restart resume, so a
+restart cannot reset it): at most one auto-recovery per execution round, with
+a verify-first preamble (no duplicate submit/push/deploy, no blind replay of
+the stuck command, browser/fixture hygiene). No session, spent budget, failed
+cleanup, or a second stall all end in an explicit blocked/failed receipt
+through the normal completion handoff — never a silent restart reported as
+success. Tunables live under `opencodeStall` in `config.example.json`.
+
+Detached-but-possibly-live old executors are recorded in the spool's
+`stranded` section (persisted, survives job completion and Worker restarts)
+with whole-tree (pid, creation-time) identities — the shell child dies with
+the worker while deeper grandchildren survive orphaned, so the root PID
+alone is never the mutex. Claim, restart-recovery, and resume paths all
+reconcile strands first: verified leftovers of already-terminal jobs are
+precisely terminated and re-verified before new work starts on the
+workspace; anything unproven keeps a formal blocked refusal. A pre-resume
+`ttlGuardMs` check against the agreed `job.ttl_at` deadline refuses
+recoveries that cannot fit the remaining window.
+
 ## Autonomous triage worker
 
 `triage-worker.mjs` is the VPS-side event gate. It keeps a durable SQLite queue,
@@ -130,20 +193,27 @@ selection when rules and the L1 suggestion both miss. Dispatches go through the
 normal AI Hub message API. Unroutable actionable events are parked in Memory
 Vault `inbox/` with the `triage-backlog` tag.
 
-Module layout (split 2026-08-19; behavior-preserving):
+Module layout (split 2026-08-19, directories 2026-09-24; behavior-preserving).
+This directory holds two unrelated processes; each keeps its entry file at the
+`worker/` root (deploy paths) and its internals in its own directory:
 
 - `triage-worker.mjs` — lifecycle only: config load, constructor, run loop,
   sources/webhook wiring, maintenance mode, shutdown. Domain methods are
-  mounted onto `TriageWorker.prototype` from `worker-*.mjs` mixins
-  (`followups` / `coordination` / `proactive` / `outcomes` / `backlog` /
-  `reminders` / `idea-diary` / `pipeline`), sharing flags, logging, and
-  state-key constants via `worker-shared.mjs`.
-- `triage-core.mjs` — pure domain functions (config normalizers, planners,
-  prompts, parsing). It re-exports `triage-shared.mjs` (constants, stableJson,
-  normalizeEvent, Shanghai day helpers) and `triage-store.mjs` (the SQLite
-  `TriageStore`), so existing imports keep working unchanged.
-- `triage-migrations.mjs` — versioned schema migrations (user_version, one
-  transaction per migration).
+  mounted onto `TriageWorker.prototype` from the mixins in
+  `triage/domains/` (`agenda` / `backlog` / `coordination` /
+  `idea-diary` / `outcomes` / `reminders` / `route-triage`)
+  and `triage/pipeline.mjs`, sharing flags, logging, and state-key constants
+  via `triage/domain-shared.mjs`. `diary-backfill.mjs` is the manual CLI.
+- `triage/triage-core.mjs` — pure domain functions (config normalizers,
+  planners, prompts, parsing). It re-exports `triage/triage-shared.mjs`
+  (constants, stableJson, normalizeEvent, Shanghai day helpers) and
+  `triage/triage-store.mjs` (the SQLite `TriageStore`).
+- `triage/triage-migrations.mjs` — versioned schema migrations (user_version,
+  one transaction per migration).
+- `worker.mjs` (job runner entry; must stay one level below the release root)
+  and `state-store.mjs` (also run by the launcher from the checkout) use the
+  runner internals in `runner/`. `lib/hub-time.mjs` is the only file both
+  processes share.
 
 Requirements:
 
@@ -159,6 +229,46 @@ cp triage.config.example.json /etc/ai-hub/triage.json
 node triage-worker.mjs /etc/ai-hub/triage.json --once
 node triage-worker.mjs /etc/ai-hub/triage.json --metrics
 ```
+
+### Workflow-only background operation
+
+`workflowOnly.enabled=true` is the persisted master boundary for
+workflow-only operation (user: 每日额度删掉，除开维持会议室和worker正常运行的
+功能，其余主动发消息和要ds跑的功能全关):
+
+```json
+{
+  "workflowOnly": { "enabled": true },
+  "coordination": {
+    "enabled": true,
+    "roomId": "cmrhxny03",
+    "tasksDir": "/opt/memory-vault/tasks",
+    "scanIntervalMinutes": 5
+  }
+}
+```
+
+- KEEP: coordination execution (Plan-ready) + due verification dispatches
+  (no numeric daily quota; bounded `WORKFLOW_EXECUTION_SCAN_BATCH_LIMIT=20`
+  per scan + existing retry safety), outcome collection, vault outbox drain,
+  webhook health/intake, maintenance replay, metrics.
+- OFF (runtime-guarded, not config-only): all `sources[]` timers, diary
+  rollup, task reminders/nudges, backlog sweep, agenda shadow, route triage
+  (+autoDispatch), hub-auto hygiene, and generic backlog/system-timer L1
+  triage. Idea rooms, absence followups, and proactive daily check-ins are
+  removed; leftover queued events finish as `noop`. Pre-existing queued/retry
+  events, manual flags (`--sweep`/`--agenda`/`--route-triage`/
+  `--task-reminders`), and forged webhook modes finish as `noop` without DS
+  calls or Hub sends; ledger is never erased.
+- `coordination.dailyLimit` is retained parsed for compat (hygiene still
+  reads it when workflowOnly is off) but never blocks execution/verification.
+- Manual `diary-backfill.mjs` stays available as explicit operator action;
+  explicit user chat to a DS model is out of scope.
+- Safe production shape: `workflowOnly.enabled=true`,
+  `coordination.enabled=true` + roomId/tasksDir, ancillary `enabled=false` for
+  defense in depth (taskReminders/diary/agenda/routeTriage/
+  backlogSweep/hubAutoHygiene), `sources=[]` (timers ignored
+  anyway when workflowOnly is on).
 
 Run only the daily Agenda shadow once:
 
@@ -252,8 +362,9 @@ frontmatter 里既没有 `executor:` 也没有 `verifier:`、又不是 `worker-t
 （`delayMinutes`，默认 60 分钟），nudge 尾部会声明窗口规则；`vetoSenders`
 （默认 User 与 claude）在群里单独一行回 `[VETO] tasks/<file>.md | 理由` 即记
 `vetoed` 拦下。窗口过后仍 pending 的建议按 stage 自动派单：`plan` → room-host
-向建议对象征集 Plan（Plan 写回、frontmatter 标 executor 后由既有 coordination
-sweep 接手执行派单）；`execute`/`review`/`maintenance` → 直接点名建议对象
+向建议对象征集 Plan（Plan 写回、标好 executor 后由既有 coordination
+sweep 接手执行派单；executor 可写 frontmatter，vault 写不进时写在
+### 执行者与工作区内的 `executor: <id>` 行亦可）；`execute`/`review`/`maintenance` → 直接点名建议对象
 （PASS / 就地完成 / delegate_to_worker 三选一）。安全闸：标题/tags 命中 T3
 敏感词（删除/强推/生产部署/凭据/付款等）或 frontmatter `mode: ask` 的任务
 永不自动派；任务已被认领或关闭时让位给常规归宿解析；超过 `maxAgeHours`
@@ -343,59 +454,6 @@ runs when no candidate exists at all. A rules table that covers every category
 therefore disables L2.5 completely — leave the long tail (`other`, and anything
 else without an obvious owner) unmapped if you want the fallback to run.
 
-### Proactive daily companion
-
-A separate timer source with `"mode": "daily"` (and category `daily`) asks L1
-whether User should get a proactive message: care/routine nudges, practical
-reminders, or light chat openers are all allowed. This path is independent of
-the task/backlog gate:
-
-- **Model routing only** among `proactive.recipients` (default `claude`, `codex`,
-  `aye`). Static `routing.rules` never override daily category.
-- **Shanghai quiet hours** default `00:00–09:00` — the daily timer does not emit
-  inside that window, and any queued daily event is forced to NO_OP.
-- **Separate daily pool**: `proactive.dailyDispatchLimit` (default 10) counts
-  Shanghai-calendar-day dispatches in delivery pool `daily`. Task per-recipient
-  `dailyLimit` / cooldown only count pool `task`, so companion outreach does not
-  burn work quotas.
-- **No daily minimum**: L1 may `NO_OP` every wake. `minDailyDispatches` defaults
-  to 0, so an empty day is allowed. Marked date-events, fresh safety events, and
-  unfinished followups still force a message. Setting `minDailyDispatches` > 0
-  with `forceAfterHour` (default 18:00 Shanghai) restores a guaranteed slot; that
-  fallback is off unless a deployment opts in. `minimumGapMinutes` defaults to
-  180 so later checks cannot spam.
-- **Real context**: L1 receives a compact current task snapshot, the three most recent
-  contact interaction timestamps, and the last daily delivery timestamp. Daily delivery
-  mode is trusted from the event source only; a normal task cannot enter the
-  daily pool by returning category `daily`.
-- Timer summary is rebuilt each wake with the current Asia/Shanghai clock.
-
-```json
-{
-  "proactive": {
-    "enabled": true,
-    "dailyDispatchLimit": 10,
-    "minDailyDispatches": 0,
-    "forceAfterHour": 18,
-    "minimumGapMinutes": 180,
-    "silentStartHour": 0,
-    "silentEndHour": 9,
-    "recipients": ["claude", "codex", "aye"]
-  },
-  "sources": [
-    {
-      "id": "daily-check-in",
-      "type": "timer",
-      "mode": "daily",
-      "intervalMinutes": 45,
-      "jitterSeconds": 900,
-      "category": "daily",
-      "summary": "Proactive daily companion check for User."
-    }
-  ]
-}
-```
-
 ### Due and overdue task reminders
 
 `taskReminders` is a deterministic scan of memory-vault's open-task snapshot; it
@@ -410,8 +468,7 @@ immediately before delivery.
 The feature is disabled when `taskReminders.enabled` is absent. Deploy the code
 first, run the read-only production shadow, and only then opt in explicitly.
 
-The scanner shares the proactive recipient allow-list and Shanghai quiet hours,
-but not the daily companion minimum-gap gate. Failed dispatches retry the same
+The scanner sends to `taskReminders.recipient`. Failed dispatches retry the same
 event and Hub idempotency key, so an uncertain response cannot create duplicate
 notifications. Use `--reminder-shadow` to print current candidates without
 enqueuing or dispatching them; use `--once --task-reminders` for a real one-shot
@@ -427,38 +484,6 @@ scan.
   }
 }
 ```
-
-### Daily idea room
-
-A timer source with `"mode": "idea"` uses DeepSeek Flash to choose one free-form
-discussion topic and either `@all` or a purposeful subset of a configured room.
-The host message is stored as `sender=room-host`, rendered as `DS 主持`, and never
-enters Memory Vault capture as if User had authored it. The worker polls the
-durable room-round status, fetches the transcript, then posts a Flash-generated
-wrap-up without opening another member round.
-
-- After the wrap-up is accepted by room-host, `idea.writeDiary` (default `true`)
-  queues one distilled `write_diary` entry. It stores the topic, metadata,
-  participation counts/names, DS wrap-up, and an AI Hub message-range pointer;
-  the full transcript is never copied into Memory Vault.
-- `idea.dailyDispatchLimit` defaults to 1 and counts the independent Shanghai-day
-  delivery pool `idea`; task and daily-companion quotas are untouched.
-- `reactionRounds` is clamped to 0–3 and defaults to 2.
-- Recently completed topics are fed back into Flash. A new topic cannot reuse either
-  of the previous two semantic categories, so every consecutive three are distinct.
-- The daily companion quiet hours also suppress idea starts.
-- `/health` exposes `ideaPoolDispatched`, `ideaChecks`, `ideaNoops`, and
-  `lastIdeaDeliveryAt`.
-- Diary delivery adds `ideaDiaryPending`, `ideaDiaryRetrying`,
-  `ideaDiariesWritten`, and `ideaDiaryLastError` to `/health`.
-- The diary slug is stable for the idea event plus `summaryMessageId`, and its
-  date uses the Asia/Shanghai completion day. The worker persists the request in
-  SQLite before marking the idea event dispatched, so event replay cannot create
-  a second diary.
-- Vault failures never reopen the completed room round or repeat its mentions.
-  They remain in the durable outbox with bounded backoff and structured warning
-  logs until a later retry succeeds. Set `idea.writeDiary` to `false` only to
-  disable this post-discussion write; room-host capture behavior is unchanged.
 
 Timer sources fire after `intervalMinutes` plus a fresh random jitter below
 `jitterSeconds`, so consecutive wakes are never closer than the interval. Only

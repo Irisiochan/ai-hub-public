@@ -1,5 +1,5 @@
-import { CodexAppServerBackend } from '../src/agents/codexAppServer.js';
-import { loadConfig } from '../src/config.js';
+import { CodexAppServerBackend } from '../src/backends/codexAppServer.js';
+import { loadConfig } from '../src/platform/config.js';
 
 const config = loadConfig();
 const limits = await CodexAppServerBackend.readRateLimits({

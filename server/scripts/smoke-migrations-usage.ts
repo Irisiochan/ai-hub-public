@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import { UsageRepo } from '../dist/agents/usageRepo.js';
-import { openDb } from '../dist/db.js';
-import { loadMigrationFiles } from '../dist/migrations.js';
+import { UsageRepo } from '../dist/messages/usageRepo.js';
+import { openDb } from '../dist/platform/db.js';
+import { loadMigrationFiles } from '../dist/platform/migrations.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const freshPath = path.join(here, '.migrations-fresh.db');

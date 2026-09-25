@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deriveDeliverySummary } from '../src/workers/deliveryStatus.js';
+import { deriveDeliverySummary } from '../src/jobs/deliveryStatus.js';
 
 const job = (overrides: Record<string, unknown> = {}) => ({
   status: 'done',

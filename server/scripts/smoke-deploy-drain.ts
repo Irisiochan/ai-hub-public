@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentManager } from '../src/agents/manager.js';
-import { RoomDispatchDrain } from '../src/agents/roomDispatchDrain.js';
-import type { HubConfig } from '../src/config.js';
-import { openDb } from '../src/db.js';
-import { prepareDeployDrain, type DeployDrainManager } from '../src/routes/system.js';
-import { SseHub } from '../src/sse.js';
+import { AgentManager } from '../src/runtime/manager.js';
+import { RoomDispatchDrain } from '../src/runtime/roomDispatchDrain.js';
+import type { HubConfig } from '../src/platform/config.js';
+import { openDb } from '../src/platform/db.js';
+import { prepareDeployDrain, type DeployDrainManager } from '../src/ops/systemRoutes.js';
+import { SseHub } from '../src/platform/sse.js';
 
 const gate = new RoomDispatchDrain();
 assert.equal(gate.begin(), true);
@@ -59,9 +59,10 @@ try {
   const config: HubConfig = {
     port: 3900, host: '127.0.0.1', dbPath: path.join(tempDir, 'hub.sqlite'),
     agentsDir: tempDir, webDist: '', uploadsDir: tempDir, releasesDir: tempDir,
-    claude: { cliPath: 'claude', turnTimeoutMs: 300_000 },
-    codex: { cliPath: 'codex', turnTimeoutMs: 300_000 },
-    grok: { cliPath: 'grok', turnTimeoutMs: 300_000 },
+    claude: { cliPath: 'claude' },
+    codex: { cliPath: 'codex' },
+    grok: { cliPath: 'grok' },
+    api: { turnTimeoutMs: 300_000 },
     memory: {
       mcpUrl: null, repoPath: null, injectOnSpawn: false, searchPerTurn: false,
       capture: false, maxTurnChars: 1200, sessionMaxAgeHours: 0,

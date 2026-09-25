@@ -54,6 +54,6 @@ if (prompt.includes('flags')) {
   emit('reasoning', { part: { type: 'reasoning', text: '先想一下。' } });
   emit('text', { part: { type: 'text', text: '想完了。' } });
 } else {
-  emit('text', { part: { type: 'text', text: '缪斯在。' } });
+  emit('text', { part: { type: 'text', text: 'Sora 在。' } });
 }
 process.exit(prompt.includes('fail') ? 1 : 0);

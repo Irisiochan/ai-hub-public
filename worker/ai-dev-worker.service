@@ -1,0 +1,83 @@
+[Unit]
+Description=AI Hub VPS development worker (vps-dev)
+Documentation=https://github.com/Irisiochan/ai-hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-dev
+Group=ai-dev
+# Fixed-version read-only install layout: exactly one version directory is
+# live at a time; upgrades flip the symlink after verification.
+#   /opt/ai-hub-worker/<version>/worker/worker.mjs   (read-only)
+#   /opt/ai-hub-worker/current -> /opt/ai-hub-worker/<version>
+ExecStart=/usr/bin/node /opt/ai-hub-worker/current/worker/worker.mjs /etc/ai-dev-worker/config.json
+WorkingDirectory=/opt/ai-hub-worker/current/worker
+Environment=AI_HUB_WORKER_LOG=/var/log/ai-dev-worker/worker.log
+# HOME is what systemd would derive from the account anyway; it is spelled out
+# because every CLI credential path below hangs off it and a silent change of
+# home is the one failure mode that looks like "logged in but not logged in".
+Environment=HOME=/home/ai-dev
+# Runner CLIs installed per-user land in ~/.local/bin, which systemd's default
+# PATH does not include. Without this the unit sees only the system dirs, so a
+# CLI that works in an interactive `su` session is "not found" for the service.
+# sbin dirs are left out on purpose: this service is never root.
+Environment=PATH=/home/ai-dev/.local/bin:/usr/local/bin:/usr/bin:/bin
+StateDirectory=ai-dev-worker
+LogsDirectory=ai-dev-worker
+ConfigurationDirectory=ai-dev-worker
+# Match the mode /etc/ai-dev-worker actually has on the VPS (750, root:ai-dev).
+# With the default 0755 systemd logs "ConfigurationDirectory 'ai-dev-worker'
+# already exists but the mode is different (File system: 750
+# ConfigurationDirectoryMode: 755)" and the directory does not show up inside
+# the unit's namespace — see the ReadWritePaths note below for what that cost.
+ConfigurationDirectoryMode=0750
+Restart=on-failure
+RestartSec=10s
+# Drain: stop accepting new jobs before restart:
+#   1. POST /api/workers/vps-dev/control {"enabled": false} (gateway panel)
+#   2. wait until no claimed/running jobs for vps-dev (GET /api/worker/reconcile empty + worker status idle)
+#   3. systemctl stop ai-dev-worker  (in-flight CLI tree is signalled as a process group)
+# Recovery: systemctl start ai-dev-worker; the worker replays its persistent
+# spool (/var/lib/ai-dev-worker/worker-state.json) and resumes heartbeats.
+# Initial measured budget (to be verified under load, G04):
+CPUQuota=200%
+MemoryHigh=3G
+MemoryMax=4G
+TasksMax=256
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# Home policy (G04, deliberate choice): ProtectHome=read-only + an explicit
+# write whitelist for exactly the CLI state the runners need
+# (~/.codex auth, opencode data dir, cache) — NOT a HOME redirect to
+# /var/lib/ai-dev-worker/home. Rationale: the CLIs and any hand-run
+# `su ai-dev` credential rotation must see the SAME home paths; a redirected
+# HOME would fork a second hidden home that drifts from interactive sessions
+# and silently breaks manual codex/opencode re-login. Read-only home keeps
+# dotfiles visible for debugging while every write stays inside the three
+# whitelisted state dirs below.
+ProtectHome=read-only
+# /etc/ai-dev-worker is listed on purpose (2026-09-18 landing): under
+# ProtectSystem=strict, ConfigurationDirectory= alone did NOT make an
+# already-existing /etc/ai-dev-worker visible inside the unit's namespace when
+# the directory mode (750) differs from ConfigurationDirectoryMode — the worker
+# looped on `Missing /etc/ai-dev-worker/config.json` (restart counter reached 8)
+# while the file was right there and readable by ai-dev. Naming the path here is
+# what fixed it on the VPS; do not drop it "because ConfigurationDirectory
+# already covers it", and do not drop it because ConfigurationDirectoryMode is
+# now pinned either — the mode line removes the cause, this line is the belt.
+# /home/ai-dev/.npm is npm's cache AND its log dir, and it is NOT under
+# ~/.cache — the first real `npm ci` on the box died with
+# `EROFS ... open '/home/ai-dev/.npm/_cacache/tmp/...'` even though the
+# workspace itself was writable, because read-only home covered it. Any repo
+# whose validation suite starts with `npm ci` needs this entry.
+ReadWritePaths=/etc/ai-dev-worker /srv/ai-dev/jobs /srv/ai-dev/mirrors /var/lib/ai-dev-worker /var/log/ai-dev-worker /home/ai-dev/.codex /home/ai-dev/.local/share/opencode /home/ai-dev/.cache /home/ai-dev/.npm
+# Mixed kill: the main worker gets SIGTERM (drains via its own SIGTERM
+# handler, which process-group-kills runner trees), everyone else gets
+# SIGKILL immediately so a hung CLI grandchild can never outlive the unit.
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

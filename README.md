@@ -7,53 +7,63 @@ Grok CLI、OpenCode 和任意 API 模型接进同一套持久会话、长期记�
 PC Worker 在个人设备执行任务，triage worker 处理主动事件，会议室负责可信派单、handoff 和回执。
 Web、Electron 桌面端和 Android 客户端只是这套 harness 的交互入口。
 
-> 当前公开版本：**v0.3.3**（2026-09-07）。AI Hub 与 Memory Vault 独立版本化；
+> 当前公开版本：**v0.4.0**（2026-09-26）。AI Hub 与 Memory Vault 独立版本化；
 > 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 > 这是一个个人项目的公开展示版本。它在作者自己的 VPS 上 24/7 跑着真实日常，
 > 但不承诺支持、不保证响应 issue，PR 随缘。拿去用、拿去改都欢迎（MIT）。
 
-## v0.3.0：陪伴心跳、OpenCode 后端与路由分诊闭环
+## v0.4.0：模型驱动的会议室工作流、VPS Worker 与减法收敛
 
-- **陪伴心跳**：CLI 与 API 联系人都可开启周期性自主 tick，间隔随机化，模型自行决定
-  这一拍要不要开口；支持手动无限模式与运行时抽屉里的开关。心跳还能桥接桌面 MCP 工具
-  （如电商购物车）与守护式 PC 相机捕获（帧以 MCP 图像返回）。
-- **OpenCode CLI 后端**：新增第四种 CLI 后端（OpenCode Go），含模型发现进选择器、
-  图片输入直通与 stdin/空闲超时修复。
-- **路由分诊闭环**：未路由任务先由巡逻联系人预筛给出路由建议，veto 窗口内无人否决即
-  自动派单；当日迟到回复可延迟收割；presence 判断时区安全。
-- **会议室加固**：结构化回执 + 部署闭环自动化（部署事件可 resume、回执分页有守护），
-  任务 outcome 与到期提醒统一走会议室，房间回执展示 worker 动作。
-- **前端**：Telegram 风格 shell、受控主题清单、动效与声音偏好、长会话渲染有界。
-- **账单导入**：支付宝/微信/招行账单导入，去重后生成月度建议。
-- **架构文档**：产品宪章（[docs/CHARTER.md](docs/CHARTER.md)）、living
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) + drift guard 测试、核心实现收敛
-  （Worker 状态、任务事务、网关契约统一，见 [docs/MINIMAL_IMPLEMENTATION.md](docs/MINIMAL_IMPLEMENTATION.md)）。
+- **固定工作流模块**：plan / execute / review / arbitration / merge / deploy / maintenance
+  七个模块取代 Workflow Profiles；每个模块在房间面板里热切换 agent / 模型 / 推理强度，
+  带 revision 并发校验，运行中的 attempt 保留派发时的绑定与权限快照，终态后可手动接管。
+- **模型驱动 handoff**：网关不再替模型选下一阶段，模型显式调用 `task_handoff` /
+  `execution_start` 交棒；共享任务账本、冻结 handoff 快照、按 turn 上下文校验房间/任务/模块，
+  跨房间或冒用其他模块的调用直接拒绝。
+- **降本直启**：APPROVE 直启合入闭环、REQUEST_CHANGES 直启返修 Worker、merge-stale 直启 rebase、
+  干净 rebase 免重审、`after_merge=deploy` 部署验证后自动收口；review 走增量 patch，
+  `task_get` 带摘要；attempt 与聊天席用量进任务成本账本。
+- **确定性合入/部署闭环**：Node 版 merge/deploy 脚本，fail-closed 合入门由服务端复核，
+  只读 closure 凭据，原始脚本回执可分页。
+- **VPS Worker**：配置驱动的 `projectTargets`、从受信镜像供给工作区、Linux 路径与进程组终止、
+  能力卡片心跳与派单闸门；execute 轮声明的测试全过即自动提交；Windows launcher 从 `master`
+  导出 release 运行。OpenCode 停滞检测 + 一次同会话恢复。
+- **Kimi CLI 后端**：模型列表从 `config.toml` 热刷新，支持逐轮推理强度；
+  CLI 空闲超时与硬超时拆分（空闲默认 5 分钟）。
+- **workflowOnly 模式**：一个开关关掉除会议室与 Worker 之外的主动消息和 DeepSeek 后台任务。
+- **模块化架构**：网关 `server/src/<module>/`、Web `web/src/<feature>/`、worker `triage/` 与
+  `runner/` 分家，依赖单向无环由边界测试强制；`shared/` 包改动未 bump 版本时 CI 直接失败。
+- **减法**：移除账单导入与财务面板、idea 房间、临时离开跟进、主动 check-in、联系人情绪打分、
+  triage 静默时段、会话分类标签，以及重复的订阅额度显示。
+
+v0.3.x 的陪伴心跳、OpenCode 后端与路由分诊闭环继续保留，历史变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 核心能力
 
 - **多 Agent 宿主**：把 `claude` CLI（stream-json 持久子进程 + resume）、
-  `codex app-server`（JSON-RPC）、Grok CLI、OpenCode CLI 和 API 直连模型（Anthropic /
+  `codex app-server`（JSON-RPC）、Grok CLI、OpenCode CLI、Kimi CLI 和 API 直连模型（Anthropic /
   OpenAI-compatible / Gemini 原生协议，模型列表可搜索选择）组织成长期在线的独立联系人；
   每个联系人保留自己的会话、人格、权限与工作目录
-- **协作与 handoff**：拉现有联系人建群，用 `@名字` / `@all` 调度；Plan 就绪的任务可进入会议室工作总线，
-  由网关签发可信派单，成员接单、委派、交付；任务控制器、协调指纹、durable outbox 和完成回执
-  共同防止正文伪造状态、重复派单或崩溃后丢回执
-- **Workflow Profiles**：把 Plan / Review / Execute / Fix / Maintenance / Patrol 的 runner、模型与
-  reasoning 映射收进版本化配置；每个任务冻结路由快照，支持预览、切换、回滚与三次质量不收敛后的兜底
-- **PC Worker 委派**：聊天里的 AI 可以把编码任务派给你 PC 上的 claude/codex 执行，
+- **协作与 handoff**：拉现有联系人建群，用 `@名字` / `@all` 调度；审批过的任务进入会议室任务账本，
+  模型通过网关接口显式 handoff，冻结快照、协调指纹、durable outbox 和完成回执共同防止正文伪造状态、
+  重复派单或崩溃后丢回执（见 [docs/model-driven-room-workflow.md](docs/model-driven-room-workflow.md)）
+- **固定工作流模块**：plan / execute / review / arbitration / merge / deploy / maintenance 各绑一个
+  agent + 模型 + 推理强度，房间面板热切换；权限取模块策略与任务授权的交集，不叠加联系人特权；
+  合入与部署走确定性脚本闭环
+- **PC / VPS Worker 委派**：聊天里的 AI 可以把编码任务派给 PC 或 VPS 上的 claude/codex/grok/opencode 执行，
   任务以可折叠子会话挂回原消息，支持暂停/取消/重试，完成后自动回执验收
 - **长期记忆**：Memory Vault 以 Markdown 保存记忆，网关按联系人自动注入、检索和捕捉，
   支持 full / compact / off 三档，并通过独立、版本化的 MCP 契约接入
-- **自主 triage worker**：VPS 常驻事件分诊——daily 主动陪伴、纪念日/生日提醒、任务到期催办、
-  临时离开跟进；每日 Agenda 只展示真实增量，未展示项轮转、长期静默项定期重新浮出；数据库异常时进入
+- **自主 triage worker**：VPS 常驻事件分诊——任务到期催办、日记汇总、未路由任务分诊与 backlog 清扫；
+  `workflowOnly` 开启时只保留会议室与 Worker 相关的后台工作；每日 Agenda 只展示真实增量，未展示项轮转、长期静默项定期重新浮出；数据库异常时进入
   可观测 maintenance mode，不在坏状态下继续派单
 - **陪伴心跳**：联系人级周期性自主 tick（CLI 与 API 后端通用），间隔随机化、模型自行决定是否开口，
   可挂接桌面 MCP 工具与守护式 PC 相机捕获，运行时抽屉直接开关
 - **IM 式交互入口**：每个 AI 是一个联系人，一条持续演进的对话；历史跨设备同步，支持群聊、
   改名、头像与主题色，Web、Electron 和 Android 共用同一套网关
 - **图片与模型能力**：选图或粘贴截图直接发送，API 联系人可按需配置独立视觉模型；
-  可选图片描述与跨联系人生活事件抽取；Claude / Codex 标题栏可显示 5h / 周窗口剩余
+  可选图片描述与跨联系人生活事件抽取；Token 用量、模型与推理强度、心跳统一在运行时抽屉查看
 - **运维内建**：token 门控的一键部署端点（拉取/构建/重启/健康检查/失败自动回滚）、
   SQLite 在线定时备份（integrity 校验 + 保留窗口）、发布状态面板
 
@@ -73,11 +83,15 @@ AI Hub harness / 网关 (Node/TS, :3900)
    ├─ codex app-server (JSON-RPC over stdio, thread/resume)
    ├─ grok (CLI stream events, session/resume)
    ├─ opencode (OpenCode Go CLI, run --file)
+   ├─ kimi (Kimi CLI)
    └─ 直连 API (anthropic / openai-compat / gemini)
 
-PC Worker (主动出站长轮询，无入站端口)
-   └─ 网关 jobs 队列 → 本机 codex exec / claude -p → 流式事件与结果回传
+PC / VPS Worker (主动出站长轮询，无入站端口)
+   └─ 网关 jobs 队列 → 本机 codex / claude / grok / opencode → 流式事件与结果回传
 ```
+
+- 代码按功能模块分目录：网关 `server/src/<module>/`（每个模块一个 `index.ts` 公开面）、Web `web/src/<feature>/`、
+  worker 的 `triage/` 与 `runner/`；模块依赖单向无环，由边界测试强制（见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)）
 
 - CLI 会话通过 `--resume` 跨网关重启延续，session id 存 SQLite
 - 每联系人串行队列，同一时刻只有一轮 in-flight；长会话按 token 阈值自动换新 thread + 滚动摘要
@@ -144,7 +158,12 @@ Compose 的私人数据始终写入被 gitignore 的 `vault-data/`，不会进�
 1. 前端左上角 `🖥`，输入设备名生成一次性配对令牌
 2. `worker/config.example.json` → `worker/config.json`，填令牌和允许的 workspace
 3. `node worker/worker.mjs worker/config.json` 验证；Windows 登录自启用
-   `worker-launcher.ps1 -Action install`（单实例、崩溃退避重拉、本地状态文件）
+   `worker-launcher.ps1 -Action install`（单实例、崩溃退避重拉、本地状态文件）。
+   launcher 每次启动把 `master` 的 `worker/` + `shared/` + `deploy/` 导出到
+   `%LOCALAPPDATA%\ai-hub-worker\releases\<sha>` 再运行，检出切到哪个分支都不影响线上 Worker；
+   config 设 `"releaseRef": ""` 可直接跑检出（仅开发）
+4. Linux/VPS Worker 用 `deploy/install-vps-worker.sh` 安装，工作区由网关配置的 `projectTargets`
+   从受信镜像供给
 
 ## 安全模型与威胁边界
 

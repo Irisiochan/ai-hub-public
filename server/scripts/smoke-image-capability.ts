@@ -7,8 +7,8 @@ import {
   DirectApiBackend,
   IMAGE_OMITTED_PLACEHOLDER,
   defaultSupportsImages,
-} from '../src/agents/directApi.js';
-import { openDb } from '../src/db.js';
+} from '../src/backends/directApi.js';
+import { openDb } from '../src/platform/db.js';
 
 // --- 纯能力推断：provider + model 名 ---
 assert.equal(defaultSupportsImages('anthropic', 'claude-x'), true, 'anthropic 默认多模态');

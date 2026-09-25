@@ -9,9 +9,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { MessageRepo } from '../src/agents/messageRepo.js';
-import { PromptComposer, type PromptContext } from '../src/agents/promptComposer.js';
-import { openDb } from '../src/db.js';
+import { MessageRepo } from '../src/messages/messageRepo.js';
+import { PromptComposer, type PromptContext } from '../src/prompt/promptComposer.js';
+import { openDb } from '../src/platform/db.js';
 import {
   buildSessionPreamble,
   countEngineeringSignals,
@@ -20,8 +20,8 @@ import {
   shouldInjectNsfwCraft,
   TEMPORAL_CONTEXT_RULES,
 } from '../src/memory/inject.js';
-import { estimateTokens } from '../src/agents/tokenEstimate.js';
-import type { ContactRow } from '../src/db.js';
+import { estimateTokens } from '../src/prompt/tokenEstimate.js';
+import type { ContactRow } from '../src/platform/db.js';
 
 const NSFW_MARK = 'NSFW 书写工艺（网关 compact';
 const TEMPORAL_MARK = '# 时间语义（网关强制）';

@@ -3,8 +3,8 @@
  * CLI 实际 MCP schema 由客户端展开，网关侧另有 mcp config bytes 日志。
  */
 import assert from 'node:assert/strict';
-import { estimateToolSchemaTokens } from '../src/agents/conversationSummary.js';
-import { estimateTokens } from '../src/agents/tokenEstimate.js';
+import { estimateToolSchemaTokens } from '../src/prompt/conversationSummary.js';
+import { estimateTokens } from '../src/prompt/tokenEstimate.js';
 
 const MEMORY_TOOLS = [
   {

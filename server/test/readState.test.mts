@@ -4,9 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
-import { openDb } from '../src/db.js';
-import { loadMigrationFiles } from '../src/migrations.js';
-import { getMessageReadState, markMessagesRead } from '../src/readState.js';
+import { openDb } from '../src/platform/db.js';
+import { loadMigrationFiles } from '../src/platform/migrations.js';
+import { getMessageReadState, markMessagesRead } from '../src/messages/readState.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-read-state-'));
 const dbPath = path.join(tempDir, 'hub.db');

@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { loadMigrations } from '../src/migrations.js';
+import { loadMigrations } from '../src/platform/migrations.js';
 import {
   maybeWriteBackTask,
   ownTaskUpdateText,
   type TaskWritebackReview,
   type TaskWritebackVault,
-} from '../src/memory/taskWriteback.js';
+} from '../src/tasks/taskWriteback.js';
 import { TaskStateService } from '../src/tasks/taskStateService.js';
 import { VaultTaskProjection } from '../src/tasks/vaultProjection.js';
 

@@ -4,7 +4,7 @@
  * 且记忆正文里Claude/Codex 第一人称叙述不会抹掉「你是当前联系人」边界。
  */
 import assert from 'node:assert/strict';
-import { PromptComposer } from '../src/agents/promptComposer.js';
+import { PromptComposer } from '../src/prompt/promptComposer.js';
 import { WORKFLOW_PRELOADED, buildSessionPreamble } from '../src/memory/inject.js';
 import type { VaultClient } from '../src/memory/vaultClient.js';
 

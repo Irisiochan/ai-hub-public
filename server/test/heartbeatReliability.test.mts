@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openDb, type MessageRow } from '../src/db.js';
-import { CompanionHeartbeat } from '../src/agents/companionHeartbeat.js';
-import { heartbeatReceipt, retryableHeartbeatError } from '../src/agents/heartbeatPolicy.js';
-import { gemHeartbeatHistory } from '../src/agents/gemHeartbeatHistory.js';
-import { AgentRuntime } from '../src/agents/runtime.js';
+import { openDb, type MessageRow } from '../src/platform/db.js';
+import { CompanionHeartbeat } from '../src/heartbeat/companionHeartbeat.js';
+import { heartbeatReceipt, retryableHeartbeatError } from '../src/companion/heartbeatPolicy.js';
+import { gemHeartbeatHistory } from '../src/prompt/gemHeartbeatHistory.js';
+import { AgentRuntime } from '../src/runtime/runtime.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'heartbeat-reliability-'));
 const db = openDb(path.join(dir, 'test.db'));

@@ -26,7 +26,7 @@ export const ProjectAccessSchema = z.object({
 export const DelegationConfigSchema = z.object({
   enabled: z.boolean().default(false),
   workspaces: z.array(trimmed(1000).min(1)).max(50).default([]),
-  runners: z.array(z.enum(['claude', 'codex', 'grok'])).max(3).default(['claude', 'codex', 'grok']),
+  runners: z.array(z.enum(['claude', 'codex', 'grok', 'opencode'])).max(4).default(['claude', 'codex', 'grok', 'opencode']),
   allowShell: z.boolean().default(false),
   allowSsh: z.boolean().default(false),
   workerId: trimmed(200).optional(),
@@ -72,7 +72,6 @@ const commonShape = {
   model: z.string().trim().max(200).default(''),
   modelOptions: z.array(modelOption).max(100).default([]),
   effort: z.string().trim().max(40).default(''),
-  turnTimeoutMs: optionalTurnTimeout,
   turnIdleTimeoutMs: optionalTurnTimeout,
   turnHardTimeoutMs: optionalTurnTimeout,
   memory: MemoryConfigSchema,
@@ -80,13 +79,8 @@ const commonShape = {
   heartbeat: HeartbeatConfigSchema,
   routing: RoutingConfigSchema,
   projectAccess: ProjectAccessSchema,
-  affect: z.enum(['on', 'off']).default('off'),
   // Cross-contact life events (P3): extract from this contact's DM + inject other contacts' events per turn.
   lifeEvents: z.enum(['on', 'off']).default('off'),
-  affectBaseline: z.object({
-    valence: z.coerce.number().min(-0.6).max(1).default(0),
-    arousal: z.coerce.number().min(0).max(1).default(0.15),
-  }).default({}),
   // NSFW craft block: always = session preamble; intimate = per-turn fail-open scene gate; off = never.
   // Default intimate demotes the old always-on resident cost; partners keep craft via fail-open detection.
   nsfwCraft: z.enum(['always', 'intimate', 'off']).default('intimate'),
@@ -154,11 +148,14 @@ export const ContactConfigSchemas = {
   codex: CodexContactConfigSchema,
   'grok-cli': GrokContactConfigSchema,
   'opencode-cli': GrokContactConfigSchema,
+  'kimi-cli': GrokContactConfigSchema,
   api: ApiContactConfigSchema,
   room: RoomContactConfigSchema,
 };
 
-export const CLI_CONTACT_BACKENDS = ['claude-cli', 'codex', 'grok-cli', 'opencode-cli'];
+export const WORKFLOW_RUNNERS = ['claude', 'codex', 'grok', 'opencode'];
+
+export const CLI_CONTACT_BACKENDS = ['claude-cli', 'codex', 'grok-cli', 'opencode-cli', 'kimi-cli'];
 
 export function isCliContactBackend(backend) {
   return CLI_CONTACT_BACKENDS.includes(backend);

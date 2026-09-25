@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openDb, type JobRow } from '../src/db.js';
+import { openDb, type JobRow } from '../src/platform/db.js';
 import { attachWorkerCompletion } from '../src/server.js';
 import {
   collectInvariantReport,
@@ -11,7 +11,7 @@ import {
 } from '../src/tasks/invariants.js';
 import { TaskStateService } from '../src/tasks/taskStateService.js';
 import { VaultTaskProjection } from '../src/tasks/vaultProjection.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-task-controller-'));
 const tasksDir = path.join(tempDir, 'tasks');
@@ -119,46 +119,41 @@ async function workerTailProjectionChecks(): Promise<void> {
        delivery_meta = ?, result = 'blocked receipt' WHERE id = ?`
     ).run(JSON.stringify({ dirtyFiles: ['server/src/server.ts'], head: 'abc1234', ahead: 1 }), blocked.id);
     const blockedRow = jobs.get(blocked.id)!;
-    assert.deepEqual(await deliver(blockedRow), { tailDone: true });
-    assert.deepEqual(await deliver(blockedRow), { tailDone: true });
+    // Retired worker-tail projection: completion alone writes nothing to the
+    // task controller, the outbox, or the vault. Explicit task_import +
+    // task_get replace it (roomTaskModelDriven.test.mts).
+    assert.deepEqual(await deliver(blockedRow), {});
+    assert.deepEqual(await deliver(blockedRow), {}, 'replay stays a quiet no-op');
     assert.equal(
       (localDb.prepare("SELECT COUNT(*) AS count FROM task_events WHERE task_id = 'parent-task'").get() as { count: number }).count,
-      1,
-      'blocked job replay must emit one parent annotation event',
+      0,
+      'retired projection emits no parent annotation event',
     );
     assert.equal(
       (localDb.prepare("SELECT COUNT(*) AS count FROM task_outbox WHERE task_id = 'parent-task'").get() as { count: number }).count,
-      1,
-      'blocked job replay must emit one parent projection',
+      0,
+      'retired projection emits no parent projection',
     );
     assert.equal(
       (localDb.prepare("SELECT COUNT(*) AS count FROM task_commands WHERE idempotency_key = ?").get(
         `worker-tail-parent:${blocked.id}:blocked_unpushed`,
       ) as { count: number }).count,
-      1,
+      0,
     );
     assert.equal(fs.existsSync(path.join(localTasksDir, `worker-tail-${blocked.id}.md`)), false);
     assert.equal(vaultWrites.filter((entry) => entry.name === 'add_task').length, 0);
 
     const parentProjection = new VaultTaskProjection(localDb, vault, () => {});
-    assert.equal(await parentProjection.flushOutbox(), 1);
-    const parentCall = vaultCalls.find((entry) => (
-      entry.name === 'update_task' && entry.args.path === 'tasks/parent-task.md'
-    ));
-    assert.ok(parentCall);
-    assert.equal(parentCall.args.status, 'open');
-    assert.match(String(parentCall.args.note), new RegExp(blocked.id));
-    assert.match(String(parentCall.args.note), /blocked_unpushed/);
-    assert.match(String(parentCall.args.note), /abc1234/);
+    assert.equal(await parentProjection.flushOutbox(), 0, 'nothing to project without the retired auto-tail');
 
     const legacy = createJob();
     localDb.prepare(
       "UPDATE jobs SET status = 'blocked', delivery_state = 'blocked_local_changes' WHERE id = ?"
     ).run(legacy.id);
     await deliver(jobs.get(legacy.id)!);
-    assert.ok(vaultWrites.some((entry) => (
+    assert.ok(!vaultWrites.some((entry) => (
       entry.name === 'add_task' && entry.args.slug === `worker-tail-${legacy.id}`
-    )), 'job without taskPath must retain legacy worker-tail creation');
+    )), 'legacy worker-tail creation is retired too');
 
     attach(null);
     const fallback = createJob('tasks/parent-task.md');
@@ -166,9 +161,9 @@ async function workerTailProjectionChecks(): Promise<void> {
       "UPDATE jobs SET status = 'blocked', delivery_state = 'blocked_unpushed' WHERE id = ?"
     ).run(fallback.id);
     await deliver(jobs.get(fallback.id)!);
-    assert.ok(vaultWrites.some((entry) => (
+    assert.ok(!vaultWrites.some((entry) => (
       entry.name === 'add_task' && entry.args.slug === `worker-tail-${fallback.id}`
-    )), 'missing tasksDir must fall back to legacy worker-tail creation');
+    )), 'missing tasksDir no longer falls back to worker-tail creation');
 
     attach(root);
     const recovered = createJob();
@@ -177,28 +172,13 @@ async function workerTailProjectionChecks(): Promise<void> {
       "UPDATE jobs SET status = 'done', delivery_state = 'delivered_out_of_band', result = 'recovered' WHERE id = ?"
     ).run(recovered.id);
     const recoveredRow = jobs.get(recovered.id)!;
-    assert.deepEqual(await deliver(recoveredRow), { tailDone: true });
-    assert.deepEqual(await deliver(recoveredRow), { tailDone: true });
-    const tailId = `worker-tail-${recovered.id}`;
-    assert.deepEqual(
-      localDb.prepare('SELECT status, version FROM work_items WHERE task_id = ?').get(tailId),
-      { status: 'done', version: 2 },
-    );
+    assert.deepEqual(await deliver(recoveredRow), {});
+    assert.deepEqual(await deliver(recoveredRow), {});
     assert.equal(
-      (localDb.prepare('SELECT COUNT(*) AS count FROM task_events WHERE task_id = ?').get(tailId) as { count: number }).count,
-      1,
+      (localDb.prepare('SELECT COUNT(*) AS count FROM task_events WHERE task_id = ?').get(`worker-tail-${recovered.id}`) as { count: number }).count,
+      0,
+      'recovered jobs no longer auto-close tail tasks',
     );
-    assert.equal(
-      (localDb.prepare('SELECT COUNT(*) AS count FROM task_outbox WHERE task_id = ?').get(tailId) as { count: number }).count,
-      1,
-    );
-    assert.equal(await parentProjection.flushOutbox(), 1);
-    const closeCall = vaultCalls.find((entry) => (
-      entry.name === 'update_task' && entry.args.path === `tasks/${tailId}.md`
-    ));
-    assert.ok(closeCall);
-    assert.equal(closeCall.args.status, 'done');
-    assert.match(String(closeCall.args.note), /delivered_out_of_band/);
 
     writeLocalTask('closed-parent', 'done');
     const rejected = createJob('tasks/closed-parent.md');
@@ -206,11 +186,11 @@ async function workerTailProjectionChecks(): Promise<void> {
       "UPDATE jobs SET status = 'blocked', delivery_state = 'blocked_unpushed' WHERE id = ?"
     ).run(rejected.id);
     const rejectedRow = jobs.get(rejected.id)!;
-    await assert.rejects(deliver(rejectedRow), /parent task annotation rejected/);
-    assert.deepEqual(await deliver(rejectedRow, true), {}, 'final attempt must release the receipt without marking the failed tail step done');
+    assert.deepEqual(await deliver(rejectedRow), {}, 'no parent annotation exists to reject');
+    assert.deepEqual(await deliver(rejectedRow, true), {});
 
     console.log(
-      `worker-tail round-trip: parent=${blocked.id} events=1 outbox=1 tail=0; recovered=${recovered.id} closeEvent=1 projected=1`,
+      `worker-tail retired: parent=${blocked.id} events=0 outbox=0 tail=0; recovered=${recovered.id} closeEvent=0 projected=0`,
     );
   } finally {
     localDb.close();

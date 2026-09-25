@@ -4,13 +4,13 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { openDb } from '../src/db.js';
-import { parsePositiveIntegerQuery } from '../src/queryParams.js';
-import { journalRouter } from '../src/routes/journal.js';
-import { messagesRouter } from '../src/routes/messages.js';
-import { workersRouter } from '../src/routes/workers.js';
-import { SseHub } from '../src/sse.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { openDb } from '../src/platform/db.js';
+import { parsePositiveIntegerQuery } from '../src/platform/queryParams.js';
+import { journalRouter } from '../src/messages/journalRoutes.js';
+import { messagesRouter } from '../src/runtime/messageRoutes.js';
+import { workersRouter } from '../src/jobs/workerRoutes.js';
+import { SseHub } from '../src/platform/sse.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 const cases = [
   { label: 'missing', value: undefined, expected: 'default' },

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {
   ownTaskUpdateText,
   reviewTaskWritebackWithDeepSeek,
-} from '../dist/memory/taskWriteback.js';
+} from '../dist/tasks/taskWriteback.js';
 
 if (!process.env.DEEPSEEK_API_KEY?.trim()) {
   throw new Error('DEEPSEEK_API_KEY is required for the live shadow smoke');

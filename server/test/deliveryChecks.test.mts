@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { buildDeliveryChecks } from '../src/workers/deliveryChecks.js';
+import { buildDeliveryChecks } from '../src/jobs/deliveryChecks.js';
 
 const job = (permissions: Record<string, unknown>, options: Record<string, unknown> = {}) => ({
   permissions: JSON.stringify(permissions),

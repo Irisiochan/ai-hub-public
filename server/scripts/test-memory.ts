@@ -1,5 +1,5 @@
 /** Smoke test for the memory layer against the live vault MCP (tailnet). */
-import { openDb } from '../src/db.js';
+import { openDb } from '../src/platform/db.js';
 import { detectTrigger } from '../src/memory/capture.js';
 import { buildSessionPreamble, buildTurnBlock, extractKeywords } from '../src/memory/inject.js';
 import { VaultClient } from '../src/memory/vaultClient.js';

@@ -7,15 +7,15 @@ import {
   buildMessageTimeline,
   messageSelectionKey,
   sameMessageReferences,
-} from '../src/messageTurns.ts';
-import { displayedErrorContent, interruptionReason } from '../src/interruptionReason.ts';
+} from '../src/chat/messageTurns.ts';
+import { displayedErrorContent, interruptionReason } from '../src/chat/interruptionReason.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const bubble = fs.readFileSync(path.join(root, 'src/components/MessageBubble.tsx'), 'utf8');
-const list = fs.readFileSync(path.join(root, 'src/components/chat/MessageList.tsx'), 'utf8');
-const pane = fs.readFileSync(path.join(root, 'src/components/ChatPane.tsx'), 'utf8');
+const bubble = fs.readFileSync(path.join(root, 'src/chat/MessageBubble.tsx'), 'utf8');
+const list = fs.readFileSync(path.join(root, 'src/chat/MessageList.tsx'), 'utf8');
+const pane = fs.readFileSync(path.join(root, 'src/chat/ChatPane.tsx'), 'utf8');
 const app = fs.readFileSync(path.join(root, 'src/App.tsx'), 'utf8');
-const header = fs.readFileSync(path.join(root, 'src/components/chat/ChatHeader.tsx'), 'utf8');
+const header = fs.readFileSync(path.join(root, 'src/chat/ChatHeader.tsx'), 'utf8');
 const css = fs.readFileSync(path.join(root, 'src/styles/theme.css'), 'utf8');
 
 assert.match(bubble, /const actions = showActions \? \([\s\S]*className="msg-time"/);
@@ -137,6 +137,20 @@ assert.equal(displayedErrorContent({
 assert.equal(
   displayedErrorContent({ content: '原有兜底错误', meta: JSON.stringify({ interruptionReason: 'claude-error' }) }),
   '原有兜底错误',
+);
+// 两种超时各自成句，不用翻网关日志才知道是空闲卡住还是撞了绝对上限
+assert.equal(
+  displayedErrorContent({ content: '超时', meta: JSON.stringify({ interruptionReason: 'turn-idle-timeout' }) }),
+  '这轮空闲超时了，已打断',
+);
+assert.equal(
+  displayedErrorContent({ content: '超时', meta: JSON.stringify({ interruptionReason: 'turn-hard-timeout' }) }),
+  '这轮达到最长时间，已打断',
+);
+// 2026-09-16 之前落库的行只有笼统 reason，仍要渲染成老文案
+assert.equal(
+  displayedErrorContent({ content: '超时', meta: JSON.stringify({ interruptionReason: 'turn-timeout' }) }),
+  '这轮超时了，已打断',
 );
 assert.equal(fs.existsSync(path.join(root, 'src/sideChannel.ts')), false);
 assert.equal(fs.existsSync(path.join(root, 'src/sideQuote.ts')), false);

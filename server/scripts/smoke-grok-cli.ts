@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { GrokCliBackend } from '../src/agents/grokCli.js';
+import { GrokCliBackend } from '../src/backends/grokCli.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const mockCliPath = path.join(here, 'mock-grok.mjs');
@@ -23,7 +23,6 @@ assert.deepEqual(
 const backend = new GrokCliBackend({
   cliPath: mockCliPath,
   cwd: process.cwd(),
-  turnTimeoutMs: 5000,
   log: () => {},
 });
 
@@ -58,6 +57,7 @@ await backend.stop();
  *  生产里只表现为「阿野说完计划就没了」（stop_reason=cancelled）。 */
 async function argvOf(opts: {
   model?: string;
+  effort?: string;
   allowRules?: string[];
   disallowedTools?: string[];
   alwaysApprove?: boolean;
@@ -65,7 +65,6 @@ async function argvOf(opts: {
   const cli = new GrokCliBackend({
     cliPath: mockCliPath,
     cwd: process.cwd(),
-    turnTimeoutMs: 5000,
     log: () => {},
     ...opts,
   });
@@ -101,11 +100,18 @@ const selectedModel = await argvOf({ model: 'grok-4.6' });
 const modelFlag = Math.max(selectedModel.indexOf('-m'), selectedModel.indexOf('--model'));
 assert.equal(selectedModel[modelFlag + 1], 'grok-4.6', '选定模型必须真正透传给 Grok CLI');
 
+const selectedEffort = await argvOf({ effort: 'high' });
+assert.equal(
+  selectedEffort[selectedEffort.indexOf('--reasoning-effort') + 1],
+  'high',
+  '选定推理强度必须真正透传给 Grok CLI'
+);
+assert(!plain.includes('--reasoning-effort'), '默认强度不得传 reasoning-effort flag');
+
 // tool_call / tool_call_update → 与 claude-cli 同构的 tool_use / tool_result 事件
 const withTools = new GrokCliBackend({
   cliPath: path.join(here, 'mock-grok.mjs'),
   cwd: process.cwd(),
-  turnTimeoutMs: 5000,
   log: () => {},
 });
 await withTools.start(null);

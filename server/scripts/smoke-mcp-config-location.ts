@@ -8,11 +8,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { BackendFactory } from '../src/agents/backendFactory.js';
-import { MessageRepo } from '../src/agents/messageRepo.js';
-import { PromptComposer } from '../src/agents/promptComposer.js';
-import type { HubConfig } from '../src/config.js';
-import { openDb, type ContactRow } from '../src/db.js';
+import { BackendFactory } from '../src/runtime/backendFactory.js';
+import { MessageRepo } from '../src/messages/messageRepo.js';
+import { PromptComposer } from '../src/prompt/promptComposer.js';
+import type { HubConfig } from '../src/platform/config.js';
+import { openDb, type ContactRow } from '../src/platform/db.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-mcpcfg-'));
 const agentsDir = path.join(root, 'checkout', 'server', 'agents'); // 只读检出的位置
@@ -36,7 +36,8 @@ const config = {
   port: 3900,
   dbPath,
   agentsDir,
-  claude: { cliPath: 'claude', turnTimeoutMs: 1000 },
+  claude: { cliPath: 'claude' },
+  api: { turnTimeoutMs: 1000 },
   memory: { mcpUrl: 'http://127.0.0.1:8900/mcp' },
 } as unknown as HubConfig;
 

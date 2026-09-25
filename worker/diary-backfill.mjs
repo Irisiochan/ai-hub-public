@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
-import { normalizeDiaryConfig, shanghaiDateAt, TriageStore } from './triage-core.mjs';
-import { rollupDay } from './diary-rollup.mjs';
-import { DeepSeekClient, HubClient, VaultClient } from './triage-clients.mjs';
+import { normalizeDiaryConfig, shanghaiDateAt, TriageStore } from './triage/triage-core.mjs';
+import { rollupDay } from './triage/diary-rollup.mjs';
+import { DeepSeekClient, HubClient, VaultClient } from './triage/triage-clients.mjs';
 
 /**
  * 一次性补写历史日记流水，走 diary-rollup.mjs 同一条链路。

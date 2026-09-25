@@ -4,31 +4,28 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import {
-  buildDailyCheckSummary,
   DEFAULT_CATEGORIES,
   fileWatchContentDigest,
   isDailyMode,
   isIdeaMode,
-  isShanghaiSilentHour,
   isWebhookProbeInput,
+  isWorkflowOnlyConfig,
   nextTimerDelay,
   nextWallClockDelay,
   normalizeBacklogSweepConfig,
   normalizeCoordinationConfig,
   normalizeDiaryConfig,
-  normalizeIdeaConfig,
   normalizeOutcomeConfig,
-  normalizeProactiveConfig,
   normalizeTaskReminderConfig,
+  normalizeWorkflowOnlyConfig,
   shouldSuppressUnchangedFileWatch,
   shanghaiDateAt,
   timerSchedule,
   TriageStore,
-} from './triage-core.mjs';
-import { normalizeFollowupConfig } from './followups.mjs';
-import { normalizeAgendaConfig } from './agenda-core.mjs';
-import { normalizeRouteTriageConfig } from './route-triage-core.mjs';
-import { DeepSeekClient, HubClient, VaultClient } from './triage-clients.mjs';
+} from './triage/triage-core.mjs';
+import { normalizeAgendaConfig } from './triage/agenda-core.mjs';
+import { normalizeRouteTriageConfig } from './triage/route-triage-core.mjs';
+import { DeepSeekClient, HubClient, VaultClient } from './triage/triage-clients.mjs';
 import {
   agendaOnce,
   bearerMatches,
@@ -40,17 +37,15 @@ import {
   reminderShadow,
   routeAutoCleanupOnce,
   sleep,
-} from './worker-shared.mjs';
-import { followupMethods } from './worker-followups.mjs';
-import { coordinationMethods } from './worker-coordination.mjs';
-import { proactiveMethods } from './worker-proactive.mjs';
-import { outcomeMethods } from './worker-outcomes.mjs';
-import { backlogMethods } from './worker-backlog.mjs';
-import { reminderMethods } from './worker-reminders.mjs';
-import { ideaDiaryMethods } from './worker-idea-diary.mjs';
-import { pipelineMethods } from './worker-pipeline.mjs';
-import { agendaMethods } from './worker-agenda.mjs';
-import { routeTriageMethods } from './worker-route-triage.mjs';
+} from './triage/domain-shared.mjs';
+import { coordinationMethods } from './triage/domains/coordination.mjs';
+import { outcomeMethods } from './triage/domains/outcomes.mjs';
+import { backlogMethods } from './triage/domains/backlog.mjs';
+import { reminderMethods } from './triage/domains/reminders.mjs';
+import { ideaDiaryMethods } from './triage/domains/idea-diary.mjs';
+import { pipelineMethods } from './triage/pipeline.mjs';
+import { agendaMethods } from './triage/domains/agenda.mjs';
+import { routeTriageMethods } from './triage/domains/route-triage.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const configPath = path.resolve(process.argv.find((arg) => !arg.startsWith('--') && arg !== process.argv[0] && arg !== process.argv[1])
@@ -72,16 +67,18 @@ function loadConfig() {
     dailyEvents: Math.max(1, Number(value.breakers?.dailyEvents ?? 2000)),
     dailyCostCny: Math.max(0, Number(value.breakers?.dailyCostCny ?? 5)),
   };
-  value.proactive = normalizeProactiveConfig(value.proactive ?? {});
-  value.taskReminders = normalizeTaskReminderConfig(value.taskReminders ?? {}, value.proactive);
-  value.idea = normalizeIdeaConfig(value.idea ?? {});
+  value.taskReminders = normalizeTaskReminderConfig(value.taskReminders ?? {});
   value.coordination = normalizeCoordinationConfig(value.coordination ?? {});
   value.diary = normalizeDiaryConfig(value.diary ?? {});
   value.outcomes = normalizeOutcomeConfig(value.outcomes ?? {});
-  value.followups = normalizeFollowupConfig(value.followups ?? {});
+  delete value.proactive;
+  delete value.idea;
+  delete value.followups;
+  delete value.quietHours;
   value.backlogSweep = normalizeBacklogSweepConfig(value.backlogSweep ?? {});
   value.agenda = normalizeAgendaConfig(value.agenda ?? {}, value.coordination);
   value.routeTriage = normalizeRouteTriageConfig(value.routeTriage ?? {}, value.coordination);
+  value.workflowOnly = normalizeWorkflowOnlyConfig(value.workflowOnly ?? {});
   return value;
 }
 
@@ -170,6 +167,15 @@ class TriageWorker {
   }
 
   async startSources() {
+    // Workflow-only master boundary: no timer/file/http/vault sources may
+    // enqueue. Formal execution flows through the model-driven task ledger;
+    // the host coordination scan is retired (hygiene-only remains).
+    // Ledger is preserved (no deletion); queued legacy events drain as noop
+    // at consumption time in pipelineMethods.processOne.
+    if (isWorkflowOnlyConfig(this.config)) {
+      log('info', 'workflow-only: timer sources disabled (coordination scan retired; hygiene stays off here)');
+      return;
+    }
     const initialPolls = [];
     for (const source of this.config.sources ?? []) {
       if (!source?.id || source.enabled === false) continue;
@@ -212,86 +218,22 @@ class TriageWorker {
         }
       } else if (source.type === 'timer') {
         const { intervalMs } = timerSchedule(source);
-        const daily = isDailyMode(source);
-        const idea = isIdeaMode(source);
+        if (isDailyMode(source) || isIdeaMode(source)) {
+          log('info', 'removed companion timer ignored', { source: source.id });
+          continue;
+        }
         const emit = async () => {
           const now = Date.now();
-          let dateEvents = { today: [], upcoming: [], unclaimedToday: [] };
-          let fallbackFollowups = [];
-          let safetyEvents = [];
-          if (daily || idea) {
-            const proactive = this.proactiveConfig();
-            if (daily && !proactive.enabled) return;
-            if (idea && !this.ideaConfig().enabled) return;
-            // P3 S4: fresh safety life-events pierce silent hours — a flooded
-            // apartment at 02:00 still deserves one proactive check-in.
-            if (daily) safetyEvents = await this.loadUnclaimedSafetyEvents(now);
-            if (isShanghaiSilentHour(now, proactive.silentStartHour, proactive.silentEndHour)) {
-              if (!(daily && safetyEvents.length)) {
-                log('info', `${idea ? 'idea' : 'daily'} timer skipped: silent hours`, { source: source.id });
-                return;
-              }
-              log('info', 'daily timer piercing silent hours: fresh safety event', {
-                source: source.id,
-                safetyEventIds: safetyEvents.map((event) => event.id),
-              });
-            }
-            if (daily) {
-              dateEvents = await this.loadMatchedDateEvents(now);
-              fallbackFollowups = this.followupFallbacks(now);
-            }
-            const policy = idea
-              ? this.ideaPolicy(now)
-              : this.dailyPolicy(now, {
-                hasTodayDateEvent: dateEvents.unclaimedToday.length > 0 || fallbackFollowups.length > 0,
-                hasFreshSafetyEvent: safetyEvents.length > 0,
-              });
-            if (policy.poolFull || policy.gapBlocked) {
-              log('info', `${idea ? 'idea' : 'daily'} timer skipped by pool policy`, {
-                source: source.id,
-                reason: policy.poolFull ? 'pool-full' : 'minimum-gap',
-              });
-              return;
-            }
-          }
-          const policy = daily
-            ? this.dailyPolicy(now, {
-              hasTodayDateEvent: dateEvents.unclaimedToday.length > 0 || fallbackFollowups.length > 0,
-              hasFreshSafetyEvent: safetyEvents.length > 0,
-            })
-            : null;
           this.enqueue({
             source: source.id,
-            categoryHint: source.category ?? (idea ? 'idea' : daily ? 'daily' : 'system'),
+            categoryHint: source.category ?? 'system',
             dedupeKey: `${source.id}:${Math.floor(now / intervalMs)}`,
-            summary: idea
-              ? (source.summary ?? 'Daily autonomous room idea discussion.')
-              : daily
-              ? buildDailyCheckSummary({
-                ...source,
-                recipients: this.proactiveConfig().recipients,
-              }, now, {
-                proactive: this.proactiveConfig(),
-                forceActionable: policy.forceActionable,
-                todayDateEvents: dateEvents.unclaimedToday,
-                upcomingDateEvents: dateEvents.upcoming,
-                hasFallbackFollowup: fallbackFollowups.length > 0,
-                activeSafetyEvents: safetyEvents,
-              })
-              : (source.summary ?? `Scheduled wake from ${source.id}`),
+            summary: source.summary ?? `Scheduled wake from ${source.id}`,
             payload: {
               ...(source.payload && typeof source.payload === 'object' ? source.payload : {}),
-              mode: idea ? 'idea' : daily ? 'daily' : 'task',
+              mode: 'task',
               emittedAt: now,
-              // Positive scheduler identity for system-timer wake gate only.
-              // Webhook/http-diff with categoryHint:'system' must NOT carry this.
-              ...(!daily && !idea ? { origin: 'scheduler-timer' } : {}),
-              ...(daily && dateEvents.unclaimedToday.length
-                ? { todayDateEvents: dateEvents.unclaimedToday }
-                : {}),
-              ...(daily && fallbackFollowups.length
-                ? { fallbackFollowupIds: fallbackFollowups.map((item) => item.id) }
-                : {}),
+              origin: 'scheduler-timer',
             },
           });
         };
@@ -550,9 +492,10 @@ class TriageWorker {
     this.startWebhook();
     do {
       await this.collectOutcomesIfDue();
-      await this.processFollowupsIfDue();
       await this.scanCoordinationIfDue();
-      await this.resolveRouteSuggestionsIfDue();
+      if (!isWorkflowOnlyConfig(this.config)) {
+        await this.resolveRouteSuggestionsIfDue();
+      }
       const vaultWorked = await this.processVaultOutboxOne();
       const eventWorked = await this.processOne();
       if (once && !vaultWorked && !eventWorked) break;
@@ -585,9 +528,7 @@ class TriageWorker {
 // TriageWorker 本体只保留生命周期、轮询与调度（constructor/run/close/sources/webhook/maintenance）。
 Object.assign(
   TriageWorker.prototype,
-  followupMethods,
   coordinationMethods,
-  proactiveMethods,
   outcomeMethods,
   backlogMethods,
   reminderMethods,

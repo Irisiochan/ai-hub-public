@@ -3,7 +3,7 @@ import {
   countsAsUnread,
   incrementReadStateForIncoming,
   unreadHydrationAfter,
-} from '../src/unreadState.ts';
+} from '../src/chat/unreadState.ts';
 
 const base = {
   id: 101,

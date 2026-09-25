@@ -1,0 +1,110 @@
+.room-tasks {
+  border-top: 1px solid var(--border, #2a2a2a);
+  padding: 8px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: min(55dvh, 640px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.room-tasks-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.room-task-create { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.room-task-create label { display: grid; gap: 4px; font-size: 13px; }
+.room-task-create input, .room-task-create select, .room-task-create textarea { box-sizing: border-box; width: 100%; min-width: 0; padding: 8px; }
+.room-task-create textarea { min-height: 80px; resize: vertical; }
+.room-task-create .room-task-create-check { display: flex; align-items: center; }
+.room-task-create-check input { width: auto; }
+.room-task-create button { margin-right: 8px; }
+
+.room-tasks-count {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.room-tasks-refresh {
+  font-size: 12px;
+}
+
+.room-tasks-empty {
+  font-size: 12px;
+  opacity: 0.65;
+  margin: 0;
+}
+
+.room-task {
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.room-task-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.room-task-status {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+
+.room-task-status.open { color: #9ecbff; }
+.room-task-status.in_progress { color: #ffd479; }
+.room-task-status.in_review { color: #d2a8ff; }
+.room-task-status.blocked { color: #ff9d9d; }
+.room-task-status.closed { color: #8dd48d; }
+.room-task-status.dropped { color: #888; }
+
+.room-task-title {
+  font-weight: 600;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-task-meta {
+  font-size: 12px;
+  opacity: 0.75;
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+
+.room-task-body {
+  padding: 0 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.room-task-req {
+  font-size: 12px;
+  white-space: pre-wrap;
+  margin: 0;
+  opacity: 0.9;
+}
+
+.room-task-section {
+  border-top: 1px dashed var(--border, #2a2a2a);
+  padding-top: 6px;
+}

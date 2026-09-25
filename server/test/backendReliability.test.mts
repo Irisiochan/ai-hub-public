@@ -4,15 +4,15 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { DirectApiBackend } from '../src/agents/directApi/base.js';
-import { openContact } from '../src/agents/configSchemas.js';
-import { AgentRuntime } from '../src/agents/runtime.js';
-import { AsyncQueue, type AgentBackend, type TurnEvent } from '../src/agents/types.js';
-import type { HubConfig } from '../src/config.js';
-import { openDb } from '../src/db.js';
-import { sessionAuth } from '../src/middleware/auth.js';
-import { SseHub } from '../src/sse.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { DirectApiBackend } from '../src/backends/directApi/base.js';
+import { openContact } from '../src/contacts/configSchemas.js';
+import { AgentRuntime } from '../src/runtime/runtime.js';
+import { AsyncQueue, type AgentBackend, type TurnEvent } from '../src/backends/types.js';
+import type { HubConfig } from '../src/platform/config.js';
+import { openDb } from '../src/platform/db.js';
+import { sessionAuth } from '../src/platform/middleware/auth.js';
+import { SseHub } from '../src/platform/sse.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-backend-reliability-'));
 const uploadsDir = path.join(tempDir, 'uploads');
@@ -188,9 +188,10 @@ async function unexpectedEofInterruptsStreamingRows(): Promise<void> {
     webDist: '',
     uploadsDir,
     releasesDir: path.join(tempDir, 'releases'),
-    claude: { cliPath: 'claude', turnTimeoutMs: 5000 },
-    codex: { cliPath: 'codex', turnTimeoutMs: 5000 },
-    grok: { cliPath: 'grok', turnTimeoutMs: 5000 },
+    claude: { cliPath: 'claude' },
+    codex: { cliPath: 'codex' },
+    grok: { cliPath: 'grok' },
+    api: { turnTimeoutMs: 5000 },
     memory: {
       mcpUrl: null,
       repoPath: null,
@@ -333,9 +334,10 @@ async function deployRestartReasonIsPersisted(): Promise<void> {
     webDist: '',
     uploadsDir,
     releasesDir: path.join(tempDir, 'releases'),
-    claude: { cliPath: 'claude', turnTimeoutMs: 5000 },
-    codex: { cliPath: 'codex', turnTimeoutMs: 5000 },
-    grok: { cliPath: 'grok', turnTimeoutMs: 5000 },
+    claude: { cliPath: 'claude' },
+    codex: { cliPath: 'codex' },
+    grok: { cliPath: 'grok' },
+    api: { turnTimeoutMs: 5000 },
     memory: {
       mcpUrl: null, repoPath: null, injectOnSpawn: false, searchPerTurn: false,
       capture: false, maxTurnChars: 1200, sessionMaxAgeHours: 0,

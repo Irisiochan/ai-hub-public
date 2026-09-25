@@ -6,9 +6,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { hardDeleteMessages } from '../src/attachments.js';
-import { openDb } from '../src/db.js';
-import { SoftDeletePurge } from '../src/purge.js';
+import { hardDeleteMessages } from '../src/messages/attachments.js';
+import { openDb } from '../src/platform/db.js';
+import { SoftDeletePurge } from '../src/ops/purge.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-purge-'));
 const dbPath = path.join(dir, 'test.db');

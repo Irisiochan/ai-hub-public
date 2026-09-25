@@ -11,33 +11,33 @@ import {
   type MessageReadStates,
   type UserProfile,
   type WorkerJob,
-} from './api';
-import ChatPane from './components/ChatPane';
-import ContactConfig from './components/ContactConfig';
-import ContactList from './components/ContactList';
-import PublishStatusPanel from './components/PublishStatusPanel';
-import UserConfig from './components/UserConfig';
-import LedgerPanel from './components/LedgerPanel';
-import WorkerPanel from './components/WorkerPanel';
+} from './platform/api';
+import ChatPane from './chat/ChatPane';
+import ContactConfig from './contacts/ContactConfig';
+import ContactList from './contacts/ContactList';
+import PublishStatusPanel from './ops/PublishStatusPanel';
+import UserConfig from './settings/UserConfig';
+import WorkerPanel from './jobs/WorkerPanel';
+import WorkflowModules from './workflow/WorkflowModules';
 import {
   createTrailingMessageReconciler,
   mergeIncomingMessage,
   mergeMessageRows,
   shouldReconcileMessagesAfterStatus,
-} from './messageMerge';
+} from './chat/messageMerge';
 import {
   applyMessageDeltaBatch,
   MessageDeltaBatcher,
   rememberRecentMessageId,
   trimMessageCache,
-} from './messagePerformance';
-import { effectiveMessageOrigin } from './messageSource.ts';
-import { incrementReadStateForIncoming, unreadHydrationAfter } from './unreadState';
-import { playSoundEvent } from './sound';
-import { getUiPreferenceSnapshot } from './preferences/store';
-import type { MotionState } from './motionPresence';
-import { workerState } from './useWorkerState';
-import { WORKER_RECONCILE_MS } from './workerState';
+} from './chat/messagePerformance';
+import { effectiveMessageOrigin } from './chat/messageSource.ts';
+import { incrementReadStateForIncoming, unreadHydrationAfter } from './chat/unreadState';
+import { playSoundEvent } from './settings/sound';
+import { getUiPreferenceSnapshot } from './settings/preferences/store';
+import type { MotionState } from './platform/motionPresence';
+import { workerState } from './jobs/useWorkerState';
+import { WORKER_RECONCILE_MS } from './jobs/workerState';
 
 const emptyReadStates = (): MessageReadStates => ({
   main: { origin: 'main', lastReadMessageId: 0, firstUnreadId: null, unreadCount: 0 },
@@ -54,7 +54,6 @@ export default function App() {
   const [user, setUser] = useState<UserProfile>({ name: 'User', avatar: '🦋', color: '#e94560' });
   const [userConfigOpen, setUserConfigOpen] = useState(false);
   const [workerPanelOpen, setWorkerPanelOpen] = useState(false);
-  const [ledgerPanelOpen, setLedgerPanelOpen] = useState(false);
   const [publishStatusOpen, setPublishStatusOpen] = useState(false);
   const [chatMotionState, setChatMotionState] = useState<MotionState>('enter');
 
@@ -277,6 +276,7 @@ export default function App() {
       onWorker: workerState.applyWorker,
       onJobMessage: workerState.applyJobMessage,
       onWorkflowProfile: () => { void workerState.reconcile().catch(() => {}); },
+      onRoomTask: ({ roomId }) => window.dispatchEvent(new CustomEvent('room-tasks:changed', { detail: { roomId } })),
       onJob: (job: WorkerJob) => {
         workerState.applyJob(job);
         if (!liveEventsReadyRef.current) return;
@@ -288,6 +288,7 @@ export default function App() {
         deltaBatcher.flushNow();
         void resync();
         void workerState.reconcile().catch(() => {});
+        window.dispatchEvent(new CustomEvent('room-tasks:changed', { detail: {} }));
       },
     }, () => selectedRef.current ? [selectedRef.current] : []);
     eventsRef.current = connection;
@@ -350,7 +351,6 @@ export default function App() {
         user={user}
         onUserClick={() => setUserConfigOpen(true)}
         onWorkers={() => setWorkerPanelOpen(true)}
-        onLedger={() => setLedgerPanelOpen(true)}
         onPublishStatus={() => setPublishStatusOpen(true)}
       />
       {selected ? (
@@ -381,8 +381,12 @@ export default function App() {
         <ContactConfig contact={configFor.contact} contacts={contacts} onClose={() => setConfigFor(null)} />
       )}
       {userConfigOpen && <UserConfig user={user} onClose={() => setUserConfigOpen(false)} />}
-      {workerPanelOpen && <WorkerPanel onClose={() => setWorkerPanelOpen(false)} />}
-      {ledgerPanelOpen && <LedgerPanel onClose={() => setLedgerPanelOpen(false)} />}
+      {workerPanelOpen && (
+        <WorkerPanel
+          onClose={() => setWorkerPanelOpen(false)}
+          modulesPanel={<WorkflowModules initiallyOpen />}
+        />
+      )}
       {publishStatusOpen && <PublishStatusPanel onClose={() => setPublishStatusOpen(false)} />}
     </div>
   );

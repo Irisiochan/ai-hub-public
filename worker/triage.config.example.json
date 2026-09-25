@@ -3,6 +3,9 @@
   "pollMs": 1000,
   "maxAttempts": 5,
   "claimTimeoutMs": 300000,
+  "workflowOnly": {
+    "enabled": false
+  },
   "categories": [
     "calendar",
     "file-change",
@@ -52,39 +55,11 @@
       "backlog": "task-owner"
     }
   },
-  "proactive": {
-    "enabled": true,
-    "dailyDispatchLimit": 10,
-    "minDailyDispatches": 0,
-    "forceAfterHour": 18,
-    "minimumGapMinutes": 180,
-    "silentStartHour": 0,
-    "silentEndHour": 9,
-    "presenceIdleMinutes": 30,
-    "safetyEvents": {
-      "enabled": true,
-      "freshnessHours": 12,
-      "maxPerEventPerDay": 2
-    },
-    "recipients": ["claude", "codex", "aye"]
-  },
   "taskReminders": {
     "enabled": true,
     "intervalMinutes": 45,
     "jitterSeconds": 900,
     "recipient": "claude"
-  },
-  "idea": {
-    "enabled": false,
-    "writeDiary": true,
-    "roomId": "room-contact-id",
-    "hostName": "DS 主持",
-    "dailyDispatchLimit": 1,
-    "reactionRounds": 2,
-    "recentTopicLimit": 12,
-    "maxTopicAttempts": 3,
-    "roundPollMs": 2000,
-    "roundTimeoutMs": 1200000
   },
   "coordination": {
     "enabled": false,
@@ -149,14 +124,6 @@
     "maxAgeDays": 30,
     "batchSize": 50
   },
-  "followups": {
-    "enabled": true,
-    "minExpectedMinutes": 5,
-    "maxExpectedMinutes": 180,
-    "defaultExpectedMinutes": 30,
-    "expireAfterMinutes": 360,
-    "scanLimit": 40
-  },
   "breakers": {
     "dailyEvents": 2000,
     "dailyCostCny": 5
@@ -175,24 +142,6 @@
       "jitterSeconds": 900,
       "category": "system",
       "summary": "Review current backlog and only act when there is concrete unfinished work."
-    },
-    {
-      "id": "daily-check-in",
-      "type": "timer",
-      "mode": "daily",
-      "intervalMinutes": 45,
-      "jitterSeconds": 900,
-      "category": "daily",
-      "summary": "Proactive daily companion check for User. Prefer natural care, reminders, or light openers over empty noise."
-    },
-    {
-      "id": "daily-idea-room",
-      "type": "timer",
-      "mode": "idea",
-      "intervalMinutes": 1440,
-      "jitterSeconds": 3600,
-      "category": "idea",
-      "summary": "Choose one novel free-form topic and host a room discussion."
     },
     {
       "id": "diary-rollup",

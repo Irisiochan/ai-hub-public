@@ -14,7 +14,7 @@ import {
   vaultTaskAlreadySettled,
   visibleJobsForContact,
   workerReceiptJobId,
-} from '../src/sideJobActions.ts';
+} from '../src/chat/sideJobReceipts.ts';
 
 const receipt = {
   id: 42,

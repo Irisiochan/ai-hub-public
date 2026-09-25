@@ -33,3 +33,19 @@ jobs:
         if: matrix.area == 'server'
         working-directory: server
         run: node --import tsx scripts/smoke-worker-control.ts
+
+  shared-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the drift check compares shared/* with the commit that set each version
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Shared package versions track their content and consumer locks
+        run: node deploy/check-shared-packages.mjs --require-history
+      - name: Guard self-test
+        run: node --test deploy/check-shared-packages.test.mjs

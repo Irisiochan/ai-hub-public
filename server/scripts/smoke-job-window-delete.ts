@@ -6,9 +6,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { openDb } from '../src/db.js';
-import { workersRouter } from '../src/routes/workers.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { openDb } from '../src/platform/db.js';
+import { workersRouter } from '../src/jobs/workerRoutes.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 let failures = 0;
 function check(label: string, condition: boolean, detail = '') {

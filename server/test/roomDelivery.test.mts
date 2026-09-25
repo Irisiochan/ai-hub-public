@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { AgentManager } from '../src/agents/manager.js';
-import { MessageRepo } from '../src/agents/messageRepo.js';
-import { openDb, type ContactRow } from '../src/db.js';
+import { AgentManager } from '../src/runtime/manager.js';
+import { MessageRepo } from '../src/messages/messageRepo.js';
+import { openDb, type ContactRow } from '../src/platform/db.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-room-delivery-'));
 const dbPath = path.join(root, 'hub.db');
@@ -41,10 +41,11 @@ const config = {
   agentsDir,
   webDist: '',
   uploadsDir,
-  claude: { cliPath: 'claude', turnTimeoutMs: 5000 },
-  codex: { cliPath: 'codex', turnTimeoutMs: 5000, nativeCompact: { enabled: false } },
-  grok: { cliPath: 'grok', turnTimeoutMs: 5000 },
-  opencode: { cliPath: 'opencode', turnTimeoutMs: 5000 },
+  claude: { cliPath: 'claude' },
+  codex: { cliPath: 'codex', nativeCompact: { enabled: false } },
+  grok: { cliPath: 'grok' },
+  opencode: { cliPath: 'opencode' },
+  api: { turnTimeoutMs: 5000 },
   memory: {
     mcpUrl: null,
     repoPath: null,
@@ -115,8 +116,8 @@ try {
   assert.match(prompt, /@阿野 修好了，可以工作了/, 'trigger message is forced into the delivery window');
   assert.match(prompt, /"direct_mention":true/);
   assert.match(prompt, /必须至少简短确认，不能只回 \[PASS\]/);
-  assert.match(prompt, /sender_type=member\/host 的协调通告、催办或回执一律只回 \[PASS\]/,
-    'coordination PASS safety gate remains in place');
+  assert.match(prompt, /任务流转只认显式任务工具/,
+    'task-ledger authority notice replaces the retired coordination gate');
   assert.doesNotMatch(prompt, /旧积压-0/, 'stale oldest backlog is not delivered');
   const state = db.prepare(
     "SELECT last_seen_id FROM room_member_state WHERE contact_id = 'room-test' AND member_id = 'aye-test'"
@@ -142,9 +143,9 @@ try {
   const hostPrompt = requests[1].messages
     .map((message: { content?: unknown }) => String(message.content ?? ''))
     .join('\n');
-  assert.match(hostPrompt, /roomHost 本轮明确点名派单给你/);
-  assert.match(hostPrompt, /\[PASS\].*说明一句当前无事可做的原因/);
-  assert.match(hostPrompt, /delegate_to_worker/);
+  assert.match(hostPrompt, /历史 room-host 点名轮次（退役链路）/);
+  assert.match(hostPrompt, /新协作一律走 task_\* 工具/);
+  assert.doesNotMatch(hostPrompt, /请三选一/);
   assert.doesNotMatch(hostPrompt, /实在没话说也可以只回 \[PASS\]/);
   const visiblePass = db.prepare(
     "SELECT COUNT(*) AS count FROM messages WHERE contact_id = 'room-test' AND sender = 'aye-test' AND content = '[PASS]'"

@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DirectApiBackend } from '../src/agents/directApi.js';
-import { openDb } from '../src/db.js';
+import { DirectApiBackend } from '../src/backends/directApi.js';
+import { openDb } from '../src/platform/db.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.prompt-cache-summary-rollover-smoke.db');

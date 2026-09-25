@@ -6,12 +6,12 @@
  */
 import assert from 'node:assert/strict';
 import { z } from 'zod';
-import { defineGatewayTool } from '../src/agents/gatewayTool.js';
+import { defineGatewayTool } from '../src/platform/gatewayTool.js';
 import http from 'node:http';
-import { DirectApiBackend } from '../src/agents/directApi.js';
-import { AnthropicProvider } from '../src/agents/directApi/anthropic.js';
-import { GeminiProvider, normalizeGeminiFinishReason } from '../src/agents/directApi/gemini.js';
-import { OpenAiProvider } from '../src/agents/directApi/openai.js';
+import { DirectApiBackend } from '../src/backends/directApi.js';
+import { AnthropicProvider } from '../src/backends/directApi/anthropic.js';
+import { GeminiProvider, normalizeGeminiFinishReason } from '../src/backends/directApi/gemini.js';
+import { OpenAiProvider } from '../src/backends/directApi/openai.js';
 
 function sse(res: http.ServerResponse, events: unknown[], done = true) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });

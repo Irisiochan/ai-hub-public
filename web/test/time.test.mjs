@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { formatConversationListTime, formatMessageTimestamp, formatRemainingMinutes } from '../src/time.ts';
+import { formatConversationListTime, formatMessageTimestamp, formatRemainingMinutes } from '../src/platform/time.ts';
 
 const shanghaiAfternoon = new Date('2026-08-02T09:45:00Z');
 

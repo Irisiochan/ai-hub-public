@@ -1,9 +1,10 @@
 import type { z } from 'zod';
 
-export type ContactBackend = 'claude-cli' | 'codex' | 'grok-cli' | 'opencode-cli' | 'api' | 'room';
+export type ContactBackend = 'claude-cli' | 'codex' | 'grok-cli' | 'opencode-cli' | 'kimi-cli' | 'api' | 'room';
 export type ContactKind = 'dm' | 'room';
 export type ApiProvider = 'anthropic' | 'openai-compat' | 'gemini';
 
+export const WORKFLOW_RUNNERS: Array<'claude' | 'codex' | 'grok' | 'opencode'>;
 export const CLI_CONTACT_BACKENDS: ContactBackend[];
 export function isCliContactBackend(backend: ContactBackend | string): boolean;
 
@@ -26,7 +27,7 @@ export interface ProjectAccessConfig {
 export interface DelegationConfig {
   enabled: boolean;
   workspaces: string[];
-  runners: Array<'claude' | 'codex' | 'grok'>;
+  runners: Array<'claude' | 'codex' | 'grok' | 'opencode'>;
   allowShell: boolean;
   allowSsh: boolean;
   workerId?: string;
@@ -63,8 +64,6 @@ export interface ContactConfig {
   model: string;
   modelOptions: Array<string | { id: string; label?: string; [key: string]: unknown }>;
   effort: string;
-  /** Legacy absolute timeout override; used as hard cap when turnHardTimeoutMs is absent. */
-  turnTimeoutMs?: number;
   turnIdleTimeoutMs?: number;
   turnHardTimeoutMs?: number;
   memory: ContactMemoryConfig;
@@ -72,8 +71,6 @@ export interface ContactConfig {
   heartbeat: HeartbeatConfig;
   routing: RoutingConfig;
   projectAccess: ProjectAccessConfig;
-  affect: 'on' | 'off';
-  affectBaseline: { valence: number; arousal: number };
   /** Cross-contact life events: extract from this contact's DM + inject other contacts' events per turn. */
   lifeEvents: 'on' | 'off';
   /** NSFW craft injection: always=preamble, intimate=per-turn fail-open, off=never. */

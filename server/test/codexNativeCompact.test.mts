@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { CodexAppServerBackend } from '../src/agents/codexAppServer.js';
+import { CodexAppServerBackend } from '../src/backends/codexAppServer.js';
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 

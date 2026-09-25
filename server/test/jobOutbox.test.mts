@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openDb, type JobRow } from '../src/db.js';
-import { JobStore, OUTBOX_MAX_ATTEMPTS } from '../src/workers/jobStore.js';
-import type { SseHub } from '../src/sse.js';
+import { openDb, type JobRow } from '../src/platform/db.js';
+import { JobStore, OUTBOX_MAX_ATTEMPTS } from '../src/jobs/jobStore.js';
+import type { SseHub } from '../src/platform/sse.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-job-outbox-'));
 const db = openDb(path.join(tempDir, 'hub.db'));

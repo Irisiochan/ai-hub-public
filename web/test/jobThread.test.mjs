@@ -3,10 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const root = path.resolve(import.meta.dirname, '..');
-const source = fs.readFileSync(path.join(root, 'src/components/JobThread.tsx'), 'utf8');
-const workerPanel = fs.readFileSync(path.join(root, 'src/components/WorkerPanel.tsx'), 'utf8');
-const list = fs.readFileSync(path.join(root, 'src/components/chat/MessageList.tsx'), 'utf8');
-const pane = fs.readFileSync(path.join(root, 'src/components/ChatPane.tsx'), 'utf8');
+const source = fs.readFileSync(path.join(root, 'src/jobs/JobThread.tsx'), 'utf8');
+const workerPanel = fs.readFileSync(path.join(root, 'src/jobs/WorkerPanel.tsx'), 'utf8');
+const list = fs.readFileSync(path.join(root, 'src/chat/MessageList.tsx'), 'utf8');
+const pane = fs.readFileSync(path.join(root, 'src/chat/ChatPane.tsx'), 'utf8');
 const styles = fs.readFileSync(path.join(root, 'src/styles.css'), 'utf8');
 
 assert.match(source, /useState\(false\)/, 'execution process must be hidden by default');

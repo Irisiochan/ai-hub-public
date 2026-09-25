@@ -8,17 +8,13 @@
  *      (gate must not swallow real webhook/http-diff events)
  *  2c) system timer + vault empty string / garbage text → fail-open to L1 (no short-circuit)
  *  3) naive UTC Hub timestamps are timezone-independent; explicit ISO keeps its instant
- *  4) User present within threshold → normal and guaranteed daily slots are journaled/suppressed;
- *     idle or a failed presence scan → guaranteed slot dispatches
- *  5) webhook kind:"probe" → acknowledged, never enqueued; real non-probe system event reaches L1
+ *  4) webhook kind:"probe" → acknowledged, never enqueued; real non-probe system event reaches L1
  *
  * Removing the system-timer gate makes (1) fail (model is called).
  * Broadening isSystemTimerEvent to categoryHint==='system' alone makes (2b)/(4) fail.
  * Treating empty/garbage vault as zero-tasks makes (2c) fail.
  * Removing the UTC normalization makes (3)/(4b) fail under America/New_York.
- * Removing the presence gate or restoring the guaranteed-slot bypass makes (4a)/(4c) fail.
- * Turning presence errors fail-closed makes (4e) fail.
- * Removing the probe bypass makes (5) fail (event is enqueued/dispatched).
+ * Removing the probe bypass makes (4) fail (event is enqueued/dispatched).
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -35,8 +31,7 @@ import {
   messageTimestampMs,
   parseHubTimestampMs,
   shouldSuppressUnchangedFileWatch,
-} from '../../worker/triage-core.mjs';
-import { irisPresenceFromMessages } from '../../worker/followups.mjs';
+} from '../../worker/triage/triage-core.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const workerDir = path.resolve(here, '../../worker');
@@ -212,7 +207,6 @@ const ELIGIBLE_SNAPSHOT = [
   assert.equal(shouldSuppressUnchangedFileWatch(digA, digC), false);
   assert.equal(shouldSuppressUnchangedFileWatch(null, digA), false);
 
-  const now = Date.now();
   const naiveUtc = '2026-08-31 18:00:00';
   const expectedUtc = Date.parse('2026-08-31T18:00:00Z');
   assert.equal(parseHubTimestampMs(naiveUtc), expectedUtc);
@@ -223,21 +217,6 @@ const ELIGIBLE_SNAPSHOT = [
     expectedUtc,
     'explicit offsets must retain their instant',
   );
-  const present = irisPresenceFromMessages(
-    [{ sender: 'user', role: 'user', content: 'hi', status: 'done', created_at: now - 5 * 60_000 }],
-    { now, idleMinutes: 30 },
-  );
-  const idle = irisPresenceFromMessages(
-    [{ sender: 'user', role: 'user', content: 'hi', status: 'done', created_at: now - 90 * 60_000 }],
-    { now, idleMinutes: 30 },
-  );
-  const aiOnly = irisPresenceFromMessages(
-    [{ sender: 'assistant', role: 'assistant', content: 'hello', status: 'done', created_at: now - 1_000 }],
-    { now, idleMinutes: 30 },
-  );
-  assert.equal(present.active, true);
-  assert.equal(idle.active, false);
-  assert.equal(aiOnly.active, false, 'AI output must not count as User presence');
 }
 
 async function systemTimerScenario(taskText: string): Promise<{ deepseekCalls: number; stdout: string }> {
@@ -522,201 +501,6 @@ async function nonTimerSystemEventScenario(taskText: string): Promise<{ deepseek
   );
 }
 
-async function dailyPresenceScenario(opts: {
-  userMessageAgeMs: number | null;
-  aiOnly?: boolean;
-  guaranteedSlot?: boolean;
-  messageScanError?: boolean;
-}): Promise<{ deepseekCalls: number; dispatchCount: number; stdout: string }> {
-  let deepseekCalls = 0;
-  let dispatchCount = 0;
-  const now = Date.now();
-  const deepseek = await listen((_req, res) => {
-    deepseekCalls += 1;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        choices: [{
-          message: {
-            content: JSON.stringify({
-              actionable: opts.guaranteedSlot === true,
-              needsLocalExec: false,
-              category: 'daily',
-              priority: 1,
-              suggestedRecipient: opts.guaranteedSlot ? 'codex' : null,
-              rationale: opts.guaranteedSlot ? 'guaranteed daily slot' : 'nothing pressing',
-            }),
-          },
-        }],
-        usage: { prompt_tokens: 10, completion_tokens: 5 },
-      }),
-    );
-  });
-  const hub = await listen((req, res) => {
-    if (req.method === 'GET' && req.url === '/api/contacts') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          contacts: [{
-            id: 'codex',
-            name: 'Codex',
-            kind: 'dm',
-            state: 'idle',
-            last_at: new Date(now - 60_000).toISOString().replace('T', ' ').replace('Z', ''),
-            config: {
-              routing: {
-                enabled: true,
-                recipientKey: 'codex',
-                categories: ['daily', 'system'],
-                dailyLimit: 10,
-                cooldownMinutes: 0,
-              },
-            },
-          }],
-        }),
-      );
-      return;
-    }
-    if (req.method === 'GET' && req.url?.startsWith('/api/contacts/codex/messages')) {
-      if (opts.messageScanError) {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'presence scan unavailable' }));
-        return;
-      }
-      const messages =
-        opts.userMessageAgeMs == null
-          ? []
-          : opts.aiOnly
-            ? [{
-              id: 1,
-              sender: 'assistant',
-              role: 'assistant',
-              content: 'AI only',
-              status: 'done',
-              created_at: new Date(now - opts.userMessageAgeMs)
-                .toISOString().replace('T', ' ').replace('Z', ''),
-            }]
-            : [{
-              id: 1,
-              sender: 'user',
-              role: 'user',
-              content: '我在',
-              status: 'done',
-              created_at: new Date(now - opts.userMessageAgeMs)
-                .toISOString().replace('T', ' ').replace('Z', ''),
-            }];
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ messages }));
-      return;
-    }
-    if (req.method === 'POST') dispatchCount += 1;
-    res.writeHead(202, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ queued: true }));
-  });
-  const vault = await listen(vaultHandler(ELIGIBLE_SNAPSHOT));
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-wake-daily-'));
-  const configPath = path.join(dir, 'triage.json');
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({
-      stateFile: path.join(dir, 'triage.db'),
-      categories: ['daily', 'system', 'other'],
-      deepseek: {
-        baseUrl: `http://127.0.0.1:${portOf(deepseek)}`,
-        apiKeyEnv: 'TEST_DEEPSEEK_KEY',
-        flashModel: 'deepseek-v4-flash',
-        proModel: 'deepseek-v4-pro',
-      },
-      hub: { baseUrl: `http://127.0.0.1:${portOf(hub)}` },
-      vault: { url: `http://127.0.0.1:${portOf(vault)}/mcp` },
-      routing: { rules: {}, fuzzyFallback: false },
-      proactive: {
-        enabled: true,
-        minDailyDispatches: opts.guaranteedSlot ? 1 : 0,
-        dailyDispatchLimit: 10,
-        forceAfterHour: opts.guaranteedSlot ? 0 : 23,
-        minimumGapMinutes: 0,
-        silentStartHour: 0,
-        silentEndHour: 0,
-        presenceIdleMinutes: 30,
-        recipients: ['codex'],
-      },
-      outcomes: { enabled: false },
-      followups: { enabled: false },
-      sources: [{
-        id: 'daily-check-in',
-        type: 'timer',
-        mode: 'daily',
-        intervalMinutes: 45,
-        jitterSeconds: 0,
-        category: 'daily',
-        summary: 'Proactive daily companion check for User.',
-      }],
-    }),
-  );
-  try {
-    const result = await runWorker(configPath, {
-      TEST_DEEPSEEK_KEY: 'test-only',
-      TZ: 'America/New_York',
-    });
-    assert.equal(result.code, 0, result.stderr || result.stdout);
-    return { deepseekCalls, dispatchCount, stdout: result.stdout };
-  } finally {
-    await Promise.all([close(deepseek), close(hub), close(vault)]);
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-// ④a User present → normal daily skips and journals the suppression.
-{
-  const present = await dailyPresenceScenario({ userMessageAgeMs: 5 * 60_000 });
-  assert.equal(present.deepseekCalls, 0, 'daily must not call model while User is present');
-  assert.match(present.stdout, /daily suppressed by User presence/);
-}
-
-// ④b Naive UTC older than the threshold stays idle under America/New_York.
-{
-  const idle = await dailyPresenceScenario({ userMessageAgeMs: 90 * 60_000 });
-  assert.ok(idle.deepseekCalls >= 1, 'daily must still evaluate when User is idle past threshold');
-  assert.doesNotMatch(idle.stdout, /daily suppressed by User presence/);
-}
-
-// ④c Guaranteed slot also yields to recent User presence and writes the journal marker.
-{
-  const present = await dailyPresenceScenario({
-    userMessageAgeMs: 5 * 60_000,
-    guaranteedSlot: true,
-  });
-  assert.equal(present.deepseekCalls, 0);
-  assert.equal(present.dispatchCount, 0);
-  assert.match(present.stdout, /daily suppressed by User presence/);
-}
-
-// ④d Guaranteed slot dispatches when User is idle.
-{
-  const idle = await dailyPresenceScenario({
-    userMessageAgeMs: 90 * 60_000,
-    guaranteedSlot: true,
-  });
-  assert.ok(idle.deepseekCalls >= 1);
-  assert.equal(idle.dispatchCount, 1);
-  assert.doesNotMatch(idle.stdout, /daily suppressed by User presence/);
-}
-
-// ④e Presence scan errors fail open: the guaranteed slot still dispatches.
-{
-  const failedProbe = await dailyPresenceScenario({
-    userMessageAgeMs: 5 * 60_000,
-    guaranteedSlot: true,
-    messageScanError: true,
-  });
-  assert.ok(failedProbe.deepseekCalls >= 1);
-  assert.equal(failedProbe.dispatchCount, 1);
-  assert.match(failedProbe.stdout, /User presence message scan failed/);
-  assert.doesNotMatch(failedProbe.stdout, /daily suppressed by User presence/);
-}
-
-// ⑤ webhook probe: never enqueue / never dispatch
 {
   let deepseekCalls = 0;
   let dispatchCount = 0;

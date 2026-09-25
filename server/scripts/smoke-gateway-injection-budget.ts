@@ -5,9 +5,9 @@ import {
   identityGuard,
   nsfwCraftCompact,
 } from '../src/memory/inject.js';
-import { buildConversationReplay } from '../src/agents/conversationReplay.js';
-import { delegationGuidance } from '../src/agents/gatewayTools.js';
-import { estimateTokens } from '../src/agents/tokenEstimate.js';
+import { buildConversationReplay } from '../src/prompt/conversationReplay.js';
+import { delegationGuidance } from '../src/jobs/delegateTools.js';
+import { estimateTokens } from '../src/prompt/tokenEstimate.js';
 
 const metric = (text: string) => ({ chars: text.length, tokens: estimateTokens(text) });
 const guard = identityGuard({ id: 'claude', name: 'Claude', backend: 'claude-cli' });

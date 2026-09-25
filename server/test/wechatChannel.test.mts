@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openDb, type ContactRow, type MessageRow } from '../src/db.js';
+import { openDb, type ContactRow, type MessageRow } from '../src/platform/db.js';
 import { WechatChannel } from '../src/wechat/channel.js';
 import { loadWechatChannelConfig, type WechatChannelConfig } from '../src/wechat/config.js';
 import { downloadWechatImage, parseWechatAesKey } from '../src/wechat/media.js';

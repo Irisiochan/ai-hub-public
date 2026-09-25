@@ -11,7 +11,7 @@ import {
   selectMessageWindow,
   trimMessageCache,
   windowBoundaryForMessage,
-} from '../src/messagePerformance.ts';
+} from '../src/chat/messagePerformance.ts';
 
 const message = (id, content = `message ${id}`) => ({
   id,
@@ -93,7 +93,7 @@ assert.equal(recentIds.size, MAX_RECENT_MESSAGE_IDS);
 assert.equal(recentIds.has('contact-a:0'), false);
 
 const root = path.resolve(import.meta.dirname, '..');
-const listSource = fs.readFileSync(path.join(root, 'src/components/chat/MessageList.tsx'), 'utf8');
+const listSource = fs.readFileSync(path.join(root, 'src/chat/MessageList.tsx'), 'utf8');
 assert.match(listSource, /new MutationObserver/, 'read sentinels must share one persistent observer');
 assert.doesNotMatch(
   listSource,

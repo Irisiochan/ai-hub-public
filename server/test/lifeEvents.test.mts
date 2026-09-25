@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openDb, type ContactRow } from '../src/db.js';
+import { openDb, type ContactRow } from '../src/platform/db.js';
 import {
   LifeEventRepo,
   LifeEventService,
@@ -10,7 +10,7 @@ import {
   lifeEventsEnabled,
   shanghaiStamp,
   type LifeEventExtractResult,
-} from '../src/agents/lifeEvents.js';
+} from '../src/companion/lifeEvents.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'life-events-'));
 const db = openDb(path.join(dir, 'hub.db'));

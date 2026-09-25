@@ -6,9 +6,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { openDb } from '../src/db.js';
-import { workersRouter } from '../src/routes/workers.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { openDb } from '../src/platform/db.js';
+import { workersRouter } from '../src/jobs/workerRoutes.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 let failures = 0;
 function check(label: string, condition: boolean, detail = '') {
@@ -62,6 +62,10 @@ try {
     body: JSON.stringify({ bootId: 'boot-a', capabilities }),
   });
   check('首次开机自动接单', connected.worker.acceptingJobs === true && connected.worker.status === 'online');
+  const me = await call('/worker/me', { headers: auth });
+  check('launcher 用 Worker token 读到自身在线', me.worker.id === 'my-pc' && me.worker.status === 'online');
+  const anonymousMe = await fetch(`${base}/worker/me`);
+  check('无 Worker token 读不到自身状态', anonymousMe.status === 401);
 
   let controlled = await call('/workers/my-pc/control', {
     method: 'POST', body: JSON.stringify({ enabled: false }),

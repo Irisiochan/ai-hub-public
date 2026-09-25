@@ -4,10 +4,11 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { contactConfig, openContact } from '../src/agents/configSchemas.js';
-import type { ContactRow } from '../src/db.js';
-import { openDb } from '../src/db.js';
-import { contactsRouter } from '../src/routes/contacts.js';
+import { contactConfig, openContact } from '../src/contacts/configSchemas.js';
+import type { ContactRow } from '../src/platform/db.js';
+import { openDb } from '../src/platform/db.js';
+import { contactsRouter } from '../src/contacts/contactRoutes.js';
+import { contactModelRouter } from '../src/runtime/modelRoutes.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.contact-config-smoke.db');
@@ -33,7 +34,8 @@ const hubConfig = {
 } as any;
 const app = express();
 app.use(express.json());
-app.use('/api/contacts', contactsRouter(db, sse, manager, hubConfig));
+app.use('/api/contacts', contactModelRouter(db, sse, manager, hubConfig));
+app.use('/api/contacts', contactsRouter(db, sse, manager));
 const server = http.createServer(app);
 const port = await new Promise<number>((resolve) => {
   server.listen(0, '127.0.0.1', () => resolve((server.address() as { port: number }).port));
@@ -64,6 +66,8 @@ try {
     'Grok 下拉必须先保留默认项，再跟随 CLI 的运行时模型目录'
   );
   assert.equal(result.body.dynamic, true, 'Grok CLI 查询成功时应标记为动态目录');
+  assert.ok(result.body.efforts?.length > 0, 'Grok 应沿用 catalog 的推理强度档');
+  assert.equal(result.body.currentEffort, '', '未设置过强度时应回落到默认空档');
 
   result = await json('/grok-model-test/model', {
     method: 'PATCH',
@@ -82,6 +86,33 @@ try {
   const defaultGrok = db.prepare('SELECT config FROM contacts WHERE id = ?').get('grok-model-test') as { config: string };
   assert.equal(JSON.parse(defaultGrok.config).model, '', '默认项必须持久化为空串，维持 CLI 自动选择');
   assert.equal(switchedModels.at(-1), '', '切回默认也必须通知 manager 重建 backend');
+
+  const grokSwitches = switchedModels.length;
+  result = await json('/grok-model-test/effort', {
+    method: 'PATCH',
+    body: JSON.stringify({ effort: 'high' }),
+  });
+  assert.equal(result.status, 200, 'Grok 推理强度应可保存');
+  const grokEffort = db.prepare('SELECT config FROM contacts WHERE id = ?').get('grok-model-test') as { config: string };
+  assert.equal(JSON.parse(grokEffort.config).effort, 'high', '选定强度必须持久化到联系人 config');
+  assert.equal(switchedModels.length, grokSwitches + 1, '切强度也必须通知 manager 重建 backend');
+
+  result = await json('/grok-model-test/effort', {
+    method: 'PATCH',
+    body: JSON.stringify({ effort: '' }),
+  });
+  assert.equal(result.status, 200, 'Grok 默认强度仍应可保存');
+  assert.equal(
+    JSON.parse((db.prepare('SELECT config FROM contacts WHERE id = ?').get('grok-model-test') as { config: string }).config).effort,
+    '',
+    '默认强度必须持久化为空串'
+  );
+
+  result = await json('/grok-model-test/effort', {
+    method: 'PATCH',
+    body: JSON.stringify({ effort: 'not-a-real-effort' }),
+  });
+  assert.equal(result.status, 400, 'Grok 无效强度应被拒绝');
 
   db.prepare(
     `INSERT INTO contacts (id, name, avatar, color, backend, kind, config, sort_order)
@@ -145,7 +176,7 @@ try {
   assert.equal(Object.keys(openContact(row)).includes('configParsed'), false, 'configParsed must be non-enumerable');
   assert.equal('configParsed' in { ...row }, false, 'spreading a row must not leak parsed secrets');
 
-  for (const backend of ['claude-cli', 'codex', 'grok-cli', 'opencode-cli'] as const) {
+  for (const backend of ['claude-cli', 'codex', 'grok-cli', 'opencode-cli', 'kimi-cli'] as const) {
     const cliRow = {
       ...row,
       id: `${backend}-default-heartbeat`,

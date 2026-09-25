@@ -5,7 +5,7 @@ import {
   createMessageIdempotencyKey,
   persistedSendResultFromError,
   prepareMessageSendAttempt,
-} from '../src/sendIdempotency.ts';
+} from '../src/platform/sendIdempotency.ts';
 
 assert.equal(
   createMessageIdempotencyKey(() => 'fixed-uuid'),

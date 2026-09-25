@@ -4,10 +4,10 @@ import type { Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { buildDelegateTools } from '../src/agents/gatewayTools.js';
-import { openDb } from '../src/db.js';
-import { workersRouter } from '../src/routes/workers.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { buildDelegateTools } from '../src/jobs/delegateTools.js';
+import { openDb } from '../src/platform/db.js';
+import { workersRouter } from '../src/jobs/workerRoutes.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-runner-availability-'));
 const db = openDb(path.join(dir, 'test.db'));

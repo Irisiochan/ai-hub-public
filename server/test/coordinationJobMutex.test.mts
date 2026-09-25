@@ -3,10 +3,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { openDb } from '../src/db.js';
-import { workersRouter } from '../src/routes/workers.js';
-import { coordinationTaskPath, JobStore } from '../src/workers/jobStore.js';
-import type { SseHub } from '../src/sse.js';
+import { openDb } from '../src/platform/db.js';
+import { workersRouter } from '../src/jobs/workerRoutes.js';
+import { coordinationTaskPath, JobStore } from '../src/jobs/jobStore.js';
+import type { SseHub } from '../src/platform/sse.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-coordination-mutex-'));
 const db = openDb(path.join(tempDir, 'hub.db'));

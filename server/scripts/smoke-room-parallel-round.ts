@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AgentManager } from '../dist/agents/manager.js';
-import { openDb, type ContactRow } from '../dist/db.js';
+import { AgentManager } from '../dist/runtime/manager.js';
+import { openDb, type ContactRow } from '../dist/platform/db.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.room-parallel.db');
@@ -47,9 +47,10 @@ const port = await new Promise<number>((resolve) =>
 const db = openDb(dbPath);
 const config = {
   port: 3900, host: '127.0.0.1', dbPath, agentsDir, webDist: '', uploadsDir,
-  claude: { cliPath: 'claude', turnTimeoutMs: 5000 },
-  codex: { cliPath: 'codex', turnTimeoutMs: 5000 },
-  grok: { cliPath: 'grok', turnTimeoutMs: 5000 },
+  claude: { cliPath: 'claude' },
+  codex: { cliPath: 'codex' },
+  grok: { cliPath: 'grok' },
+  api: { turnTimeoutMs: 5000 },
   memory: { mcpUrl: null, repoPath: null, injectOnSpawn: false, searchPerTurn: false, capture: false, maxTurnChars: 0, sessionMaxAgeHours: 0 },
   backup: { enabled: false, dir: '', intervalHours: 24, keep: 1 },
 };

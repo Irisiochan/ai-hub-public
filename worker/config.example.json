@@ -12,7 +12,8 @@
   "runners": [
     "codex",
     "claude",
-    "grok"
+    "grok",
+    "opencode"
   ],
   "maxConcurrent": 2,
   "codexCommand": "codex.cmd",
@@ -27,5 +28,22 @@
   "allowTaobao": false,
   "taobaoMcpUrl": "http://localhost:3654/mcp",
   "grokCommand": "C:/Users/YOUR-USER/.grok/bin/grok.exe",
-  "grokModel": ""
+  "grokModel": "",
+  "opencodeCommand": "opencode.cmd",
+  "opencodeModel": "opencode-go/muse-spark-1.3-contributor",
+  "opencodeStall": {
+    "enabled": true,
+    "noOutputMs": 720000,
+    "noProgressMs": 600000,
+    "diagnoseGraceMs": 180000,
+    "killGraceMs": 15000,
+    "checkIntervalMs": 5000,
+    "maxRecoveries": 1,
+    "cpuWatch": true,
+    "cpuEpsilonMs": 50,
+    "cpuBusyRatio": 0.05,
+    "degradedConfirmMultiplier": 3,
+    "toolLimitMs": 600000,
+    "ttlGuardMs": 300000
+  }
 }

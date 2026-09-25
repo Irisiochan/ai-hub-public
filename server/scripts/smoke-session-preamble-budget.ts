@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { PromptComposer } from '../src/agents/promptComposer.js';
-import { estimateTokens } from '../src/agents/tokenEstimate.js';
+import { PromptComposer } from '../src/prompt/promptComposer.js';
+import { estimateTokens } from '../src/prompt/tokenEstimate.js';
 import { buildSessionPreamble, buildTurnBlock } from '../src/memory/inject.js';
 
 const COMPACT_FACTS = [

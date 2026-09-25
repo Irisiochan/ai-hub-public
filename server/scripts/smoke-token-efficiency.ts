@@ -7,9 +7,9 @@ import {
   DirectApiBackend,
   estimateTokens,
   TOOL_RESULT_MAX_CHARS,
-} from '../src/agents/directApi.js';
-import { touchConversationSummary } from '../src/agents/conversationSummary.js';
-import { openDb, invalidateConversationSummary } from '../src/db.js';
+} from '../src/backends/directApi.js';
+import { touchConversationSummary } from '../src/prompt/conversationSummary.js';
+import { openDb, invalidateConversationSummary } from '../src/platform/db.js';
 import { buildSessionPreamble } from '../src/memory/inject.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -219,7 +219,7 @@ try {
   );
 
   // --- tool result 选择性压缩（非无差别砍 80%）---
-  const { compressToolResultForInjection } = await import('../src/agents/selectiveCompress.js');
+  const { compressToolResultForInjection } = await import('../src/prompt/selectiveCompress.js');
   const longDump = Array.from({ length: 200 }, (_, i) => `DEBUG payload ${i} ${'x'.repeat(80)}`).join('\n');
   const protectedBlock = [
     'AssertionError: expected 200 to equal 404',

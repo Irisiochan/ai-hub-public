@@ -4,7 +4,7 @@
  * to contact.name → 「会议室 思考中」.
  */
 import assert from 'node:assert/strict';
-import { statusText } from '../src/statusText.ts';
+import { statusText } from '../src/chat/statusText.ts';
 
 // Room with member → member name
 assert.equal(

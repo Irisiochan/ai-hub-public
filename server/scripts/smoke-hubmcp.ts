@@ -9,9 +9,9 @@ import path from 'node:path';
 import express from 'express';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { openDb } from '../src/db.js';
-import { hubMcpRouter } from '../src/routes/hubMcp.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { openDb } from '../src/platform/db.js';
+import { hubMcpRouter } from '../src/tools/hubMcpRoutes.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 let failures = 0;
 function check(label: string, cond: boolean, detail = '') {

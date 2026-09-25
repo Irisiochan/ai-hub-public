@@ -6,7 +6,7 @@ import {
   listApiModels,
   modelsUrlFor,
   optionFromApiItem,
-} from '../src/agents/apiModels.js';
+} from '../src/backends/apiModels.js';
 
 assert.equal(
   modelsUrlFor('openai-compat', 'https://api.openai.com/v1/chat/completions'),

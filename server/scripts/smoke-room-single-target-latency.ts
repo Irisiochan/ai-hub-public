@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AgentManager } from '../dist/agents/manager.js';
-import { openDb } from '../dist/db.js';
+import { AgentManager } from '../dist/runtime/manager.js';
+import { openDb } from '../dist/platform/db.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.room-single-target-latency.db');
@@ -54,9 +54,10 @@ const config = {
   agentsDir,
   webDist: '',
   uploadsDir,
-  claude: { cliPath: 'claude', turnTimeoutMs: 5000 },
-  codex: { cliPath: 'codex', turnTimeoutMs: 5000 },
-  grok: { cliPath: 'grok', turnTimeoutMs: 5000 },
+  claude: { cliPath: 'claude' },
+  codex: { cliPath: 'codex' },
+  grok: { cliPath: 'grok' },
+  api: { turnTimeoutMs: 5000 },
   memory: { mcpUrl: null, repoPath: null, injectOnSpawn: false, searchPerTurn: false, capture: false, maxTurnChars: 0, sessionMaxAgeHours: 0 },
   backup: { enabled: false, dir: '', intervalHours: 24, keep: 1 },
 };

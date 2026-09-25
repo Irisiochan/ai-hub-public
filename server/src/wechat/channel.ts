@@ -1,16 +1,20 @@
 import crypto from 'node:crypto';
-import type { AgentManager } from '../agents/manager.js';
-import type { DmTurnResult } from '../agents/runtime.js';
+import type { AgentManager, DmTurnResult } from '../runtime/index.js';
 import {
   MAX_IMAGES_PER_MESSAGE,
   deleteMessageFiles,
   persistImageBuffer,
   withAttachments,
-} from '../attachments.js';
-import { CaptionService } from '../captionService.js';
-import type { ContactRow, Db, MessageRow } from '../db.js';
-import { logMessage, type HubLogger } from '../logger.js';
-import type { SseHub } from '../sse.js';
+  CaptionService,
+} from '../messages/index.js';
+import {
+  type ContactRow,
+  type Db,
+  type MessageRow,
+  logMessage,
+  type HubLogger,
+  type SseHub,
+} from '../platform/index.js';
 import type { WechatChannelConfig } from './config.js';
 import { downloadWechatImage, type DownloadedWechatImage } from './media.js';
 import {

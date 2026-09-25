@@ -1,6 +1,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { loadConfig } from '../src/config.js';
+import { loadConfig } from '../src/platform/config.js';
 import { buildTurnBlock } from '../src/memory/inject.js';
 
 const userText = process.argv.slice(2).join(' ').trim() || '还有 vault 检索命中质量🫡';

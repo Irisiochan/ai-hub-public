@@ -9,22 +9,22 @@ import Database from 'better-sqlite3';
 import express from 'express';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { buildCameraTool } from '../src/agents/cameraTool.js';
-import { frameAutomatedTurn } from '../src/agents/messageSource.js';
+import { buildCameraTool } from '../src/devices/cameraTool.js';
+import { frameAutomatedTurn } from '../src/messages/messageSource.js';
 import {
   CompanionHeartbeat,
   HeartbeatError,
   randomHeartbeatIntervalMinutes,
   type HeartbeatStatus,
-} from '../src/agents/companionHeartbeat.js';
-import type { ContactRow, MessageRow } from '../src/db.js';
-import { openDb } from '../src/db.js';
-import { loadMigrationFiles } from '../src/migrations.js';
-import { workersRouter } from '../src/routes/workers.js';
-import { hubMcpRouter } from '../src/routes/hubMcp.js';
-import { heartbeatRouter } from '../src/routes/heartbeat.js';
-import { CameraSnapBroker } from '../src/workers/cameraSnap.js';
-import { JobStore } from '../src/workers/jobStore.js';
+} from '../src/heartbeat/companionHeartbeat.js';
+import type { ContactRow, MessageRow } from '../src/platform/db.js';
+import { openDb } from '../src/platform/db.js';
+import { loadMigrationFiles } from '../src/platform/migrations.js';
+import { workersRouter } from '../src/jobs/workerRoutes.js';
+import { hubMcpRouter } from '../src/tools/hubMcpRoutes.js';
+import { heartbeatRouter } from '../src/heartbeat/heartbeatRoutes.js';
+import { CameraSnapBroker } from '../src/devices/cameraSnap.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-heartbeat-smoke-'));
 const dbPath = path.join(dir, 'data', 'hub.db');
@@ -334,7 +334,21 @@ try {
     new URL(`http://127.0.0.1:${port}/api/hub-mcp/heartbeat-only`)
   ));
   const listed = await mcp.listTools();
-  assert.deepEqual(listed.tools.map((tool) => tool.name), ['camera_snap'], 'heartbeat-only MCP exposes no delegation tools');
+  assert.deepEqual(
+    listed.tools.map((tool) => tool.name),
+    [
+      'task_create', 'task_import', 'task_get', 'task_submit_evidence', 'task_handoff',
+      'task_accept', 'task_decline', 'task_pass', 'task_block', 'task_done',
+      'execution_start', 'execution_get',
+      'review_submit', 'release_execute', 'task_retry', 'task_wait', 'camera_snap',
+    ],
+    'heartbeat-only MCP exposes camera plus task tools (task calls still need a room module turn)',
+  );
+  const noAuthority = await mcp.callTool({
+    name: 'task_get', arguments: { room_id: 'room-x', task_path: 'tasks/x.md' },
+  });
+  assert.equal(noAuthority.isError, true, 'task tools refuse without room module-turn authority');
+  assert.match((noAuthority.content as Array<{ text: string }>)[0].text, /模块轮次授权/);
 
   const textOnlyResult = await mcp.callTool({ name: 'camera_snap', arguments: {} });
   assert.equal(textOnlyResult.isError, true);

@@ -12,7 +12,7 @@ binaries produced by their toolchains.
 AI Hub itself is licensed under the repository MIT license. Every component below remains
 subject to its own license; package names and versions come from the lockfiles.
 
-Generated component versions: **706**.
+Generated component versions: **704**.
 
 ## License summary
 
@@ -29,7 +29,7 @@ Generated component versions: **706**.
 | BSD-3-Clause | 12 |
 | CC-BY-4.0 | 1 |
 | ISC | 46 |
-| MIT | 607 |
+| MIT | 605 |
 | Python-2.0 | 1 |
 | Unlicense | 1 |
 | WTFPL | 1 |
@@ -265,7 +265,7 @@ Generated component versions: **706**.
 | [browserslist](https://www.npmjs.com/package/browserslist/v/4.28.8) | 4.28.8 | MIT | Web UI | build/dev |
 | [buffer](https://www.npmjs.com/package/buffer/v/5.7.1) | 5.7.1 | MIT | Desktop, Gateway / Docker | runtime |
 | [buffer-crc32](https://www.npmjs.com/package/buffer-crc32/v/0.2.13) | 0.2.13 | MIT | Android | build/dev |
-| [buffer-from](https://www.npmjs.com/package/buffer-from/v/1.1.2) | 1.1.2 | MIT | Desktop, Gateway / Docker | runtime |
+| [buffer-from](https://www.npmjs.com/package/buffer-from/v/1.1.2) | 1.1.2 | MIT | Desktop | build/dev |
 | [builder-util](https://www.npmjs.com/package/builder-util/v/26.15.3) | 26.15.3 | MIT | Desktop | build/dev |
 | [builder-util-runtime](https://www.npmjs.com/package/builder-util-runtime/v/9.7.0) | 9.7.0 | MIT | Desktop | build/dev |
 | [busboy](https://www.npmjs.com/package/busboy/v/1.6.0) | 1.6.0 | MIT | Desktop, Gateway / Docker | runtime |
@@ -298,7 +298,6 @@ Generated component versions: **706**.
 | [commander](https://www.npmjs.com/package/commander/v/9.5.0) | 9.5.0 | MIT | Desktop | build/dev |
 | [compare-version](https://www.npmjs.com/package/compare-version/v/0.1.2) | 0.1.2 | MIT | Desktop | build/dev |
 | [concat-map](https://www.npmjs.com/package/concat-map/v/0.0.1) | 0.0.1 | MIT | Desktop | build/dev |
-| [concat-stream](https://www.npmjs.com/package/concat-stream/v/2.0.0) | 2.0.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [content-disposition](https://www.npmjs.com/package/content-disposition/v/0.5.4) | 0.5.4 | MIT | Desktop, Gateway / Docker | runtime |
 | [content-disposition](https://www.npmjs.com/package/content-disposition/v/1.1.0) | 1.1.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [content-type](https://www.npmjs.com/package/content-type/v/1.0.5) | 1.0.5 | MIT | Desktop, Gateway / Docker | runtime |
@@ -413,7 +412,7 @@ Generated component versions: **706**.
 | [hasown](https://www.npmjs.com/package/hasown/v/2.0.4) | 2.0.4 | MIT | Desktop, Gateway / Docker | runtime |
 | [hast-util-to-jsx-runtime](https://www.npmjs.com/package/hast-util-to-jsx-runtime/v/2.3.6) | 2.3.6 | MIT | Web UI | runtime |
 | [hast-util-whitespace](https://www.npmjs.com/package/hast-util-whitespace/v/3.0.0) | 3.0.0 | MIT | Web UI | runtime |
-| [hono](https://www.npmjs.com/package/hono/v/4.13.2) | 4.13.2 | MIT | Desktop, Gateway / Docker | runtime |
+| [hono](https://www.npmjs.com/package/hono/v/4.13.9) | 4.13.9 | MIT | Desktop, Gateway / Docker | runtime |
 | [hosted-git-info](https://www.npmjs.com/package/hosted-git-info/v/4.1.0) | 4.1.0 | ISC | Desktop | build/dev |
 | [html-url-attributes](https://www.npmjs.com/package/html-url-attributes/v/3.0.1) | 3.0.1 | MIT | Web UI | runtime |
 | [http-cache-semantics](https://www.npmjs.com/package/http-cache-semantics/v/4.2.0) | 4.2.0 | BSD-2-Clause | Desktop | build/dev |
@@ -450,7 +449,7 @@ Generated component versions: **706**.
 | [jiti](https://www.npmjs.com/package/jiti/v/2.7.0) | 2.7.0 | MIT | Desktop | build/dev |
 | [jose](https://www.npmjs.com/package/jose/v/6.2.8) | 6.2.8 | MIT | Desktop, Gateway / Docker | runtime |
 | [js-tokens](https://www.npmjs.com/package/js-tokens/v/4.0.0) | 4.0.0 | MIT | Web UI | runtime |
-| [js-yaml](https://www.npmjs.com/package/js-yaml/v/4.3.1) | 4.3.1 | MIT | Desktop | build/dev |
+| [js-yaml](https://www.npmjs.com/package/js-yaml/v/4.3.2) | 4.3.2 | MIT | Desktop | build/dev |
 | [jsesc](https://www.npmjs.com/package/jsesc/v/3.1.0) | 3.1.0 | MIT | Web UI | build/dev |
 | [json-buffer](https://www.npmjs.com/package/json-buffer/v/3.0.1) | 3.0.1 | MIT | Desktop | build/dev |
 | [json-schema-traverse](https://www.npmjs.com/package/json-schema-traverse/v/1.0.0) | 1.0.0 | MIT | Desktop, Gateway / Docker | runtime |
@@ -540,7 +539,7 @@ Generated component versions: **706**.
 | [mkdirp-classic](https://www.npmjs.com/package/mkdirp-classic/v/0.5.3) | 0.5.3 | MIT | Desktop, Gateway / Docker | runtime |
 | [ms](https://www.npmjs.com/package/ms/v/2.0.0) | 2.0.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [ms](https://www.npmjs.com/package/ms/v/2.1.3) | 2.1.3 | MIT | Android, Desktop, Gateway / Docker, Web UI | runtime |
-| [multer](https://www.npmjs.com/package/multer/v/2.2.0) | 2.2.0 | MIT | Desktop, Gateway / Docker | runtime |
+| [multer](https://www.npmjs.com/package/multer/v/2.4.0) | 2.4.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [nanoid](https://www.npmjs.com/package/nanoid/v/3.3.18) | 3.3.18 | MIT | Web UI | build/dev |
 | [napi-build-utils](https://www.npmjs.com/package/napi-build-utils/v/2.0.0) | 2.0.0 | MIT | Desktop, Gateway / Docker | runtime |
 | [native-run](https://www.npmjs.com/package/native-run/v/2.0.3) | 2.0.3 | MIT | Android | build/dev |
@@ -700,7 +699,6 @@ Generated component versions: **706**.
 | [type-fest](https://www.npmjs.com/package/type-fest/v/0.13.1) | 0.13.1 | (MIT OR CC0-1.0) | Desktop | build/dev |
 | [type-is](https://www.npmjs.com/package/type-is/v/1.6.18) | 1.6.18 | MIT | Desktop, Gateway / Docker | runtime |
 | [type-is](https://www.npmjs.com/package/type-is/v/2.1.0) | 2.1.0 | MIT | Desktop, Gateway / Docker | runtime |
-| [typedarray](https://www.npmjs.com/package/typedarray/v/0.0.6) | 0.0.6 | MIT | Desktop, Gateway / Docker | runtime |
 | [typescript](https://www.npmjs.com/package/typescript/v/5.9.3) | 5.9.3 | Apache-2.0 | Gateway / Docker, Web UI | build/dev |
 | [undici](https://www.npmjs.com/package/undici/v/6.28.0) | 6.28.0 | MIT | Desktop | build/dev |
 | [undici](https://www.npmjs.com/package/undici/v/7.29.0) | 7.29.0 | MIT | Desktop | build/dev |

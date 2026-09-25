@@ -5,9 +5,9 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import Database from 'better-sqlite3';
-import { openDb, type MessageRow } from '../src/db.js';
-import { loadMigrationFiles } from '../src/migrations.js';
-import { messagesRouter } from '../src/routes/messages.js';
+import { openDb, type MessageRow } from '../src/platform/db.js';
+import { loadMigrationFiles } from '../src/platform/migrations.js';
+import { messagesRouter } from '../src/runtime/messageRoutes.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-message-idempotency-'));
 const here = path.dirname(fileURLToPath(import.meta.url));

@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { openDb } from '../src/db.js';
-import { DeployReceiptPoller } from '../src/workers/deployReceipt.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { openDb } from '../src/platform/db.js';
+import { DeployReceiptPoller } from '../src/jobs/deployReceipt.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 test('a deploy receipt promotes jobs whose delivered commit is an ancestor', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-deploy-receipt-'));

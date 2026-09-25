@@ -3,7 +3,7 @@ import {
   closeExternalLink,
   openExternalLink,
   shouldOpenInExternalView,
-} from '../src/externalLinks.ts';
+} from '../src/chat/externalLinks.ts';
 
 const current = 'http://localhost:5173/chat';
 

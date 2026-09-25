@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { filterModelOptions, visibleModelOptions } from '../src/modelSearch.ts';
+import { filterModelOptions, visibleModelOptions } from '../src/contacts/modelSearch.ts';
 
 const root = path.resolve(import.meta.dirname, '..');
-const picker = fs.readFileSync(path.join(root, 'src/components/ModelPicker.tsx'), 'utf8');
-const drawer = fs.readFileSync(path.join(root, 'src/components/chat/RuntimeDrawer.tsx'), 'utf8');
-const apiFields = fs.readFileSync(path.join(root, 'src/components/contact-config/ApiFields.tsx'), 'utf8');
+const picker = fs.readFileSync(path.join(root, 'src/contacts/ModelPicker.tsx'), 'utf8');
+const drawer = fs.readFileSync(path.join(root, 'src/chat/RuntimeDrawer.tsx'), 'utf8');
+const apiFields = fs.readFileSync(path.join(root, 'src/contacts/ApiFields.tsx'), 'utf8');
 
 assert.match(picker, /aria-label="搜索模型"/);
 assert.match(picker, /role="listbox"/);

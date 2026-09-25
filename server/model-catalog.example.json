@@ -35,6 +35,7 @@
   "opencode-cli": {
     "models": [
       { "id": "", "label": "默认（OpenCode 自动选择）", "isDefault": true },
+      { "id": "opencode-go/muse-spark-1.3-contributor", "label": "Muse Spark 1.3 Contributor (Go)" },
       { "id": "opencode-go/muse-spark-1.2-contributor", "label": "Muse Spark 1.2 Contributor (Go)" }
     ],
     "efforts": [

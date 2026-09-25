@@ -8,8 +8,8 @@ import {
   setMotionLevel,
   setSoundCueEnabled,
   setSoundVolume,
-} from '../src/preferences/store.ts';
-import { playSoundEvent, previewSounds, soundTiming } from '../src/sound.ts';
+} from '../src/settings/preferences/store.ts';
+import { playSoundEvent, previewSounds, soundTiming } from '../src/settings/sound.ts';
 
 assert.equal(resolveMotionLevel(null, false, 'full'), 'full');
 assert.equal(resolveMotionLevel(null, true, 'full'), 'reduced');
@@ -91,11 +91,11 @@ assert.equal(await playSoundEvent('send', 'throttle:second', contexts.currentFor
 const root = path.resolve(import.meta.dirname, '..');
 const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
 const app = read('src/App.tsx');
-const pane = read('src/components/ChatPane.tsx');
-const list = read('src/components/chat/MessageList.tsx');
-const sound = read('src/sound.ts');
+const pane = read('src/chat/ChatPane.tsx');
+const list = read('src/chat/MessageList.tsx');
+const sound = read('src/settings/sound.ts');
 const motion = read('src/styles/motion.css');
-const settings = read('src/components/MotionSoundSettings.tsx');
+const settings = read('src/settings/MotionSoundSettings.tsx');
 
 assert.match(app, /onDelta: \(delta\) => deltaBatcher\.add\(delta\)/);
 assert.doesNotMatch(app.match(/onDelta:[^\n]+/)?.[0] ?? '', /playSoundEvent|motion/i);

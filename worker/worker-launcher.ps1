@@ -36,6 +36,7 @@ $script:Child = $null
 $script:Status = $null
 $script:LastError = $null
 $script:RestartCount = 0
+$script:ReleaseSha = $null
 $script:BootId = $null
 
 function Get-ShanghaiTime {
@@ -43,9 +44,20 @@ function Get-ShanghaiTime {
   return $value.ToString('yyyy-MM-ddTHH:mm:ss') + '+08:00'
 }
 
+# The worker appends to the same file. Logging is best-effort: a sharing
+# violation right after spawning the worker used to throw inside the start
+# path, mark the start failed and orphan the just-started child.
 function Write-LauncherLog([string]$Level, [string]$Message) {
-  $line = "[$(Get-ShanghaiTime)] $Level launcher $Message"
-  [IO.File]::AppendAllText($script:LogPath, $line + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+  $bytes = [Text.UTF8Encoding]::new($false).GetBytes("[$(Get-ShanghaiTime)] $Level launcher $Message" + [Environment]::NewLine)
+  for ($attempt = 0; $attempt -lt 5; $attempt++) {
+    try {
+      $stream = [IO.FileStream]::new($script:LogPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+      try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+      return
+    } catch {
+      Start-Sleep -Milliseconds 50
+    }
+  }
 }
 
 function Save-State(
@@ -68,6 +80,7 @@ function Save-State(
     updatedAt = Get-ShanghaiTime
     nextRetryAt = $NextRetryAt
     serverUrl = if ($script:Status) { $script:Status.serverUrl } else { $null }
+    releaseSha = $script:ReleaseSha
   }
   $json = $script:Status | ConvertTo-Json -Depth 5
   $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
@@ -109,7 +122,28 @@ function Show-Status {
   $state | ConvertTo-Json -Depth 5
 }
 
+function Get-LauncherCommandLine([int]$DelaySeconds = 0) {
+  'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Action run -Config "{1}" -StartupDelaySeconds {2}' -f $script:LauncherPath, $Config, $DelaySeconds
+}
+
+# Start the launcher through WMI so its parent is WmiPrvSE, outside the
+# caller's process tree and Job object. Start-Process inherits the caller's
+# Job: a restart issued from a packaged desktop app (Codex, seen live
+# 2026-09-23 23:58) died with that app's auto-update, silently taking the
+# worker offline. Start-Process stays only as a fallback.
 function Start-HiddenLauncher([int]$DelaySeconds = 0) {
+  $commandLine = Get-LauncherCommandLine $DelaySeconds
+  try {
+    $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+    $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+      CommandLine = $commandLine
+      ProcessStartupInformation = $startup
+    }
+    if ($result.ReturnValue -eq 0) { return }
+    Write-LauncherLog 'WARN' "Win32_Process.Create returned $($result.ReturnValue); falling back to Start-Process"
+  } catch {
+    Write-LauncherLog 'WARN' "Win32_Process.Create failed: $($_.Exception.Message); falling back to Start-Process"
+  }
   $args = @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
     '-File', ('"{0}"' -f $script:LauncherPath), '-Action', 'run',
@@ -132,7 +166,7 @@ function Request-Stop([int]$TimeoutSeconds = 20) {
 
 function Install-Launcher {
   New-Item -Path $script:RunKey -Force | Out-Null
-  $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Action run -Config "{1}" -StartupDelaySeconds 300' -f $script:LauncherPath, $Config
+  $command = Get-LauncherCommandLine 300
   New-ItemProperty -Path $script:RunKey -Name $script:RunName -Value $command -PropertyType String -Force | Out-Null
   Write-Output "installed HKCU Run: $script:RunName"
 }
@@ -177,17 +211,82 @@ function Test-NetworkReady([Uri]$ServerUri) {
   return Test-TcpEndpoint $ServerUri
 }
 
-function Test-WorkerOnline([string]$ServerUrl, [string]$WorkerId) {
+# /api/workers requires a hub session the launcher does not have (it always
+# got 401 and reported "starting" forever); ask about this worker with its token.
+function Test-WorkerOnline([string]$ServerUrl, [string]$WorkerToken) {
   try {
-    $response = Invoke-RestMethod -Uri ($ServerUrl.TrimEnd('/') + '/api/workers') -TimeoutSec 5
-    return $null -ne ($response.workers | Where-Object { $_.id -eq $WorkerId -and $_.status -in @('online', 'busy', 'paused') } | Select-Object -First 1)
+    $response = Invoke-RestMethod -Uri ($ServerUrl.TrimEnd('/') + '/api/worker/me') -TimeoutSec 5 `
+      -Headers @{ Authorization = "Bearer $WorkerToken" }
+    return $response.worker.status -in @('online', 'busy', 'paused')
   } catch { return $false }
 }
 
-function Start-WorkerProcess([string]$NodePath) {
+# The PC Worker must not run whatever branch the shared checkout happens to
+# have checked out (2026-09-14 it silently sat on an unreviewed task branch).
+# Each start exports worker/ + shared/ from a fixed ref (default master) into
+# a per-commit release directory and runs that copy. Paths inside the worker
+# resolve from the config directory, so state, locks and logs stay put.
+# Config "releaseRef": "" opts out and runs the checkout directly (dev only).
+function Resolve-WorkerScript([object]$Cfg) {
+  $ref = 'master'
+  if ($null -ne $Cfg -and $Cfg.PSObject.Properties.Name -contains 'releaseRef') { $ref = [string]$Cfg.releaseRef }
+  if (-not $ref) {
+    Write-LauncherLog 'WARN' 'releaseRef disabled; running worker directly from the checkout'
+    return $script:WorkerPath
+  }
+  $repo = Split-Path $script:WorkerDir -Parent
+  try {
+    # No pipeline here: an early-terminating pipeline rewrites $LASTEXITCODE.
+    $sha = & git -C $repo rev-parse --verify --quiet ($ref + '^{commit}') 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $sha) { throw "cannot resolve release ref '$ref'" }
+    $sha = ([string]@($sha)[0]).Trim()
+    $root = Join-Path $env:LOCALAPPDATA 'ai-hub-worker\releases'
+    $dir = Join-Path $root $sha
+    $releaseScript = Join-Path $dir 'worker\worker.mjs'
+    if (-not (Test-Path -LiteralPath $releaseScript)) {
+      New-Item -ItemType Directory -Force -Path $root | Out-Null
+      $tmp = "$dir.tmp-$PID"
+      $tar = "$dir.tmp-$PID.tar"
+      Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+      New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+      try {
+        # deploy/ ships with the worker: merge/deploy closure gate scripts are
+        # resolved from this release tree (worker/closure-runner.mjs
+        # resolveClosureScript), never from the candidate checkout they judge.
+        & git -C $repo archive --format=tar -o $tar $sha worker shared deploy
+        if ($LASTEXITCODE -ne 0) { throw "git archive exited with code $LASTEXITCODE" }
+        # Pin Windows bsdtar: from a Git Bash parent, PATH resolves MSYS GNU
+        # tar first, which reads 'E:\...' as a remote host and fails.
+        $tarExe = Join-Path $env:SystemRoot 'System32\tar.exe'
+        if (-not (Test-Path -LiteralPath $tarExe)) { $tarExe = 'tar' }
+        & $tarExe -xf $tar -C $tmp
+        if ($LASTEXITCODE -ne 0) { throw "tar exited with code $LASTEXITCODE" }
+        if (-not (Test-Path -LiteralPath (Join-Path $tmp 'worker\worker.mjs'))) { throw 'release export has no worker.mjs' }
+        if (-not (Test-Path -LiteralPath (Join-Path $tmp 'deploy\merge-close-job.ps1'))) { throw 'release export has no deploy\merge-close-job.ps1' }
+        if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+        Rename-Item -LiteralPath $tmp -NewName (Split-Path $dir -Leaf)
+      } finally {
+        Remove-Item -LiteralPath $tar -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+      }
+      Write-LauncherLog 'INFO' "exported worker release $ref@$sha"
+    }
+    Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -ne $sha -and $_.Name -notlike '*.tmp-*' } |
+      Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 2 |
+      ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    $script:ReleaseSha = $sha
+    return $releaseScript
+  } catch {
+    Write-LauncherLog 'ERROR' "worker release export failed ($($_.Exception.Message)); refusing to run the checkout's current branch"
+    throw
+  }
+}
+
+function Start-WorkerProcess([string]$NodePath, [string]$WorkerScript) {
   $info = New-Object Diagnostics.ProcessStartInfo
   $info.FileName = $NodePath
-  $info.Arguments = ('"{0}" "{1}"' -f $script:WorkerPath, $Config)
+  $info.Arguments = ('"{0}" "{1}"' -f $WorkerScript, $Config)
   $info.WorkingDirectory = $script:WorkerDir
   $info.UseShellExecute = $false
   $info.CreateNoWindow = $true
@@ -242,7 +341,6 @@ function Invoke-LauncherRun {
     $serverUrl = [string]$cfg.serverUrl
     if (-not $serverUrl -or -not $cfg.token) { throw 'config requires serverUrl and token' }
     $serverUri = [Uri]$serverUrl
-    $workerId = ([string]$cfg.token).Split('.')[0]
     try {
       $script:BootId = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
     } catch {
@@ -271,13 +369,14 @@ function Invoke-LauncherRun {
       }
 
       try {
-        $script:Child = Start-WorkerProcess $node
+        $workerScript = Resolve-WorkerScript $cfg
+        $script:Child = Start-WorkerProcess $node $workerScript
         Save-State 'starting' 'worker process started' $script:Child.Id
-        Write-LauncherLog 'INFO' "worker started pid=$($script:Child.Id)"
+        Write-LauncherLog 'INFO' "worker started pid=$($script:Child.Id) script=$workerScript"
         $lastStateWrite = [DateTime]::MinValue
         while (-not $script:Child.HasExited -and -not (Test-StopRequested)) {
           if (([DateTime]::UtcNow - $lastStateWrite).TotalSeconds -ge 10) {
-            if (Test-WorkerOnline $serverUrl $workerId) {
+            if (Test-WorkerOnline $serverUrl ([string]$cfg.token)) {
               Save-State 'online' 'worker connected to gateway' $script:Child.Id
             } elseif (Test-NetworkReady $serverUri) {
               Save-State 'starting' 'worker process alive; waiting for gateway registration' $script:Child.Id
@@ -305,6 +404,9 @@ function Invoke-LauncherRun {
         Save-State $state "retrying in ${delay}s" -ErrorMessage $script:LastError -NextRetryAt $next
         if (-not (Wait-Controlled ([int]$delay))) { break }
       } catch {
+        # Never leave an untracked child behind: the retry would start a
+        # second worker that only loses the instance lock.
+        Stop-WorkerChild
         $script:RestartCount++
         $script:LastError = $_.Exception.Message
         Write-LauncherLog 'ERROR' $script:LastError

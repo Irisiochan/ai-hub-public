@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createWorkerState, WORKER_RECONCILE_MS } from '../src/workerState.ts';
+import { createWorkerState, WORKER_RECONCILE_MS } from '../src/jobs/workerState.ts';
 
 const job = (id, status = 'running', extra = {}) => ({ id, status, created_at: id, ...extra });
 const message = (id, jobId = 'a') => ({ id, job_id: jobId, content: `log ${id}` });

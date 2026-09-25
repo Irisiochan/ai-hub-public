@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { writeWebBundle } from '../src/appUpdateBundle.ts';
+import { writeWebBundle } from '../src/ops/appUpdateBundle.ts';
 
 const calls = [];
 const directories = new Set();

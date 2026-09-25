@@ -1,4 +1,4 @@
-import type { Db } from '../db.js';
+import type { Db } from '../platform/index.js';
 import { readTaskSnapshots, type TaskSnapshot } from './taskStateService.js';
 
 export const INVARIANT_CODES = [

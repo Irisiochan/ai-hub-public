@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { BackendFactory } from '../src/agents/backendFactory.js';
-import { contactConfig, openContact } from '../src/agents/configSchemas.js';
-import { MessageRepo } from '../src/agents/messageRepo.js';
-import { PromptComposer } from '../src/agents/promptComposer.js';
-import type { HubConfig } from '../src/config.js';
-import { openDb, type ContactRow } from '../src/db.js';
-import { loadMigrationFiles } from '../src/migrations.js';
+import { BackendFactory } from '../src/runtime/backendFactory.js';
+import { contactConfig, openContact } from '../src/contacts/configSchemas.js';
+import { MessageRepo } from '../src/messages/messageRepo.js';
+import { PromptComposer } from '../src/prompt/promptComposer.js';
+import type { HubConfig } from '../src/platform/config.js';
+import { openDb, type ContactRow } from '../src/platform/db.js';
+import { loadMigrationFiles } from '../src/platform/migrations.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-cli-heartbeat-'));
 const agentsDir = path.join(root, 'agents');
@@ -59,10 +59,11 @@ const config = {
   port: 3900,
   dbPath,
   agentsDir,
-  claude: { cliPath: 'claude', turnTimeoutMs: 1000 },
-  codex: { cliPath: 'codex', turnTimeoutMs: 1000, nativeCompact: { enabled: false } },
-  grok: { cliPath: 'grok', turnTimeoutMs: 1000 },
-  opencode: { cliPath: 'opencode', turnTimeoutMs: 1000 },
+  claude: { cliPath: 'claude' },
+  codex: { cliPath: 'codex', nativeCompact: { enabled: false } },
+  grok: { cliPath: 'grok' },
+  opencode: { cliPath: 'opencode' },
+  api: { turnTimeoutMs: 1000 },
   memory: { mcpUrl: null },
 } as unknown as HubConfig;
 

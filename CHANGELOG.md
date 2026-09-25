@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-26
+
+- Replace Workflow Profiles with seven fixed workflow modules (plan, execute, review,
+  arbitration, merge, deploy, maintenance). Each module binds an agent, model, and reasoning
+  level that can be swapped from the room panel with revision-checked updates; running
+  attempts keep the binding and permission snapshot they were dispatched with, and a
+  terminal attempt can be taken over manually.
+- Move the meeting room to model-driven handoffs: the gateway no longer picks the next stage.
+  Models call `task_handoff` / `execution_start` explicitly against a shared task ledger with
+  frozen handoff snapshots, and every task tool call is checked against a server-built turn
+  context, so a contact cannot act in another room or under another module's binding.
+- Start the next step directly where the outcome is already decided: APPROVE starts the merge
+  closure, REQUEST_CHANGES starts a repair Worker, a stale merge starts a rebase Worker, clean
+  rebases skip re-review, and `after_merge=deploy` closes the task after a verified deploy.
+  Reviews read incremental patches, `task_get` returns a summary section, and attempt and
+  chat-seat usage land in a per-task cost ledger.
+- Run merge and deploy closures through deterministic Node scripts with a fail-closed,
+  server-reverified merge gate, a read-only GET-only closure credential, and raw script receipts.
+- Add Linux/VPS Worker support: config-driven `projectTargets`, workspaces supplied from trusted
+  repo mirrors, Linux paths and process-group kills, capability-card heartbeats that gate
+  dispatch, and automatic commits for execute rounds whose declared tests all pass. The Windows
+  launcher now runs an exported `master` release instead of the live checkout. OpenCode runs get
+  stall detection with one same-session recovery and a read-only bash allowlist for recon.
+- Add a Kimi CLI contact backend with model hot-refresh from `config.toml` and per-turn
+  reasoning effort. CLI turns now split idle and hard timeouts (idle defaults to 5 minutes).
+- Add `workflowOnly` mode: one switch that turns off proactive messages and DeepSeek background
+  work while keeping the meeting room and Workers running.
+- Reorganize the code into functional modules: `server/src/<module>/` behind public `index.ts`
+  files, `web/src/<feature>/`, and separate `triage/` and `runner/` spaces in the worker, with
+  boundary tests enforcing an acyclic dependency graph. CI fails when a `shared/` package changes
+  without a version bump.
+- Remove features that did not earn their upkeep: the finance ledger panel and bill import, idea
+  rooms, absence follow-ups, proactive check-ins, the contact affect scorer, the triage quiet-hour
+  window, conversation category tabs, and the duplicate subscription-quota display.
+- Clear npm audit findings (`multer` 2.4.0, `hono` 4.13.9, `js-yaml`) and regenerate the
+  third-party notices.
+
+This public release is a curated, sanitized snapshot based on private source revision
+`9c96d3e8c2d72bf20cfb33a7219815e1244488f2`; private contacts, personas, real evaluation data,
+databases, credentials, token-rotation scripts, and author-specific deployment tooling are excluded.
+
 ## 0.3.3 - 2026-09-07
 
 - Stop bank-statement re-imports from resurrecting refunded spending: the duplicate-update

@@ -10,7 +10,7 @@ process.env.DEPLOY_TOKEN = 'smoke-secret';
 process.env.DEPLOY_SCRIPT = '/nonexistent/smoke-deploy-guard.sh';
 process.env.DEPLOY_LOG = `${process.cwd()}/smoke-deploy-never-written.log`;
 
-const { deployControlRouter } = await import('../src/routes/system.js');
+const { deployControlRouter } = await import('../src/ops/systemRoutes.js');
 
 let failures = 0;
 function check(label: string, cond: boolean, detail = '') {

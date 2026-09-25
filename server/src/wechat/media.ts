@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { MAX_IMAGE_BYTES } from '../attachments.js';
+import { MAX_IMAGE_BYTES } from '../messages/index.js';
 import type { WechatMessageItem } from './protocol.js';
 
 export interface DownloadedWechatImage {

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { BUILTIN_THEMES, VIOLET_PURPLE_THEME } from '../src/theme/builtins.ts';
-import { parseThemeManifest } from '../src/theme/schema.ts';
+import { BUILTIN_THEMES, VIOLET_PURPLE_THEME } from '../src/settings/theme/builtins.ts';
+import { parseThemeManifest } from '../src/settings/theme/schema.ts';
 import {
   exportCurrentTheme,
   getThemeSnapshot,
@@ -11,7 +11,7 @@ import {
   selectTheme,
   setThemeMode,
   themeCssTokens,
-} from '../src/theme/store.ts';
+} from '../src/settings/theme/store.ts';
 
 for (const theme of BUILTIN_THEMES) assert.deepEqual(parseThemeManifest(theme), theme);
 
@@ -65,7 +65,7 @@ delete globalThis.localStorage;
 
 const root = path.resolve(import.meta.dirname, '..');
 const app = fs.readFileSync(path.join(root, 'src/App.tsx'), 'utf8');
-const pane = fs.readFileSync(path.join(root, 'src/components/ChatPane.tsx'), 'utf8');
+const pane = fs.readFileSync(path.join(root, 'src/chat/ChatPane.tsx'), 'utf8');
 assert.doesNotMatch(app, /useState[^\n]*theme/i, 'theme changes must not enter App state');
 assert.doesNotMatch(pane, /themeManifest|selectedTheme|themeMode/i, 'theme props must not enter chat rendering');
 

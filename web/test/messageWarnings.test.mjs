@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { isOutputLengthLimit, outputLimitWarning } from '../src/messageWarnings.ts';
+import { isOutputLengthLimit, outputLimitWarning } from '../src/chat/messageWarnings.ts';
 
 assert.equal(
   outputLimitWarning(JSON.stringify({ usage: { output: 8192, finishReason: 'length' } })),

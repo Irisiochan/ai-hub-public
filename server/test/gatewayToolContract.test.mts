@@ -5,17 +5,18 @@ import path from 'node:path';
 import express from 'express';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { buildCameraTool } from '../src/agents/cameraTool.js';
-import { buildDelegateTools } from '../src/agents/gatewayTools.js';
-import { buildTaobaoTools } from '../src/agents/taobaoTools.js';
-import { sanitizeGeminiSchema } from '../src/agents/directApi/gemini.js';
-import type { CompanionHeartbeat } from '../src/agents/companionHeartbeat.js';
-import { openDb } from '../src/db.js';
-import { hubMcpRouter } from '../src/routes/hubMcp.js';
-import type { SseHub } from '../src/sse.js';
-import type { CameraSnapBroker } from '../src/workers/cameraSnap.js';
-import { JobStore } from '../src/workers/jobStore.js';
-import type { TaobaoBridge } from '../src/workers/taobaoBridge.js';
+import { buildCameraTool } from '../src/devices/cameraTool.js';
+import { buildDelegateTools } from '../src/jobs/delegateTools.js';
+import { buildRoomTaskTools, ROOM_TASK_TOOL_NAMES } from '../src/roomTasks/roomTaskTools.js';
+import { buildTaobaoTools } from '../src/devices/taobaoTools.js';
+import { sanitizeGeminiSchema } from '../src/backends/directApi/gemini.js';
+import type { CompanionHeartbeat } from '../src/heartbeat/companionHeartbeat.js';
+import { openDb } from '../src/platform/db.js';
+import { hubMcpRouter } from '../src/tools/hubMcpRoutes.js';
+import type { SseHub } from '../src/platform/sse.js';
+import type { CameraSnapBroker } from '../src/devices/cameraSnap.js';
+import { JobStore } from '../src/jobs/jobStore.js';
+import type { TaobaoBridge } from '../src/devices/taobaoBridge.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-tool-contract-'));
 const db = openDb(path.join(dir, 'hub.db'));
@@ -48,6 +49,9 @@ const taobao = {
 } as unknown as TaobaoBridge;
 const tools = [
   ...buildDelegateTools(jobs, db, 'codex', delegation),
+  // DM turns carry no room context: declarations still match across
+  // transports; every call refuses without a room module turn.
+  ...buildRoomTaskTools(db, jobs, 'codex', null, {}, null),
   buildCameraTool(broker, heartbeat, db, 'codex'),
   ...buildTaobaoTools(taobao, heartbeat, db, 'codex', 'full'),
 ];
@@ -67,7 +71,7 @@ try {
     new URL(`http://127.0.0.1:${address.port}/api/hub-mcp/codex`),
   ));
   const listed = (await client.listTools()).tools;
-  assert.equal(listed.length, 26, 'all four job tools, camera, and 21 Taobao tools are registered');
+  assert.equal(listed.length, 42, 'all four job tools, sixteen task tools, camera, and 21 Taobao tools are registered');
   for (const tool of tools) {
     const mcp = listed.find((entry) => entry.name === tool.name)!;
     assert.ok(mcp, `${tool.name} is available to CLI contacts`);

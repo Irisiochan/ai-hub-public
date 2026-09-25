@@ -6,8 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { DbBackup } from '../src/backup.js';
-import { openDb } from '../src/db.js';
+import { DbBackup } from '../src/ops/backup.js';
+import { openDb } from '../src/platform/db.js';
 
 let failures = 0;
 function check(label: string, cond: boolean, detail = '') {

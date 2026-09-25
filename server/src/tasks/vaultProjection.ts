@@ -1,8 +1,8 @@
-import type { Db } from '../db.js';
+import type { Db } from '../platform/index.js';
 import {
   MEMORY_OUTBOX_MAX_ATTEMPTS,
   memoryOutboxRetryDelayMs,
-} from '../memory/vaultClient.js';
+} from '../memory/index.js';
 
 export const TASK_OUTBOX_FLUSH_INTERVAL_MS = 5_000;
 

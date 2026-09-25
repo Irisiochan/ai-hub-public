@@ -15,9 +15,9 @@ import path from 'node:path';
 import express from 'express';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { HEARTBEAT_GUIDANCE } from '../src/agents/cameraTool.js';
-import { CompanionHeartbeat, heartbeatPrompt } from '../src/agents/companionHeartbeat.js';
-import { contactConfig } from '../src/agents/configSchemas.js';
+import { HEARTBEAT_GUIDANCE } from '../src/devices/cameraTool.js';
+import { CompanionHeartbeat, heartbeatPrompt } from '../src/heartbeat/companionHeartbeat.js';
+import { contactConfig } from '../src/contacts/configSchemas.js';
 import {
   TAOBAO_INPUT_SHAPES,
   TAOBAO_TOOL_CATALOG,
@@ -26,14 +26,14 @@ import {
   taobaoGuidance,
   taobaoModeFor,
   taobaoToolNames,
-} from '../src/agents/taobaoTools.js';
-import type { ContactRow } from '../src/db.js';
-import { openDb } from '../src/db.js';
-import { hubMcpRouter } from '../src/routes/hubMcp.js';
-import { workersRouter } from '../src/routes/workers.js';
-import { CameraSnapBroker } from '../src/workers/cameraSnap.js';
-import { JobStore } from '../src/workers/jobStore.js';
-import { TaobaoBridge } from '../src/workers/taobaoBridge.js';
+} from '../src/devices/taobaoTools.js';
+import type { ContactRow } from '../src/platform/db.js';
+import { openDb } from '../src/platform/db.js';
+import { hubMcpRouter } from '../src/tools/hubMcpRoutes.js';
+import { workersRouter } from '../src/jobs/workerRoutes.js';
+import { CameraSnapBroker } from '../src/devices/cameraSnap.js';
+import { JobStore } from '../src/jobs/jobStore.js';
+import { TaobaoBridge } from '../src/devices/taobaoBridge.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-taobao-smoke-'));
 const dbPath = path.join(dir, 'data', 'hub.db');
@@ -251,15 +251,29 @@ try {
     return client;
   };
   const codex = await mcpFor('codex');
-  assert.deepEqual((await codex.listTools()).tools.map((t) => t.name), ['camera_snap'], 'taobao.enabled=false lists camera only');
+  assert.deepEqual(
+    (await codex.listTools()).tools.map((t) => t.name),
+    [
+      'task_create', 'task_import', 'task_get', 'task_submit_evidence', 'task_handoff',
+      'task_accept', 'task_decline', 'task_pass', 'task_block', 'task_done',
+      'execution_start', 'execution_get',
+      'review_submit', 'release_execute', 'task_retry', 'task_wait', 'camera_snap',
+    ],
+    'taobao.enabled=false lists camera plus task tools (task calls still need a room module turn)',
+  );
   await codex.close();
   const aye = await mcpFor('aye');
-  assert.equal((await aye.listTools()).tools.length, 1 + 21, 'full mode excludes add-to-cart');
+  assert.equal((await aye.listTools()).tools.length, 16 + 21 + 1, 'full mode excludes add-to-cart');
   await aye.close();
 
   const claude = await mcpFor('claude');
   const listed = (await claude.listTools()).tools;
-  assert.deepEqual(listed.map((t) => t.name), ['camera_snap', ...browse], 'browse contact lists camera + browse tools');
+  assert.deepEqual(listed.map((t) => t.name), [
+    'task_create', 'task_import', 'task_get', 'task_submit_evidence', 'task_handoff',
+    'task_accept', 'task_decline', 'task_pass', 'task_block', 'task_done',
+    'execution_start', 'execution_get',
+    'review_submit', 'release_execute', 'task_retry', 'task_wait', 'camera_snap', ...browse,
+  ], 'browse contact lists task tools + camera + browse tools');
   const searchTool = listed.find((t) => t.name === 'taobao_search_products')!;
   assert.deepEqual(searchTool.inputSchema.required, ['keyword']);
   assert.equal('sourceApp' in (searchTool.inputSchema.properties as Record<string, unknown>), false);

@@ -2,17 +2,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DirectApiBackend } from '../src/agents/directApi.js';
-import { buildDelegateTools } from '../src/agents/gatewayTools.js';
-import { updateCoordinationRoomReceipt } from '../src/agents/coordinationRoom.js';
-import { historicalMessageText } from '../src/agents/sideChannel.js';
-import { openDb, type JobRow, type MessageRow } from '../src/db.js';
-import { formatCoordinationReceipt } from '../src/workers/coordinationReceipt.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { DirectApiBackend } from '../src/backends/directApi.js';
+import { buildDelegateTools } from '../src/jobs/delegateTools.js';
+import { updateCoordinationRoomReceipt } from '../src/workflow/coordinationRoom.js';
+import { historicalMessageText } from '../src/messages/sideChannel.js';
+import { openDb, type JobRow, type MessageRow } from '../src/platform/db.js';
+import { formatCoordinationReceipt } from '../src/jobs/coordinationReceipt.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 import {
   formatWorkerReceiptPreview,
   WORKER_RECEIPT_PREVIEW_MAX_CHARS,
-} from '../src/workers/receiptPreview.js';
+} from '../src/jobs/receiptPreview.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-receipt-preview-'));
 const db = openDb(path.join(dir, 'test.db'));
@@ -146,7 +146,9 @@ try {
     }),
   }), { taskPath: 'tasks/demo.md', planHash: 'a'.repeat(64) });
   assert.ok(coordinationPreview.length <= WORKER_RECEIPT_PREVIEW_MAX_CHARS);
-  assert.match(coordinationPreview, /工作对接回执（preview）/);
+  assert.match(coordinationPreview, /工作对接回执，请按阶段处理。/);
+  assert.doesNotMatch(coordinationPreview, /@claude/);
+  assert.doesNotMatch(coordinationPreview, /请依据 preview 给出 PASS\/返工结论/);
   assert.match(coordinationPreview, /任务文件：tasks\/demo\.md/);
   assert.match(coordinationPreview, /状态：done \/ delivered/);
   assert.match(coordinationPreview, /部署 commit=fedcba9876543210/);

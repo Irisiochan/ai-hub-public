@@ -8,11 +8,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openDb, type ContactRow } from '../src/db.js';
-import type { MemoryConfig } from '../src/config.js';
-import { LifeEventService } from '../src/agents/lifeEvents.js';
-import { MessageRepo } from '../src/agents/messageRepo.js';
-import { PromptComposer, type PromptContext } from '../src/agents/promptComposer.js';
+import { openDb, type ContactRow } from '../src/platform/db.js';
+import type { MemoryConfig } from '../src/platform/config.js';
+import { LifeEventService } from '../src/companion/lifeEvents.js';
+import { MessageRepo } from '../src/messages/messageRepo.js';
+import { PromptComposer, type PromptContext } from '../src/prompt/promptComposer.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'life-inject-'));
 const db = openDb(path.join(dir, 'hub.db'));
@@ -98,7 +98,7 @@ try {
   void m2;
 
   // B（codex）的每轮注入：最新事实 + 风险等级 + 时间 + 来源
-  const composer = new PromptComposer(null, new MessageRepo(db), null, null, null, service);
+  const composer = new PromptComposer(null, new MessageRepo(db), null, null, service);
   const coveTurn = await composer.composeTurn(ctxFor(codex), '老婆现在什么状态？', '老婆现在什么状态？', new Set());
   assert.match(coveTurn, /<CROSS_CONTACT_STATE trust="gateway">/);
   assert.match(coveTurn, /【安全·进行中】/, 'risk level must be visible');

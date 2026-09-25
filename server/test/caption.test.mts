@@ -2,10 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openDb, type ContactRow, type MessageRow } from '../src/db.js';
-import { CaptionService, captionsFromMeta } from '../src/captionService.js';
-import { historicalMessageText } from '../src/agents/sideChannel.js';
-import { journalDay } from '../src/routes/journal.js';
+import { openDb, type ContactRow, type MessageRow } from '../src/platform/db.js';
+import { CaptionService, captionsFromMeta } from '../src/messages/captionService.js';
+import { historicalMessageText } from '../src/messages/sideChannel.js';
+import { journalDay } from '../src/messages/journalRoutes.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'caption-'));
 const uploadsDir = path.join(dir, 'uploads');

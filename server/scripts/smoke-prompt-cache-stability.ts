@@ -15,15 +15,15 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { DirectApiBackend } from '../src/agents/directApi.js';
-import { AnthropicProvider } from '../src/agents/directApi/anthropic.js';
-import type { HistoryMessage, ProviderTools } from '../src/agents/directApi/provider.js';
-import { openDb } from '../src/db.js';
-import { compactSummaryText } from '../src/agents/conversationSummary.js';
+import { DirectApiBackend } from '../src/backends/directApi.js';
+import { AnthropicProvider } from '../src/backends/directApi/anthropic.js';
+import type { HistoryMessage, ProviderTools } from '../src/backends/directApi/provider.js';
+import { openDb } from '../src/platform/db.js';
+import { compactSummaryText } from '../src/prompt/conversationSummary.js';
 import {
   ConversationSummaryRepo,
   SHARED_SUMMARY_MEMBER_ID,
-} from '../src/agents/conversationSummaryRepo.js';
+} from '../src/prompt/conversationSummaryRepo.js';
 
 const requests: Array<{ body: any; headers: http.IncomingHttpHeaders }> = [];
 const server = http.createServer((req, res) => {

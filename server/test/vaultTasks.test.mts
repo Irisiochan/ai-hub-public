@@ -4,8 +4,8 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { openDb, type Db } from '../src/db.js';
-import { vaultTasksRouter } from '../src/routes/vaultTasks.js';
+import { openDb, type Db } from '../src/platform/db.js';
+import { vaultTasksRouter } from '../src/tasks/vaultTaskRoutes.js';
 
 async function listen(db: Db, tasksDir: string | null) {
   const app = express();

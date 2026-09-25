@@ -2,10 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildDelegateTools } from '../src/agents/gatewayTools.js';
-import { openDb } from '../src/db.js';
-import { SseHub } from '../src/sse.js';
-import { JobStore } from '../src/workers/jobStore.js';
+import { buildDelegateTools } from '../src/jobs/delegateTools.js';
+import { openDb } from '../src/platform/db.js';
+import { SseHub } from '../src/platform/sse.js';
+import { JobStore } from '../src/jobs/jobStore.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-worker-pagination-'));
 const db = openDb(path.join(tempDir, 'hub.sqlite'));

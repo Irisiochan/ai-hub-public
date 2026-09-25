@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { openContact } from '../src/agents/configSchemas.js';
-import { AgentRuntime } from '../src/agents/runtime.js';
-import { AsyncQueue, type AgentBackend, type TurnEvent } from '../src/agents/types.js';
-import type { HubConfig } from '../src/config.js';
-import { openDb, type MessageRow } from '../src/db.js';
+import { openContact } from '../src/contacts/configSchemas.js';
+import { AgentRuntime } from '../src/runtime/runtime.js';
+import { AsyncQueue, type AgentBackend, type TurnEvent } from '../src/backends/types.js';
+import type { HubConfig } from '../src/platform/config.js';
+import { openDb, type MessageRow } from '../src/platform/db.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-wechat-runtime-'));
 const uploadsDir = path.join(tempDir, 'uploads');
@@ -20,9 +20,10 @@ const config: HubConfig = {
   webDist: '',
   uploadsDir,
   releasesDir: path.join(tempDir, 'releases'),
-  claude: { cliPath: 'claude', turnTimeoutMs: 5_000 },
-  codex: { cliPath: 'codex', turnTimeoutMs: 5_000 },
-  grok: { cliPath: 'grok', turnTimeoutMs: 5_000 },
+  claude: { cliPath: 'claude' },
+  codex: { cliPath: 'codex' },
+  grok: { cliPath: 'grok' },
+  api: { turnTimeoutMs: 5_000 },
   memory: {
     mcpUrl: null,
     repoPath: null,

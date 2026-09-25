@@ -1,4 +1,4 @@
-import { CodexAppServerBackend, type CodexRateLimits } from '../agents/codexAppServer.js';
+import { CodexAppServerBackend, type CodexRateLimits } from '../backends/index.js';
 
 export interface CodexQuotaSnapshot {
   fiveHour: { remainingPct: number; resetsAt: string | null } | null;

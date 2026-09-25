@@ -8,10 +8,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MessageRepo } from '../src/agents/messageRepo.js';
-import { PromptComposer, type PromptContext } from '../src/agents/promptComposer.js';
-import { openDb } from '../src/db.js';
-import type { ContactRow } from '../src/db.js';
+import { MessageRepo } from '../src/messages/messageRepo.js';
+import { PromptComposer, type PromptContext } from '../src/prompt/promptComposer.js';
+import { openDb } from '../src/platform/db.js';
+import type { ContactRow } from '../src/platform/db.js';
 
 let failures = 0;
 function check(label: string, cond: boolean, detail = '') {

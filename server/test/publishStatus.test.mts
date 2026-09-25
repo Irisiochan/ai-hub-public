@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { inspectRepo } from '../src/publishStatus.js';
+import { inspectRepo } from '../src/ops/publishStatus.js';
 
 test('uses a sanitized publish snapshot without reading repository metadata', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-publish-'));

@@ -17,7 +17,7 @@
 ### ③a 全员层——「对 User 一致」的部分
 
 - 代码：`server/src/memory/inject.ts`（`WORKFLOW_PRELOADED`、`TEMPORAL_CONTEXT_RULES`、
-  `identityGuard`、`nsfwCraftCompact`、记忆快照）与 `server/src/agents/promptComposer.ts`
+  `identityGuard`、`nsfwCraftCompact`、记忆快照）与 `server/src/prompt/promptComposer.ts`
   的群聊框架、对话存档回放。
 - 记忆库：`memories/User-ai-interaction-styles.md`（tag「所有AI通用」）、
   `_meta/cli/global-agent-workflow.md`。
@@ -51,7 +51,7 @@
 | 身份隔离、时间语义、NSFW 下限、记忆预载标记 | `server/src/memory/inject.ts` |
 | 某一个联系人相对它家 base 的口吻/交付差分 | 该联系人的 `overlay.md` |
 | 某个 AI 的名字、关系、能力边界（有没有 Bash 等） | 该联系人的 `CLAUDE.md` / `AGENTS.md`，或 UI 里的联系人配置 |
-| 委派规范、项目写权限纪律 | `server/src/agents/gatewayTools.ts` |
+| 委派规范、项目写权限纪律 | `server/src/jobs/delegateTools.ts` |
 
 **禁止**用 ③a 的全员文件或网关块去对冲某一家厂商的 base prompt——那会误伤其他家。
 反过来也禁止把某家专用的句子粘进 `User-ai-interaction-styles.md`：那是 append-only 的核心文件，

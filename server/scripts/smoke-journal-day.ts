@@ -4,8 +4,8 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { openDb } from '../src/db.js';
-import { journalDay, journalRouter } from '../src/routes/journal.js';
+import { openDb } from '../src/platform/db.js';
+import { journalDay, journalRouter } from '../src/messages/journalRoutes.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.journal-day-smoke.db');

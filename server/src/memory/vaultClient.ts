@@ -1,6 +1,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { Db } from '../db.js';
+import type { Db } from '../platform/index.js';
 
 export const MEMORY_OUTBOX_MAX_ATTEMPTS = 8;
 const MEMORY_OUTBOX_BASE_RETRY_MS = 60_000;

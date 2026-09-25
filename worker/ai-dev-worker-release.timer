@@ -1,0 +1,10 @@
+[Unit]
+Description=Retry a pending vps-dev worker release switch every 5 minutes (ai-hub W2)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -27,11 +27,11 @@ const repo = path.resolve(here, '..');
 /** 派活 / 交付 / 分诊模板所在文件。改名或新增模板文件时必须同步这里。 */
 const PROMPT_FILES = [
   'worker/triage-worker.mjs', // dispatchPrompt：自主事件分派正文
-  'worker/triage-clients.mjs', // L1 闸 / fuzzyRoute / idea 主持的 system prompt
-  'worker/runner.mjs', // promptFor：拼给本机 CLI runner 的最终 prompt
-  'server/src/routes/workers.ts', // DELIVERY_CONTRACT：交付契约
-  'server/src/agents/gatewayTools.ts', // delegationGuidance / PROJECT_WRITE_GIT_GUARD
-  'server/src/agents/roomPrompt.ts', // 群聊轮次网关框架
+  'worker/triage/triage-clients.mjs', // L1 闸 / fuzzyRoute / idea 主持的 system prompt
+  'worker/runner/runner.mjs', // promptFor：拼给本机 CLI runner 的最终 prompt
+  'server/src/jobs/workerRoutes.ts', // DELIVERY_CONTRACT：交付契约
+  'server/src/jobs/delegateTools.ts', // delegationGuidance / PROJECT_WRITE_GIT_GUARD
+  'server/src/rooms/roomPrompt.ts', // 群聊轮次网关框架
 ];
 
 /** 造时间压力或后果威胁的措辞。命中即失败。 */

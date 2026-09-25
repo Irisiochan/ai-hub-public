@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { DshHarnessBackend } from '../src/agents/dshHarness.js';
-import type { TurnEvent } from '../src/agents/types.js';
+import { DshHarnessBackend } from '../src/backends/dshHarness.js';
+import type { TurnEvent } from '../src/backends/types.js';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-dsh-harness-'));
 const home = path.join(root, 'home');

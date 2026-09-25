@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Db } from '../db.js';
+import type { Db } from '../platform/index.js';
 
 export const TASK_STATUSES = ['proposed', 'open', 'blocked', 'done', 'dropped'] as const;
 export type TaskStatus = typeof TASK_STATUSES[number];

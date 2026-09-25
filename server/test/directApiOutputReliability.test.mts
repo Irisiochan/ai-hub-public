@@ -4,13 +4,13 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { DirectApiBackend } from '../src/agents/directApi/base.js';
-import { DsmlTextFilter } from '../src/agents/directApi/dsml.js';
-import { OpenAiProvider } from '../src/agents/directApi/openai.js';
-import type { ProviderStreamEvent } from '../src/agents/directApi/provider.js';
-import type { TurnEvent } from '../src/agents/types.js';
-import { openDb } from '../src/db.js';
-import { loadMigrationFiles } from '../src/migrations.js';
+import { DirectApiBackend } from '../src/backends/directApi/base.js';
+import { DsmlTextFilter } from '../src/backends/directApi/dsml.js';
+import { OpenAiProvider, openCodeGoHeaders } from '../src/backends/directApi/openai.js';
+import type { ProviderStreamEvent } from '../src/backends/directApi/provider.js';
+import type { TurnEvent } from '../src/backends/types.js';
+import { openDb } from '../src/platform/db.js';
+import { loadMigrationFiles } from '../src/platform/migrations.js';
 
 async function listen(server: http.Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -333,6 +333,55 @@ function migrationRaisesOnlyLegacyBudget(): void {
   }
 }
 
+async function goConversationRouting(): Promise<void> {
+  const endpoint = 'https://opencode.ai/zen/go/v1/chat/completions';
+  for (const other of [
+    'https://api.openai.com/v1/chat/completions',
+    'https://opencode.ai/zen/v1/chat/completions',
+    'https://opencode.ai.example.com/zen/go/v1/chat/completions',
+    'http://opencode.ai/zen/go/v1/chat/completions',
+  ]) assert.deepEqual(openCodeGoHeaders(other, 'session'), {});
+  const originalFetch = globalThis.fetch;
+  const requests: Headers[] = [];
+  globalThis.fetch = async (_url, init) => {
+    requests.push(new Headers(init?.headers));
+    return new Response('data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-hub-go-routing-'));
+  const db = openDb(path.join(dir, 'hub.sqlite'));
+  try {
+    for (const id of ['go-a', 'go-b']) db.prepare(
+      "INSERT INTO contacts (id, name, backend, kind, config) VALUES (?, ?, 'api', 'dm', '{}')",
+    ).run(id, id);
+    // Backend recreation on successive turns must preserve the conversation ID.
+    for (const id of ['go-a', 'go-a', 'go-b']) {
+      const backend = outputBackend('openai-compat', endpoint, db, dir, id);
+      const events = await collectTurn(backend, 'reply OK', 0);
+      assert.ok(events.some((event) => event.type === 'delta' && event.text === 'OK'));
+      await backend.stop();
+    }
+    assert.match(requests[0].get('x-opencode-session')!, /^ai-hub-[a-f0-9]{64}$/);
+    assert.equal(requests[0].get('x-opencode-session'), requests[1].get('x-opencode-session'));
+    assert.notEqual(requests[0].get('x-opencode-session'), requests[2].get('x-opencode-session'));
+    assert.equal(requests[0].get('user-agent'), 'ai-hub/0.3.3');
+    assert.equal(requests[0].get('authorization'), 'Bearer test');
+    // Multiple tool rounds through the same provider retain routing too.
+    const provider = new OpenAiProvider({ baseUrl: endpoint, apiKey: 'test', model: 'kimi-k3', maxTokens: 32, promptCache: 'auto' });
+    const conversation = provider.createConversation([], { static: '', summary: '' });
+    for (let i = 0; i < 2; i++) {
+      for await (const _ of provider.stream(conversation, { definitions: [], allowCalls: false }, new AbortController().signal)) {}
+    }
+    assert.equal(requests[3].get('x-opencode-session'), requests[4].get('x-opencode-session'));
+  } finally {
+    globalThis.fetch = originalFetch;
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+await goConversationRouting();
 dsmlFilterHandlesProductionShape();
 await providerStripsDsmlAndKeepsFinishReason();
 await providerUsageLastWriteNotSumAcrossChunks();

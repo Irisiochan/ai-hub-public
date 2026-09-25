@@ -7,14 +7,14 @@ import {
   buildConversationReplay,
   CLI_REPLAY_MIN_RECENT_MESSAGES,
   CLI_REPLAY_TOKEN_BUDGET,
-} from '../src/agents/conversationReplay.js';
-import { ConversationSummaryRepo } from '../src/agents/conversationSummaryRepo.js';
-import { openContact } from '../src/agents/configSchemas.js';
-import { MessageRepo } from '../src/agents/messageRepo.js';
-import { PromptComposer, type PromptContext } from '../src/agents/promptComposer.js';
-import { historicalMessageText } from '../src/agents/sideChannel.js';
-import { estimateTokens } from '../src/agents/tokenEstimate.js';
-import { openDb, type ContactRow, type MessageRow } from '../src/db.js';
+} from '../src/prompt/conversationReplay.js';
+import { ConversationSummaryRepo } from '../src/prompt/conversationSummaryRepo.js';
+import { openContact } from '../src/contacts/configSchemas.js';
+import { MessageRepo } from '../src/messages/messageRepo.js';
+import { PromptComposer, type PromptContext } from '../src/prompt/promptComposer.js';
+import { historicalMessageText } from '../src/messages/sideChannel.js';
+import { estimateTokens } from '../src/prompt/tokenEstimate.js';
+import { openDb, type ContactRow, type MessageRow } from '../src/platform/db.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.conversation-replay.db');

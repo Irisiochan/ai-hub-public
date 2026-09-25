@@ -5,7 +5,7 @@ import {
   mergeIncomingMessage,
   mergeMessageRows,
   shouldReconcileMessagesAfterStatus,
-} from '../src/messageMerge.ts';
+} from '../src/chat/messageMerge.ts';
 
 const base = {
   id: 42,

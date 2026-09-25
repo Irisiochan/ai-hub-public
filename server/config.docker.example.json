@@ -7,14 +7,12 @@
   "uploadsDir": "data/uploads",
   "claude": {
     "cliPath": "claude",
-    "turnTimeoutMs": 300000,
-    "turnIdleTimeoutMs": 120000,
+    "turnIdleTimeoutMs": 300000,
     "turnHardTimeoutMs": 900000
   },
   "codex": {
     "cliPath": "codex",
-    "turnTimeoutMs": 300000,
-    "turnIdleTimeoutMs": 120000,
+    "turnIdleTimeoutMs": 300000,
     "turnHardTimeoutMs": 900000,
     "nativeCompact": {
       "enabled": true,
@@ -38,12 +36,17 @@
   },
   "grok": {
     "cliPath": "grok",
-    "turnTimeoutMs": 300000,
-    "turnIdleTimeoutMs": 120000,
+    "turnIdleTimeoutMs": 300000,
     "turnHardTimeoutMs": 900000
+  },
+  "api": {
+    "turnTimeoutMs": 300000
   },
   "reviewBatch": {
     "size": 3,
     "intervalMinutes": 30
+  },
+  "workflowOnly": {
+    "enabled": false
   }
 }

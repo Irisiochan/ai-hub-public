@@ -11,13 +11,14 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AgentManager } from '../dist/agents/manager.js';
+import { AgentManager } from '../dist/runtime/manager.js';
 import {
+  DEFAULT_ROOM_ORCHESTRATOR_ID,
   coordinationAuthorityHolderIds,
   isRoomHostCoordinationDomain,
   type RoomCoordinationDispatch,
-} from '../dist/agents/roomPrompt.js';
-import { openDb, type ContactRow } from '../dist/db.js';
+} from '../dist/rooms/roomPrompt.js';
+import { openDb, type ContactRow } from '../dist/platform/db.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.coordination-reaction-wake-gate.db');
@@ -73,9 +74,10 @@ const config = {
   agentsDir,
   webDist: '',
   uploadsDir,
-  claude: { cliPath: 'claude', turnTimeoutMs: 5000 },
-  codex: { cliPath: 'codex', turnTimeoutMs: 5000 },
-  grok: { cliPath: 'grok', turnTimeoutMs: 5000 },
+  claude: { cliPath: 'claude' },
+  codex: { cliPath: 'codex' },
+  grok: { cliPath: 'grok' },
+  api: { turnTimeoutMs: 5000 },
   memory: {
     mcpUrl: null,
     repoPath: null,
@@ -134,6 +136,8 @@ try {
     true
   );
   assert.equal(isRoomHostCoordinationDomain({ name: 'DS 主持' }), false);
+  // 不写死默认编排者：它改过一次（claude → codex），写死会让这条断言在下次改动时
+  // 变成假阳性。执行者/验证者另取一个 id，免得和默认编排者撞成一个。
   assert.deepEqual(
     coordinationAuthorityHolderIds({
       kind: 'execution',
@@ -141,9 +145,9 @@ try {
       branch: 'b',
       workspace: 'C:/w',
       planHash: 'a'.repeat(64),
-      executor: 'codex',
+      executor: 'claude',
     }).sort(),
-    ['claude', 'codex']
+    [DEFAULT_ROOM_ORCHESTRATOR_ID, 'claude'].sort()
   );
   assert.deepEqual(
     coordinationAuthorityHolderIds({
@@ -152,15 +156,44 @@ try {
       due: '2026-08-11',
       verifier: 'aye',
     }).sort(),
-    ['aye', 'claude']
+    [DEFAULT_ROOM_ORCHESTRATOR_ID, 'aye'].sort()
+  );
+  // 房间显式指定编排者时压过默认值，执行者与编排者重合也只算一个持有者。
+  assert.deepEqual(
+    coordinationAuthorityHolderIds({
+      kind: 'execution',
+      taskPath: 'tasks/x.md',
+      branch: 'b',
+      workspace: 'C:/w',
+      planHash: 'a'.repeat(64),
+      executor: 'gala',
+    }, 'claude').sort(),
+    ['claude', 'gala']
+  );
+  assert.deepEqual(
+    coordinationAuthorityHolderIds({
+      kind: 'execution',
+      taskPath: 'tasks/x.md',
+      branch: 'b',
+      workspace: 'C:/w',
+      planHash: 'a'.repeat(64),
+      executor: 'claude',
+    }, 'claude'),
+    ['claude']
   );
 
   addMember('claude', 'claude-model');
   addMember('codex', 'codex-model');
   addMember('gala', 'gala-model');
+  // 显式指定编排者：默认编排者改过一次（claude → codex），不写死这里就会和下面的
+  // executor 撞成同一个人，权威集合塌成一个，反应轮断言跟着假失败。
   db.prepare(
     `INSERT INTO contacts (id, name, backend, kind, config) VALUES ('room-coord', '会议室', 'room', 'room', ?)`
-  ).run(JSON.stringify({ members: ['claude', 'codex', 'gala'], reactionRounds: 2 }));
+  ).run(JSON.stringify({
+    members: ['claude', 'codex', 'gala'],
+    reactionRounds: 2,
+    coordination: { enabled: true, orchestrator: 'claude' },
+  }));
   db.prepare(
     `INSERT INTO contacts (id, name, backend, kind, config) VALUES ('room-idea', 'idea房', 'room', 'room', ?)`
   ).run(JSON.stringify({ members: ['claude', 'codex', 'gala'], reactionRounds: 1 }));

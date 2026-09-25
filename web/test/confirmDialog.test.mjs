@@ -15,7 +15,7 @@ const collect = (dir) => {
 collect(src);
 
 const allSource = sourceFiles.map((file) => fs.readFileSync(file, 'utf8')).join('\n');
-const dialog = fs.readFileSync(path.join(src, 'components/ConfirmDialog.tsx'), 'utf8');
+const dialog = fs.readFileSync(path.join(src, 'platform/ConfirmDialog.tsx'), 'utf8');
 const main = fs.readFileSync(path.join(src, 'main.tsx'), 'utf8');
 
 assert.doesNotMatch(allSource, /window\.confirm\s*\(/, 'native confirm must not re-enter the Electron Windows focus bug');
@@ -32,11 +32,11 @@ assert.match(dialog, /createPortal\(/, 'the dialog must escape clipped nested pa
 assert.match(dialog, /autoFocus/, 'the safe cancel action must receive initial focus');
 
 for (const file of [
-  'components/ChatPane.tsx',
-  'components/ContactConfig.tsx',
-  'components/JobThread.tsx',
-  'components/WorkerPanel.tsx',
-  'components/chat/SideJobActions.tsx',
+  'chat/ChatPane.tsx',
+  'contacts/ContactConfig.tsx',
+  'jobs/JobThread.tsx',
+  'jobs/WorkerPanel.tsx',
+  'chat/SideJobActions.tsx',
 ]) {
   assert.match(fs.readFileSync(path.join(src, file), 'utf8'), /useConfirm\(/, `${file} must use the shared dialog`);
 }

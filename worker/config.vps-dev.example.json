@@ -1,0 +1,34 @@
+{
+  "serverUrl": "http://127.0.0.1:3900",
+  "token": "vps-dev.PASTE_PAIRING_TOKEN_HERE",
+  "name": "vps-dev",
+  "workspaces": [
+    "/srv/ai-dev/jobs"
+  ],
+  "stateFile": "/var/lib/ai-dev-worker/worker-state.json",
+  "runners": [
+    "codex",
+    "opencode"
+  ],
+  "maxConcurrent": 1,
+  "codexCommand": "codex",
+  "codexModel": "",
+  "claudeCommand": "claude",
+  "opencodeCommand": "opencode",
+  "opencodeModel": "opencode-go/muse-spark-1.3-contributor",
+  "allowShell": true,
+  "allowSsh": false,
+  "allowCamera": false,
+  "allowTaobao": false,
+  "capabilityProbeIntervalMinutes": 60,
+  "repos": {
+    "<repoId>": {
+      "url": "https://git.example.com/User/<repo>.git",
+      "mirror": "/srv/ai-dev/mirrors/<repoId>.git"
+    },
+    "ai-hub": {
+      "url": "git@github-ai-hub:Irisiochan/ai-hub.git",
+      "mirror": "/srv/ai-dev/mirrors/ai-hub.git"
+    }
+  }
+}

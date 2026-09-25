@@ -32,6 +32,12 @@ function normalize(raw) {
     launcher: raw.launcher && typeof raw.launcher === 'object' ? raw.launcher : null,
     jobs,
     events: Array.isArray(raw.events) ? raw.events : [],
+    // Durable strand mutex: detached-but-possibly-live old executors, keyed
+    // by job id. Survives removeEntry (job completion) and Worker restarts;
+    // only an explicit verified-clear removes a record.
+    stranded: raw.stranded && typeof raw.stranded === 'object' && !Array.isArray(raw.stranded)
+      ? raw.stranded
+      : {},
   };
 }
 
@@ -87,6 +93,7 @@ export function saveWorkerSpool(file, spool) {
     ...current,
     jobs: spool.jobs,
     events: spool.events,
+    stranded: spool.stranded ?? current.stranded ?? {},
   }));
 }
 

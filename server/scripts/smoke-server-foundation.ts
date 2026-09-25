@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import express from 'express';
-import { createLogger } from '../src/logger.js';
-import { sessionAuth } from '../src/middleware/auth.js';
-import { localCors } from '../src/middleware/cors.js';
+import { createLogger } from '../src/platform/logger.js';
+import { sessionAuth } from '../src/platform/middleware/auth.js';
+import { localCors } from '../src/platform/middleware/cors.js';
 import { createServer } from '../src/server.js';
 
 assert.equal(typeof createServer, 'function', 'server module must export a side-effect-free factory');

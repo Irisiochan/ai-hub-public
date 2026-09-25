@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { openDb, type MessageRow } from '../src/db.js';
-import { messagesRouter } from '../src/routes/messages.js';
+import { openDb, type MessageRow } from '../src/platform/db.js';
+import { messagesRouter } from '../src/runtime/messageRoutes.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aihub-message-delete-'));
 const db = openDb(path.join(tempDir, 'hub.db'));

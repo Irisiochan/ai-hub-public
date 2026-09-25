@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DirectApiBackend } from '../dist/agents/directApi.js';
-import { openDb } from '../dist/db.js';
+import { DirectApiBackend } from '../dist/backends/directApi.js';
+import { openDb } from '../dist/platform/db.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = path.join(here, '.history-cache.db');
